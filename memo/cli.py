@@ -22,7 +22,7 @@ def _hours(value: str) -> float:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="memo", description="Capture and replay coding-agent sessions")
     action = result.add_mutually_exclusive_group(required=True)
-    action.add_argument("--status", action="store_true", help="list mutable scratch sessions")
+    action.add_argument("--status", action="store_true", help="list scratch and saved sessions")
     action.add_argument("--save", action="store_true", help="ship eligible scratch sessions")
     action.add_argument("--load", metavar="SESSION_ID", help="load a scratch or shipped session")
     result.add_argument("--all", action="store_true", help="with --save, ship every scratch session")
@@ -102,4 +102,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

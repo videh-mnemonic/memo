@@ -15,7 +15,7 @@ memo codex [args...]
 
 Native resume flags append a leg when the referenced session is still in scratch. Resuming a shipped session starts a child session that records the old session ID.
 
-Inspect and ship captured sessions:
+Inspect captured sessions (both scratch and saved archives), and ship scratch sessions:
 
 ```console
 memo --status

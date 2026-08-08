@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import fcntl
+import json
+import tarfile
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,5 +85,25 @@ def list_scratch(paths: Paths | None = None) -> list[tuple[Path, SessionMeta]]:
         try:
             result.append((directory, SessionMeta.load(directory / "meta.json")))
         except (OSError, ValueError, TypeError):
+            continue
+    return result
+
+
+def list_saved(paths: Paths | None = None) -> list[tuple[Path, SessionMeta]]:
+    paths = paths or Paths.discover()
+    if not paths.archive.exists():
+        return []
+    result = []
+    for archive_path in sorted(paths.archive.glob("*/*.tar.gz")):
+        try:
+            with tarfile.open(archive_path, "r:gz") as archive:
+                member = archive.getmember("meta.json")
+                handle = archive.extractfile(member)
+                if handle is None:
+                    continue
+                meta = SessionMeta.from_dict(json.loads(handle.read()))
+                meta.validate()
+                result.append((archive_path, meta))
+        except (OSError, ValueError, TypeError, KeyError, tarfile.TarError):
             continue
     return result
