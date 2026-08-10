@@ -38,11 +38,12 @@ def safe_extract_tar(path: Path, target: Path) -> None:
 
 def unpack(session_id: str, paths: Paths | None = None) -> Path:
     paths = paths or Paths.discover()
+    location = find_session(session_id, paths)
     target = paths.unpack / session_id
     marker = target / ".unpacked-ok"
-    if marker.is_file():
+    source = f"{location.kind}:{location.path}"
+    if location.kind == "archive" and marker.is_file() and marker.read_text().strip() == source:
         return target
-    location = find_session(session_id, paths)
     if target.exists():
         shutil.rmtree(target)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -55,7 +56,7 @@ def unpack(session_id: str, paths: Paths | None = None) -> Path:
             shutil.copytree(location.path, temporary, dirs_exist_ok=True)
         else:
             safe_extract_tar(location.path, temporary)
-        (temporary / ".unpacked-ok").write_text("ok\n")
+        (temporary / ".unpacked-ok").write_text(source + "\n")
         temporary.replace(target)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -81,6 +82,15 @@ def _apply_mailbox(path: Path, destination: Path) -> None:
         _run(["git", "am", "--committer-date-is-author-date", str(path)], destination)
 
 
+def _apply_session_mailboxes(source: Path, destination: Path) -> None:
+    cumulative = source / "git" / "session-commits.patch"
+    if cumulative.is_file():
+        _apply_mailbox(cumulative, destination)
+        return
+    for patch in sorted((source / "legs").glob("*/commits.patch")):
+        _apply_mailbox(patch, destination)
+
+
 def _apply_diff(path: Path, destination: Path) -> None:
     if path.is_file() and path.stat().st_size:
         _run(["git", "apply", "--binary", str(path)], destination)
@@ -100,7 +110,7 @@ def reconstruct(session_id: str, at: str, destination: Path, force: bool = False
         _apply_diff(source / "git" / "initial-uncommitted.patch", destination)
         _extract_untracked(source / "git" / "initial-untracked.tar.gz", destination)
     elif at == "final":
-        _apply_mailbox(source / "git" / "session-commits.patch", destination)
+        _apply_session_mailboxes(source, destination)
         _apply_diff(source / "git" / "final-uncommitted.patch", destination)
         _extract_untracked(source / "git" / "final-untracked.tar.gz", destination)
     elif at.startswith("leg:"):
@@ -165,4 +175,3 @@ def replay(session_id: str, at: str, destination: Path, force: bool = False,
         lines.append("(none)\n")
     (destination / "MEMO_TASK.md").write_text("\n".join(lines))
     return destination
-

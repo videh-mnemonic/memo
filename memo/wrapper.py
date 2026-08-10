@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,24 @@ def _tool_version(tool: str) -> str:
 def _facts(cwd: Path, git_head: str, tool: str) -> dict[str, str]:
     return {"cwd": str(cwd), "git_head": git_head, "host": socket.gethostname(),
             "user": getpass.getuser(), "env_tool_version": _tool_version(tool)}
+
+
+def _checkpoint_interval() -> float:
+    value = os.environ.get("MEMO_CHECKPOINT_INTERVAL", "15")
+    try:
+        return max(1.0, float(value))
+    except ValueError:
+        return 15.0
+
+
+def _copy_trace(trace: Path, session_dir: Path, leg_id: str) -> str:
+    trace_name = f"leg-{leg_id}.jsonl"
+    trace_dir = session_dir / "traces"
+    trace_dir.mkdir(exist_ok=True)
+    temporary = trace_dir / f".{trace_name}.tmp"
+    shutil.copy2(trace, temporary)
+    temporary.replace(trace_dir / trace_name)
+    return trace_name
 
 
 def _new_meta(tool: str, cwd: Path, provisional: str, resumes: str | None = None) -> SessionMeta:
@@ -95,13 +114,63 @@ def run(tool: str, args: list[str]) -> int:
         start["git_head_before"] = start.pop("git_head")
         start["start_utc"] = started
         (leg_dir / "start.json").write_text(json.dumps(start, indent=2) + "\n")
+        meta.legs.append(Leg(leg_id, args, started, None, None, None, False))
+        meta.last_activity_utc = started
+        meta.save(session_dir / "meta.json")
         marker = mark(tool)
+        trace_name = None
+
+        def checkpoint() -> None:
+            nonlocal session_dir, leg_dir, trace_name
+            trace = locate(tool, marker)
+            if trace:
+                actual_id = session_id(trace)
+                if is_new and meta.repo_kind != "synthetic" and actual_id != meta.session_id:
+                    target = paths.scratch / actual_id
+                    if target.exists():
+                        raise RuntimeError(f"session already exists: {actual_id}")
+                    session_dir.rename(target)
+                    session_dir = target
+                    leg_dir = session_dir / "legs" / leg_id
+                    meta.session_id = actual_id
+                trace_name = _copy_trace(trace, session_dir, leg_id)
+            after_checkpoint = snapshot_final(meta, session_dir)
+            write_commit_patch(meta, session_dir, before, after_checkpoint, leg_dir / "commits.patch")
+            now = utcnow()
+            current_leg = meta.legs[-1]
+            current_leg.trace_file = trace_name
+            meta.final_head = after_checkpoint
+            meta.last_activity_utc = now
+            meta.save(session_dir / "meta.json")
+
         try:
-            process = subprocess.run([tool, *args], env=git_env(meta, session_dir))
-            exit_code = process.returncode
+            process = subprocess.Popen([tool, *args], env=git_env(meta, session_dir))
+            interval = _checkpoint_interval()
+            next_checkpoint = time.monotonic()
+            while True:
+                exit_code = process.poll()
+                if exit_code is not None:
+                    break
+                if time.monotonic() >= next_checkpoint:
+                    try:
+                        checkpoint()
+                    except Exception as error:
+                        print(f"memo: checkpoint failed: {error}", file=os.sys.stderr)
+                    next_checkpoint = time.monotonic() + interval
+                time.sleep(min(0.25, interval))
         except FileNotFoundError:
             exit_code = 127
             print(f"memo: executable not found: {tool}", file=os.sys.stderr)
+        except KeyboardInterrupt:
+            try:
+                process.wait(timeout=2)
+                exit_code = process.returncode
+            except (NameError, subprocess.TimeoutExpired):
+                if "process" in locals():
+                    process.terminate()
+                    exit_code = process.wait()
+                else:
+                    exit_code = 130
         trace = locate(tool, marker)
         actual_id = session_id(trace) if trace else meta.session_id.removeprefix("provisional-")
         if is_new and actual_id != meta.session_id:
@@ -112,11 +181,8 @@ def run(tool: str, args: list[str]) -> int:
             session_dir = target
             leg_dir = session_dir / "legs" / leg_id
             meta.session_id = actual_id
-        trace_name = None
         if trace:
-            trace_name = f"leg-{leg_id}.jsonl"
-            (session_dir / "traces").mkdir(exist_ok=True)
-            shutil.copy2(trace, session_dir / "traces" / trace_name)
+            trace_name = _copy_trace(trace, session_dir, leg_id)
         after = snapshot_final(meta, session_dir)
         write_commit_patch(meta, session_dir, before, after, leg_dir / "commits.patch")
         ended = utcnow()
@@ -125,7 +191,7 @@ def run(tool: str, args: list[str]) -> int:
         end["end_utc"] = ended
         end["exit_code"] = exit_code
         (leg_dir / "end.json").write_text(json.dumps(end, indent=2) + "\n")
-        meta.legs.append(Leg(leg_id, args, started, ended, exit_code, trace_name, True))
+        meta.legs[-1] = Leg(leg_id, args, started, ended, exit_code, trace_name, True)
         meta.final_head = after
         meta.last_activity_utc = ended
         meta.save(session_dir / "meta.json")

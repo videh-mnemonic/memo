@@ -50,6 +50,8 @@ memo --load <id> --traces --path <file.json>
 memo --load <id> --traces --raw --path <file.json>
 ```
 
+TODO: Add optional AWS trace recording for durable off-machine trace storage.
+
 Reconstruct a state and add `MEMO_TASK.md` containing the original ordered user prompts:
 
 ```console
