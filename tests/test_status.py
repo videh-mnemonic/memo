@@ -55,5 +55,19 @@ def test_status_lists_scratch_and_saved_sessions(tmp_path: Path) -> None:
     assert "saved    saved-id" in output
 
 
+def test_status_shows_full_namespace(tmp_path: Path) -> None:
+    configured = _paths(tmp_path)
+    namespace = "github.com_videh-mnemonic_example-repository-with-long-name"
+    scratch = configured.scratch / "scratch-id"
+    meta = _meta("scratch-id")
+    meta.archive_namespace = namespace
+    meta.save(scratch / "meta.json")
+
+    output = render_status(configured)
+
+    assert namespace in output
+    assert "..." not in output
+
+
 def test_status_reports_no_sessions_when_storage_is_empty(tmp_path: Path) -> None:
     assert render_status(_paths(tmp_path)) == "No sessions.\n"
