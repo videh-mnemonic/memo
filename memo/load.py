@@ -64,6 +64,65 @@ def unpack(session_id: str, paths: Paths | None = None) -> Path:
     return target
 
 
+def _size(path: Path) -> str:
+    if not path.exists():
+        return "-"
+    size = path.stat().st_size
+    if size >= 1024 * 1024:
+        return f"{size // (1024 * 1024)}MiB"
+    if size >= 1024:
+        return f"{size // 1024}KiB"
+    return f"{size}B"
+
+
+def inspect_session(session_id: str, paths: Paths | None = None) -> str:
+    paths = paths or Paths.discover()
+    location = find_session(session_id, paths)
+    source = unpack(session_id, paths)
+    meta = SessionMeta.load(source / "meta.json")
+    state = "saved" if location.kind == "archive" else location.kind
+    lines = [
+        f"Session: {meta.session_id}",
+        f"State: {state}",
+        f"Source: {location.path}",
+        f"Unpacked: {source}",
+        f"Tool: {meta.tool}",
+        f"Repository: {meta.repo_name}",
+        f"Original root: {meta.repo_root}",
+        f"Namespace: {meta.archive_namespace}",
+        f"Branch: {meta.branch or '(unknown)'}",
+        f"Initial head: {meta.initial_head or '(none)'}",
+        f"Final/checkpoint head: {meta.final_head or '(none)'}",
+        f"First seen: {meta.first_seen_utc}",
+        f"Last activity: {meta.last_activity_utc}",
+        f"Coverage: {meta.coverage}",
+        "",
+        "Artifacts:",
+        f"  initial.bundle: {_size(source / 'git' / 'initial.bundle')}",
+        f"  initial-uncommitted.patch: {_size(source / 'git' / 'initial-uncommitted.patch')}",
+        f"  initial-untracked.tar.gz: {_size(source / 'git' / 'initial-untracked.tar.gz')}",
+        f"  session-commits.patch: {_size(source / 'git' / 'session-commits.patch')}",
+        f"  final-uncommitted.patch: {_size(source / 'git' / 'final-uncommitted.patch')}",
+        f"  final-untracked.tar.gz: {_size(source / 'git' / 'final-untracked.tar.gz')}",
+        "",
+        "Legs:",
+    ]
+    if meta.legs:
+        for leg in meta.legs:
+            state = "complete" if leg.complete else "active"
+            trace = leg.trace_file or "-"
+            patch = source / "legs" / leg.leg_id / "commits.patch"
+            ended = leg.end_utc or "-"
+            code = "-" if leg.exit_code is None else str(leg.exit_code)
+            lines.append(
+                f"  {leg.leg_id}: {state}, start={leg.start_utc}, end={ended}, "
+                f"exit={code}, trace={trace}, commits={_size(patch)}"
+            )
+    else:
+        lines.append("  (none)")
+    return "\n".join(lines) + "\n"
+
+
 def _prepare_destination(destination: Path, force: bool) -> None:
     if destination.exists() and any(destination.iterdir()):
         if not force:
@@ -128,11 +187,16 @@ def reconstruct(session_id: str, at: str, destination: Path, force: bool = False
     return destination
 
 
+def trace_json(session_id: str, raw: bool = False, paths: Paths | None = None) -> str:
+    source = unpack(session_id, paths)
+    return json.dumps(all_traces(source, raw), indent=2, ensure_ascii=False) + "\n"
+
+
 def write_traces(session_id: str, destination: Path, raw: bool = False,
                  paths: Paths | None = None) -> Path:
-    source = unpack(session_id, paths)
+    data = trace_json(session_id, raw, paths)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(all_traces(source, raw), indent=2, ensure_ascii=False) + "\n")
+    destination.write_text(data)
     return destination
 
 

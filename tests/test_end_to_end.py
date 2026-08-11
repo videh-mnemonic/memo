@@ -54,7 +54,7 @@ def _tree(path: Path) -> dict[str, bytes]:
     return {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*") if p.is_file() and ".git" not in p.parts}
 
 
-def test_real_repo_capture_save_load(tmp_path: Path, monkeypatch) -> None:
+def test_real_repo_capture_save_load(tmp_path: Path, monkeypatch, capsys) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", str(repo)], check=True, stdout=subprocess.PIPE)
@@ -98,6 +98,15 @@ def test_real_repo_capture_save_load(tmp_path: Path, monkeypatch) -> None:
     exported = tmp_path / "normalized.json"
     assert main(["--load", "abc123", "--traces", "--path", str(exported)]) == 0
     assert json.loads(exported.read_text())[0]["type"] == "user_input"
+    assert main(["--load", "abc123", "--inspect"]) == 0
+    inspected = capsys.readouterr().out
+    assert "Session: abc123" in inspected
+    assert "State: saved" in inspected
+    assert "001: complete" in inspected
+    assert main(["--load", "abc123", "--traces"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["content"] == "change it"
+    assert main(["--load", "abc123", "--traces", "--path", "-"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["content"] == "change it"
     replayed = tmp_path / "replayed"
     assert main(["--load", "abc123", "--replay", "--at", "final", "--path", str(replayed)]) == 0
     assert "change it" in (replayed / "MEMO_TASK.md").read_text()
@@ -171,3 +180,35 @@ def test_live_session_checkpoints_before_exit(tmp_path: Path, monkeypatch) -> No
     finally:
         thread.join(timeout=10)
     assert result == {"code": 0}
+
+
+def test_live_session_id_collision_keeps_provisional_session(tmp_path: Path, monkeypatch, capsys) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, stdout=subprocess.PIPE)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("initial\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, stdout=subprocess.PIPE)
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    stub = binary / "codex"
+    stub.write_text(LIVE_STUB)
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    memo_home = tmp_path / "memo-home"
+    (memo_home / "scratch" / "live123").mkdir(parents=True)
+    monkeypatch.setenv("MEMO_HOME", str(memo_home))
+    monkeypatch.setenv("MEMO_TRACE_DIR", str(tmp_path / "traces"))
+    monkeypatch.setenv("MEMO_CHECKPOINT_INTERVAL", "1")
+    monkeypatch.setenv("STUB_ROOT", str(repo))
+    monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.chdir(repo)
+
+    assert main(["codex"]) == 0
+    assert "checkpoint failed" not in capsys.readouterr().err
+    provisional = [path for path in (memo_home / "scratch").iterdir() if path.name.startswith("provisional-")]
+    assert len(provisional) == 1
+    meta = json.loads((provisional[0] / "meta.json").read_text())
+    assert meta["legs"][0]["complete"] is True
+    assert meta["legs"][0]["trace_file"] == "leg-001.jsonl"

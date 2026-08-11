@@ -19,6 +19,7 @@ Inspect captured sessions (both scratch and saved archives), and ship scratch se
 
 ```console
 memo --status
+memo --load <id> --inspect
 memo --save                         # sessions idle for at least 48 hours
 memo --save --older-than 12h
 memo --save --all
@@ -46,7 +47,9 @@ Memo refuses to overwrite a non-empty directory. Add `--force` when replacement 
 Export traces in the common schema, or retain vendor records with a leg tag:
 
 ```console
+memo --load <id> --traces
 memo --load <id> --traces --path <file.json>
+memo --load <id> --traces --path -          # same as omitting --path
 memo --load <id> --traces --raw --path <file.json>
 ```
 

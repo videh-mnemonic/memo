@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-from .load import reconstruct, replay, unpack, write_traces
+from .load import inspect_session, reconstruct, replay, trace_json, unpack, write_traces
 from .save import save_sessions
 from .status import render_status
 from .wrapper import run
@@ -29,6 +29,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--session", metavar="ID", help="with --save, ship one session")
     result.add_argument("--older-than", default=48.0, type=_hours, metavar="DURATION")
     mode = result.add_mutually_exclusive_group()
+    mode.add_argument("--inspect", action="store_true")
     mode.add_argument("--unpack", action="store_true")
     mode.add_argument("--traces", action="store_true")
     mode.add_argument("--replay", action="store_true")
@@ -77,12 +78,15 @@ def main(argv: list[str] | None = None) -> int:
             return _print_summary(save_sessions(all_sessions=args.all, session_id=args.session,
                                                 older_than_hours=args.older_than))
         if args.load:
-            if args.unpack:
+            if args.inspect:
+                print(inspect_session(args.load), end="")
+            elif args.unpack:
                 print(unpack(args.load))
             elif args.traces:
-                if not args.path:
-                    raise ValueError("--traces requires --path FILE")
-                write_traces(args.load, args.path, args.raw)
+                if not args.path or str(args.path) == "-":
+                    print(trace_json(args.load, args.raw), end="")
+                else:
+                    write_traces(args.load, args.path, args.raw)
             elif args.replay:
                 if not args.path or not args.at:
                     raise ValueError("--replay requires --at and --path DIR")
@@ -92,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("--at requires --path DIR")
                 reconstruct(args.load, args.at, args.path, args.force)
             else:
-                raise ValueError("--load requires --unpack, --at, --traces, or --replay")
+                raise ValueError("--load requires --inspect, --unpack, --at, --traces, or --replay")
             return 0
     except Exception as error:
         print(f"memo: {error}", file=sys.stderr)

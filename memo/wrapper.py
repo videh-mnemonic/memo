@@ -65,6 +65,18 @@ def _copy_trace(trace: Path, session_dir: Path, leg_id: str) -> str:
     return trace_name
 
 
+def _adopt_session_id(meta: SessionMeta, paths: Paths, session_dir: Path, leg_id: str,
+                      actual_id: str) -> tuple[Path, Path]:
+    if actual_id == meta.session_id:
+        return session_dir, session_dir / "legs" / leg_id
+    target = paths.scratch / actual_id
+    if target.exists():
+        return session_dir, session_dir / "legs" / leg_id
+    session_dir.rename(target)
+    meta.session_id = actual_id
+    return target, target / "legs" / leg_id
+
+
 def _new_meta(tool: str, cwd: Path, provisional: str, resumes: str | None = None) -> SessionMeta:
     identity = discover_repo_identity(cwd)
     now = utcnow()
@@ -126,13 +138,7 @@ def run(tool: str, args: list[str]) -> int:
             if trace:
                 actual_id = session_id(trace)
                 if is_new and meta.repo_kind != "synthetic" and actual_id != meta.session_id:
-                    target = paths.scratch / actual_id
-                    if target.exists():
-                        raise RuntimeError(f"session already exists: {actual_id}")
-                    session_dir.rename(target)
-                    session_dir = target
-                    leg_dir = session_dir / "legs" / leg_id
-                    meta.session_id = actual_id
+                    session_dir, leg_dir = _adopt_session_id(meta, paths, session_dir, leg_id, actual_id)
                 trace_name = _copy_trace(trace, session_dir, leg_id)
             after_checkpoint = snapshot_final(meta, session_dir)
             write_commit_patch(meta, session_dir, before, after_checkpoint, leg_dir / "commits.patch")
@@ -174,13 +180,7 @@ def run(tool: str, args: list[str]) -> int:
         trace = locate(tool, marker)
         actual_id = session_id(trace) if trace else meta.session_id.removeprefix("provisional-")
         if is_new and actual_id != meta.session_id:
-            target = paths.scratch / actual_id
-            if target.exists():
-                raise RuntimeError(f"session already exists: {actual_id}")
-            session_dir.rename(target)
-            session_dir = target
-            leg_dir = session_dir / "legs" / leg_id
-            meta.session_id = actual_id
+            session_dir, leg_dir = _adopt_session_id(meta, paths, session_dir, leg_id, actual_id)
         if trace:
             trace_name = _copy_trace(trace, session_dir, leg_id)
         after = snapshot_final(meta, session_dir)
