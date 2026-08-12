@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 
 
+DIRECTORY_FORMAT_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 1
+
+
 @dataclass
 class Leg:
     leg_id: str
@@ -76,3 +80,91 @@ class SessionMeta:
         temporary.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n")
         temporary.replace(path)
 
+
+@dataclass
+class DirectorySession:
+    session_id: str
+    root: str
+    archive_namespace: str
+    created_utc: str
+    updated_utc: str
+    state: str = "active"
+    format: str = "memo-directory-session"
+    format_version: int = DIRECTORY_FORMAT_VERSION
+
+    def validate(self) -> None:
+        if self.format != "memo-directory-session" or self.format_version != DIRECTORY_FORMAT_VERSION:
+            raise ValueError("unsupported directory session format")
+        if self.state not in {"active", "ending", "complete"}:
+            raise ValueError(f"invalid directory session state: {self.state}")
+        if not Path(self.root).is_absolute():
+            raise ValueError("directory session root must be absolute")
+        ns = self.archive_namespace
+        if not ns or ns in {".", ".."} or "/" in ns or "\\" in ns:
+            raise ValueError("archive_namespace must be a safe path component")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "DirectorySession":
+        result = cls(**value)
+        result.validate()
+        return result
+
+    @classmethod
+    def load(cls, path: Path) -> "DirectorySession":
+        return cls.from_dict(json.loads(path.read_text()))
+
+
+@dataclass(frozen=True)
+class SnapshotEntry:
+    path: str
+    kind: str
+    mode: int
+    size: int | None = None
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "SnapshotEntry":
+        return cls(**value)
+
+
+@dataclass
+class CheckpointManifest:
+    checkpoint_id: str
+    session_id: str
+    generation: int
+    created_utc: str
+    snapshot: str
+    entries: list[SnapshotEntry] = field(default_factory=list)
+    schema_version: int = CHECKPOINT_SCHEMA_VERSION
+
+    def validate(self) -> None:
+        if self.schema_version != CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError("unsupported checkpoint schema version")
+        if self.generation < 1:
+            raise ValueError("checkpoint generation must be positive")
+        expected = f"snapshots/{self.checkpoint_id}"
+        if self.snapshot != expected:
+            raise ValueError(f"checkpoint snapshot must be {expected}")
+        for entry in self.entries:
+            path = Path(entry.path)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError(f"unsafe snapshot entry: {entry.path}")
+            if entry.kind not in {"file", "directory"}:
+                raise ValueError(f"unsupported snapshot entry kind: {entry.kind}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "CheckpointManifest":
+        value = dict(value)
+        value["entries"] = [SnapshotEntry.from_dict(item) for item in value.get("entries", [])]
+        result = cls(**value)
+        result.validate()
+        return result
+
+    @classmethod
+    def load(cls, path: Path) -> "CheckpointManifest":
+        return cls.from_dict(json.loads(path.read_text()))

@@ -5,6 +5,7 @@ import re
 import sys
 from pathlib import Path
 
+from .daemon import activate
 from .load import inspect_session, reconstruct, replay, trace_json, unpack, write_traces
 from .save import save_sessions
 from .status import render_status
@@ -21,10 +22,14 @@ def _hours(value: str) -> float:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="memo", description="Capture and replay coding-agent sessions")
-    action = result.add_mutually_exclusive_group(required=True)
+    action = result.add_mutually_exclusive_group()
     action.add_argument("--status", action="store_true", help="list scratch and saved sessions")
     action.add_argument("--save", action="store_true", help="ship eligible scratch sessions")
     action.add_argument("--load", metavar="SESSION_ID", help="load a scratch or shipped session")
+    action.add_argument("--background", action="store_true",
+                        help="start or join a directory recording without a terminal")
+    result.add_argument("recording_path", nargs="?", type=Path,
+                        help="directory to record (defaults to the current directory)")
     result.add_argument("--all", action="store_true", help="with --save, ship every scratch session")
     result.add_argument("--session", metavar="ID", help="with --save, ship one session")
     result.add_argument("--older-than", default=48.0, type=_hours, metavar="DURATION")
@@ -98,6 +103,17 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 raise ValueError("--load requires --inspect, --unpack, --at, --traces, or --replay")
             return 0
+        if args.background:
+            result = activate(args.recording_path or Path.cwd())
+            action = "joined" if result["joined"] else "started"
+            print(
+                f"{action}: {result['session_id']} "
+                f"generation={result['generation']} root={result['root']}"
+            )
+            return 0
+        if args.recording_path is not None:
+            raise ValueError("interactive recording is not available yet; use --background")
+        raise ValueError("choose an action or use --background [path]")
     except Exception as error:
         print(f"memo: {error}", file=sys.stderr)
         return 1

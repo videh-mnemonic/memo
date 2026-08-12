@@ -9,6 +9,9 @@ import time
 from pathlib import Path
 
 from memo.cli import main
+from memo.config import Paths
+from memo.protocol import request
+from memo.session_store import SessionStore
 
 
 STUB = '''#!/usr/bin/env python3
@@ -212,3 +215,29 @@ def test_live_session_id_collision_keeps_provisional_session(tmp_path: Path, mon
     meta = json.loads((provisional[0] / "meta.json").read_text())
     assert meta["legs"][0]["complete"] is True
     assert meta["legs"][0]["trace_file"] == "leg-001.jsonl"
+
+
+def test_public_cli_starts_background_directory_recording(tmp_path: Path, monkeypatch, capsys) -> None:
+    home = tmp_path / "memo-home"
+    root = tmp_path / "plain-directory"
+    root.mkdir()
+    (root / "notes.txt").write_text("initial\n")
+    monkeypatch.setenv("MEMO_HOME", str(home))
+    monkeypatch.setenv("MEMO_CHECKPOINT_INTERVAL", "1")
+
+    assert main(["--background", str(root)]) == 0
+    output = capsys.readouterr().out
+    assert "started:" in output
+    paths = Paths.discover()
+    sessions = list((home / "archive").glob("*/*/session.json"))
+    assert len(sessions) == 1
+    session_dir = sessions[0].parent
+    store = SessionStore(paths)
+    head = store.head(session_dir.parent.name, session_dir.name)
+    assert head is not None
+    assert (session_dir / head.snapshot / "notes.txt").read_text() == "initial\n"
+
+    assert main(["--background", str(root)]) == 0
+    assert "joined:" in capsys.readouterr().out
+    assert paths.socket is not None
+    request(str(paths.socket), "shutdown")
