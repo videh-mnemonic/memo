@@ -11,6 +11,7 @@ from .config import Paths
 from .models import DirectorySession, SessionMeta
 from .normalize import all_traces
 from .session_store import SessionStore
+from .transport import atomic_install_directory
 from .store import find_session
 
 
@@ -61,7 +62,7 @@ def unpack(session_id: str, paths: Paths | None = None) -> Path:
         else:
             safe_extract_tar(location.path, temporary)
         (temporary / ".unpacked-ok").write_text(source + "\n")
-        temporary.replace(target)
+        atomic_install_directory(temporary, target, force=True)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise

@@ -91,6 +91,9 @@ class DirectorySession:
     state: str = "active"
     format: str = "memo-directory-session"
     format_version: int = DIRECTORY_FORMAT_VERSION
+    last_pushed_generation: int | None = None
+    last_pushed_digest: str | None = None
+    remote_object: str | None = None
 
     def validate(self) -> None:
         if self.format != "memo-directory-session" or self.format_version != DIRECTORY_FORMAT_VERSION:
@@ -102,6 +105,13 @@ class DirectorySession:
         ns = self.archive_namespace
         if not ns or ns in {".", ".."} or "/" in ns or "\\" in ns:
             raise ValueError("archive_namespace must be a safe path component")
+        if self.last_pushed_generation is not None and self.last_pushed_generation < 1:
+            raise ValueError("last pushed generation must be positive")
+        remote_values = (self.last_pushed_generation, self.last_pushed_digest, self.remote_object)
+        if any(value is not None for value in remote_values) and not all(
+            value is not None for value in remote_values
+        ):
+            raise ValueError("remote transport state must be recorded atomically")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

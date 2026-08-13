@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import IO, Any
 
 from .checkpoint import CheckpointPublisher, utcnow
-from .config import Paths, checkpoint_interval, recovery_enabled, watcher_debounce, watcher_enabled
+from .config import (Paths, TransportConfig, automatic_push_enabled,
+                     automatic_push_interval, checkpoint_interval, recovery_enabled,
+                     watcher_debounce, watcher_enabled)
 from .identity import local_namespace
 from .models import DirectorySession
 from .protocol import (
@@ -54,6 +56,8 @@ class MemoDaemon:
         self._checkpoint_requests: dict[str, threading.Event] = {}
         self._observers: dict[str, Any] = {}
         self._worker_lock = threading.Lock()
+        self._session_locks: dict[str, threading.RLock] = {}
+        self._push_thread: threading.Thread | None = None
         self._server: socket.socket | None = None
         self._lock_handle: IO[str] | None = None
 
@@ -70,6 +74,14 @@ class MemoDaemon:
 
     def _session_model(self, active: ActiveSession) -> DirectorySession:
         return self.store.load_session(active.archive_namespace, active.session_id)
+
+    def _session_lock(self, session_id: str) -> threading.RLock:
+        with self._worker_lock:
+            return self._session_locks.setdefault(session_id, threading.RLock())
+
+    def _publish(self, session: DirectorySession):
+        with self._session_lock(session.session_id):
+            return self.publisher.publish(session)
 
     def _ensure_worker(self, active: ActiveSession) -> None:
         with self._worker_lock:
@@ -116,7 +128,7 @@ class MemoDaemon:
                     return
                 request_event.clear()
             try:
-                self.publisher.publish(self._session_model(active))
+                self._publish(self._session_model(active))
             except Exception as error:
                 print(f"memo daemon: checkpoint failed for {active.session_id}: {error}", file=sys.stderr)
             deadline = time.monotonic() + self.interval
@@ -140,7 +152,7 @@ class MemoDaemon:
             )
             try:
                 self.store.create(session)
-                manifest = self.publisher.publish(session)
+                manifest = self._publish(session)
             except BaseException:
                 self.registry.remove(active.session_id)
                 raise
@@ -148,7 +160,7 @@ class MemoDaemon:
             session = self._session_model(active)
             manifest = self.store.head(active.archive_namespace, active.session_id)
             if manifest is None:
-                manifest = self.publisher.publish(session)
+                manifest = self._publish(session)
         self._ensure_worker(active)
         return {
             "session_id": active.session_id,
@@ -209,7 +221,7 @@ class MemoDaemon:
         for attachment in self.registry.list_attachments(active.session_id):
             if attachment.detached_utc is None:
                 self.registry.detach(attachment.terminal_id, detached_at)
-        manifest = self.publisher.publish(session)
+        manifest = self._publish(session)
         session.state = "complete"
         session.updated_utc = manifest.created_utc
         self.store.update_session(session)
@@ -248,6 +260,35 @@ class MemoDaemon:
             })
         return {"sessions": sessions}
 
+    def _push(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .transport import PushSummary, push_session
+        config = TransportConfig.discover(required=True)
+        assert config is not None
+        selected = payload.get("session_id")
+        summary = PushSummary()
+        sessions = [session for _, session in self.store.list_sessions()
+                    if selected is None or session.session_id == selected]
+        if selected and not sessions:
+            summary.failed.append((str(selected), "directory session not found"))
+        for session in sessions:
+            try:
+                with self._session_lock(session.session_id):
+                    result = push_session(self.store, session, config)
+                target = summary.skipped if result["status"] == "skipped" else summary.pushed
+                target.append(session.session_id)
+            except Exception as error:
+                summary.failed.append((session.session_id, str(error)))
+        return {"pushed": summary.pushed, "skipped": summary.skipped,
+                "failed": summary.failed}
+
+    def _automatic_push_loop(self) -> None:
+        interval = automatic_push_interval()
+        while not self._stop.wait(interval):
+            try:
+                self._push({})
+            except Exception as error:
+                print(f"memo daemon: automatic push failed: {error}", file=sys.stderr)
+
     def dispatch(self, message: Request) -> dict[str, Any]:
         if message.operation == "health":
             return {"status": "ok"}
@@ -280,11 +321,13 @@ class MemoDaemon:
             return self._end(message.payload)
         if message.operation == "status":
             return self._status()
+        if message.operation == "push":
+            return self._push(message.payload)
         if message.operation == "checkpoint":
             active = self.registry.lookup(Path(message.payload["path"]))
             if active is None:
                 raise FileNotFoundError("no active recording for path")
-            manifest = self.publisher.publish(self._session_model(active))
+            manifest = self._publish(self._session_model(active))
             return {"session_id": active.session_id, "generation": manifest.generation,
                     "checkpoint_id": manifest.checkpoint_id}
         if message.operation == "shutdown":
@@ -327,6 +370,9 @@ class MemoDaemon:
             server.settimeout(0.25)
             for active in self.registry.list_active():
                 self._ensure_worker(active)
+            if automatic_push_enabled() and TransportConfig.discover() is not None:
+                self._push_thread = threading.Thread(target=self._automatic_push_loop, daemon=True)
+                self._push_thread.start()
             while not self._stop.is_set():
                 try:
                     connection, _ = server.accept()
@@ -392,6 +438,14 @@ def end(path: Path, paths: Paths | None = None) -> dict[str, Any]:
     ensure_daemon(paths)
     assert paths.socket is not None
     return request(str(paths.socket), "end", {"path": str(path)}, timeout=60.0)
+
+
+def push(session_id: str | None = None, paths: Paths | None = None) -> dict[str, Any]:
+    paths = paths or Paths.discover()
+    ensure_daemon(paths)
+    assert paths.socket is not None
+    payload = {"session_id": session_id} if session_id else {}
+    return request(str(paths.socket), "push", payload, timeout=300.0)
 
 
 def main() -> int:

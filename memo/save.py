@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import gzip
 import hashlib
-import io
 import json
 import os
 import shutil
 import subprocess
-import tarfile
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +12,7 @@ from pathlib import Path
 from .config import Paths
 from .models import SessionMeta
 from .store import SessionLock, SessionLockedError, list_scratch
+from .transport import atomic_write as _atomic_write, deterministic_archive
 from .wrapper import utcnow
 
 
@@ -71,38 +68,7 @@ def _coverage(session_dir: Path, meta: SessionMeta) -> str | None:
 
 
 def _archive_bytes(session_dir: Path) -> bytes:
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
-        for path in sorted(session_dir.rglob("*"), key=lambda p: p.relative_to(session_dir).as_posix()):
-            relative = path.relative_to(session_dir)
-            if relative.as_posix() == "session.lock" or path.is_socket():
-                continue
-            info = archive.gettarinfo(str(path), arcname=relative.as_posix())
-            info.uid = info.gid = 0
-            info.uname = info.gname = ""
-            info.mtime = 0
-            if info.isfile():
-                with path.open("rb") as handle:
-                    archive.addfile(info, handle)
-            else:
-                archive.addfile(info)
-    result = io.BytesIO()
-    with gzip.GzipFile(filename="", mode="wb", fileobj=result, mtime=0) as zipped:
-        zipped.write(raw.getvalue())
-    return result.getvalue()
-
-
-def _atomic_write(path: Path, data: bytes) -> None:
-    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(name, path)
-    except BaseException:
-        Path(name).unlink(missing_ok=True)
-        raise
+    return deterministic_archive(session_dir)
 
 
 def ship(session_dir: Path, meta: SessionMeta, paths: Paths) -> tuple[Path, str | None]:
@@ -156,4 +122,3 @@ def save_sessions(*, all_sessions: bool = False, session_id: str | None = None,
         except Exception as error:
             summary.failed.append((meta.session_id, str(error)))
     return summary
-

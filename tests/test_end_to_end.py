@@ -11,6 +11,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from memo.cli import main
 from memo.config import Paths
 from memo.protocol import request
@@ -339,3 +341,29 @@ def test_end_restore_export_and_restart_directory_session(tmp_path: Path, monkey
     assert {path.name for path in sessions} != {first_session.name}
     assert paths.socket is not None
     request(str(paths.socket), "shutdown")
+
+
+def test_push_pull_and_restore_directory_generation(tmp_path: Path) -> None:
+    from test_transport import FakeS3, _paths, _published
+    from memo.config import TransportConfig
+    from memo.transport import pull_session, push_session
+
+    root = tmp_path / "source"
+    root.mkdir()
+    source_paths = _paths(tmp_path / "source-home")
+    store, session = _published(source_paths, root)
+    client = FakeS3()
+    config = TransportConfig("bucket", "e2e")
+    assert push_session(store, session, config, client)["status"] == "pushed"
+
+    destination_paths = _paths(tmp_path / "destination-home")
+    pull_session("session", destination_paths, config, client=client)
+    restored = tmp_path / "restored"
+    destination_store = SessionStore(destination_paths)
+    destination_store.restore("namespace", "session", restored)
+    assert (restored / "file.txt").read_text() == "generation 1\n"
+
+    (restored / "local-only.txt").write_text("preserved")
+    with pytest.raises(FileExistsError):
+        pull_session("session", destination_paths, config, client=client)
+    assert (restored / "local-only.txt").read_text() == "preserved"

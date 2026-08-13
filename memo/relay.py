@@ -61,7 +61,7 @@ def run(path: Path, paths: Paths | None = None, shell: str | None = None,
 
     try:
         if original_mode is not None:
-            tty.setraw(stdin_fd)
+            tty.setraw(stdin_fd, termios.TCSANOW)
         _resize(stdin_fd, master_fd)
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
             previous_handlers[signum] = signal.signal(signum, forward)

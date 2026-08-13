@@ -30,6 +30,27 @@ Directory sessions live at `$MEMO_HOME/archive/<namespace>/<id>/`. Immutable che
 
 `--at final` resolves `HEAD` once. Historical directory checkpoints can be selected with `generation:N` or `checkpoint:ID`. Restores refuse to replace non-empty destinations unless `--force` is supplied.
 
+## S3 Transport
+
+Set `MEMO_S3_BUCKET` to enable S3-compatible transport. Optional settings are
+`MEMO_S3_ENDPOINT`, `MEMO_S3_REGION`, `MEMO_S3_PREFIX`, and `MEMO_AWS_PROFILE`.
+Credentials come from the standard AWS SDK credential chain and are never written
+to session metadata.
+
+```console
+memo --push
+memo --push --session <id>
+memo --pull <id>
+memo --pull <id> --force
+```
+
+The daemon retries changed generations every 15 minutes. Override the cadence with
+`MEMO_PUSH_INTERVAL`, or disable automatic push with `MEMO_AUTO_PUSH=0`. Pushes are
+complete deterministic packages, so bandwidth scales with the committed generation
+size. Data and checksum objects publish before `latest.json`. Pull verifies both,
+rejects unsafe archive entries, and atomically installs without removing prior local
+state when an operation fails. A local session is not replaced without `--force`.
+
 ## Legacy Sessions
 
 Run an agent normally through memo; all arguments and terminal I/O pass through:

@@ -43,6 +43,35 @@ class Paths:
         self.spool.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
+@dataclass(frozen=True)
+class TransportConfig:
+    bucket: str
+    prefix: str = "memo"
+    endpoint_url: str | None = None
+    region: str | None = None
+    profile: str | None = None
+
+    @classmethod
+    def discover(cls, required: bool = False) -> "TransportConfig | None":
+        bucket = os.environ.get("MEMO_S3_BUCKET", "").strip()
+        if not bucket:
+            if required:
+                raise ValueError("S3 transport requires MEMO_S3_BUCKET")
+            return None
+        return cls(
+            bucket=bucket,
+            prefix=os.environ.get("MEMO_S3_PREFIX", "memo").strip("/"),
+            endpoint_url=os.environ.get("MEMO_S3_ENDPOINT") or None,
+            region=os.environ.get("MEMO_S3_REGION") or None,
+            profile=os.environ.get("MEMO_AWS_PROFILE") or None,
+        )
+
+    def client(self):
+        import boto3
+        session = boto3.Session(profile_name=self.profile, region_name=self.region)
+        return session.client("s3", endpoint_url=self.endpoint_url)
+
+
 def checkpoint_interval() -> float:
     value = os.environ.get("MEMO_CHECKPOINT_INTERVAL", "15")
     try:
@@ -83,3 +112,11 @@ def watcher_debounce() -> float:
 
 def recovery_enabled() -> bool:
     return os.environ.get("MEMO_RECOVERY", "1").lower() not in {"0", "false", "no", "off"}
+
+
+def automatic_push_interval() -> float:
+    return _positive_float("MEMO_PUSH_INTERVAL", 15 * 60, minimum=1.0)
+
+
+def automatic_push_enabled() -> bool:
+    return os.environ.get("MEMO_AUTO_PUSH", "1").lower() not in {"0", "false", "no", "off"}

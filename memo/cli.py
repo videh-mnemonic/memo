@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-from .daemon import activate, end
+from .daemon import activate, end, push
 from .load import (inspect_session, reconstruct, replay, terminal_json, trace_json,
                    unpack, write_terminals, write_traces)
 from .relay import run as run_relay
@@ -31,6 +31,8 @@ def parser() -> argparse.ArgumentParser:
     action.add_argument("--background", action="store_true",
                         help="start or join a directory recording without a terminal")
     action.add_argument("--end", action="store_true", help="finalize a directory recording")
+    action.add_argument("--push", action="store_true", help="push changed directory sessions")
+    action.add_argument("--pull", metavar="SESSION_ID", help="pull a directory session")
     result.add_argument("recording_path", nargs="?", type=Path,
                         help="directory to record (defaults to the current directory)")
     result.add_argument("--all", action="store_true", help="with --save, ship every scratch session")
@@ -116,6 +118,20 @@ def main(argv: list[str] | None = None) -> int:
             result = end(args.recording_path or Path.cwd())
             action = "already complete" if result["already_complete"] else "completed"
             print(f"{action}: {result['session_id']} generation={result['generation']}")
+            return 0
+        if args.push:
+            result = push(args.session)
+            for session_id in result["pushed"]:
+                print(f"pushed: {session_id}")
+            for session_id in result["skipped"]:
+                print(f"skipped: unchanged: {session_id}")
+            for session_id, error in result["failed"]:
+                print(f"failed: {session_id}: {error}", file=sys.stderr)
+            return 1 if result["failed"] else 0
+        if args.pull:
+            from .transport import pull_session
+            destination = pull_session(args.pull, force=args.force)
+            print(f"pulled: {args.pull} path={destination}")
             return 0
         return run_relay(args.recording_path or Path.cwd())
     except Exception as error:
