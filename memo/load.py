@@ -241,7 +241,12 @@ def trace_json(session_id: str, raw: bool = False, paths: Paths | None = None) -
         return terminal_json(session_id, paths=paths)
     source = unpack(session_id, paths)
     meta = SessionMeta.load(source / "meta.json")
-    return json.dumps(all_traces(get_harness(meta.provider), source, raw), indent=2, ensure_ascii=False) + "\n"
+    trace_files = [leg.trace_file for leg in meta.legs if leg.trace_file is not None]
+    return json.dumps(
+        all_traces(get_harness(meta.provider), source, raw, trace_files=trace_files),
+        indent=2,
+        ensure_ascii=False,
+    ) + "\n"
 
 
 def terminal_json(session_id: str, terminal_id: str | None = None,
@@ -301,8 +306,13 @@ def replay(session_id: str, at: str, destination: Path, force: bool = False,
     reconstruct(session_id, at, destination, force, paths)
     meta = SessionMeta.load(source / "meta.json")
     through = int(at.partition(":")[2]) if at.startswith("leg:") else None
+    trace_files = [
+        leg.trace_file for leg in meta.legs
+        if leg.trace_file is not None and (through is None or int(leg.leg_id) <= through)
+    ]
     records = ([] if at == "initial" else
-               all_traces(get_harness(meta.provider), source, through_leg=through))
+               all_traces(get_harness(meta.provider), source, through_leg=through,
+                          trace_files=trace_files))
     prompts = [
         _prompt_text(record["event"]["content"])
         for record in records if record["event"]["type"] == "user_input"

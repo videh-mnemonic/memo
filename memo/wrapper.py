@@ -24,17 +24,6 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _resume_id(tool: str, args: list[str]) -> str | None:
-    for flag in ("--resume", "-r"):
-        if flag in args:
-            index = args.index(flag)
-            if index + 1 < len(args):
-                return args[index + 1]
-    if tool == "codex" and args[:1] == ["resume"] and len(args) > 1:
-        return args[1]
-    return None
-
-
 def _tool_version(tool: str) -> str:
     try:
         return subprocess.run([tool, "--version"], text=True, stdout=subprocess.PIPE,
@@ -68,7 +57,7 @@ def _copy_trace(trace: Path, session_dir: Path, leg_id: str) -> str:
 
 def _adopt_session_id(meta: SessionMeta, paths: Paths, session_dir: Path, leg_id: str,
                       actual_id: str) -> tuple[Path, Path]:
-    if actual_id == meta.session_id:
+    if actual_id == meta.session_id or actual_id == meta.resumes:
         return session_dir, session_dir / "legs" / leg_id
     target = paths.scratch / actual_id
     if target.exists():

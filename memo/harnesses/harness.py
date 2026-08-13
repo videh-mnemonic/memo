@@ -152,9 +152,15 @@ def all_traces(
     unpacked: Path,
     raw: bool = False,
     through_leg: int | None = None,
+    trace_files: Sequence[str] | None = None,
 ) -> list[Any]:
     result: list[Any] = []
-    for path in sorted((unpacked / "traces").glob("leg-*.jsonl")):
+    paths = (
+        [unpacked / "traces" / name for name in trace_files]
+        if trace_files is not None
+        else sorted((unpacked / "traces").glob("leg-*.jsonl"))
+    )
+    for path in paths:
         trace = path.stem.removeprefix("leg-")
         if through_leg is not None and int(trace) > through_leg:
             continue

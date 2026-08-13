@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from memo.load import inspect_session, reconstruct, terminal_json, trace_json
-from memo.models import CheckpointManifest, DirectorySession, SessionMeta, SnapshotEntry
+from memo.models import CheckpointManifest, DirectorySession, Leg, SessionMeta, SnapshotEntry
 from memo.session_store import SessionStore, atomic_write
 from memo.streams import StreamEvent
 from memo.config import Paths
@@ -46,6 +46,10 @@ def _agent_fixture(tmp_path: Path) -> Paths:
         repo_root=str(tmp_path), repo_name="repo", remote="", canonical_remote="",
         archive_namespace="local", initial_head="", final_head="",
         first_seen_utc="start", last_activity_utc="end",
+        legs=[
+            Leg("001", [], "start", "end", 0, "leg-001.jsonl", True),
+            Leg("002", [], "start", "end", 0, "leg-002.jsonl", True),
+        ],
     ).save(session / "meta.json")
     (session / "traces" / "leg-002.jsonl").write_text(
         '{"type":"assistant","content":"done"}\ninvalid\n'
@@ -127,3 +131,16 @@ def test_agent_trace_export_preserves_normal_and_raw_contracts(tmp_path: Path) -
         {"type": "user", "content": {"text": "fix it"}}, ["native"],
         {"type": "assistant", "content": "done"},
     ]
+
+
+def test_agent_trace_export_uses_ordered_metadata_references(tmp_path: Path) -> None:
+    paths = _agent_fixture(tmp_path)
+    session = paths.scratch / "agent-session"
+    (session / "traces" / "leg-003.jsonl").write_text(
+        '{"type":"user","content":"unreferenced"}\n'
+    )
+
+    exported = json.loads(trace_json("agent-session", paths=paths))
+
+    assert [item["position"]["trace"] for item in exported] == ["001", "001", "002", "002"]
+    assert all(item["event"]["content"] != "unreferenced" for item in exported)

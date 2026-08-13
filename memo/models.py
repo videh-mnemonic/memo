@@ -25,6 +25,21 @@ class Leg:
     def from_dict(cls, value: dict[str, Any]) -> "Leg":
         return cls(**value)
 
+    def validate(self, expected_number: int) -> None:
+        expected_id = f"{expected_number:03d}"
+        if self.leg_id != expected_id:
+            raise ValueError(f"agent session legs must be ordered from 001: expected {expected_id}")
+        if not isinstance(self.tool_args, list) or not all(isinstance(arg, str) for arg in self.tool_args):
+            raise ValueError(f"invalid tool arguments for leg {self.leg_id}")
+        if not self.start_utc:
+            raise ValueError(f"start time is required for leg {self.leg_id}")
+        if self.trace_file is not None and self.trace_file != f"leg-{self.leg_id}.jsonl":
+            raise ValueError(f"invalid trace reference for leg {self.leg_id}")
+        if self.complete and (self.end_utc is None or self.exit_code is None):
+            raise ValueError(f"completed leg {self.leg_id} requires end time and exit code")
+        if not self.complete and (self.end_utc is not None or self.exit_code is not None):
+            raise ValueError(f"active leg {self.leg_id} cannot have completion data")
+
 
 @dataclass
 class SessionMeta:
@@ -53,7 +68,11 @@ class SessionMeta:
     def validate(self) -> None:
         if self.format != "memo-agent-session" or self.format_version != AGENT_SESSION_FORMAT_VERSION:
             raise ValueError("unsupported agent session format")
-        if not self.provider:
+        if (not self.session_id or self.session_id in {".", ".."}
+                or Path(self.session_id).name != self.session_id):
+            raise ValueError("agent session id must be a safe, non-empty path component")
+        if (not self.provider or self.provider in {".", ".."}
+                or Path(self.provider).name != self.provider):
             raise ValueError("agent session provider is required")
         if self.repo_kind not in {"real", "synthetic"}:
             raise ValueError(f"invalid repo_kind: {self.repo_kind}")
@@ -64,6 +83,13 @@ class SessionMeta:
             raise ValueError("canonical_remote requires remote")
         if self.coverage not in {"full", "partial_outside_repo"}:
             raise ValueError(f"invalid coverage: {self.coverage}")
+        if self.resumes is not None and (not self.resumes or self.resumes in {".", ".."}
+                                         or Path(self.resumes).name != self.resumes):
+            raise ValueError("resume relationship must contain a safe session id")
+        if self.resumes == self.session_id:
+            raise ValueError("an agent session cannot resume itself")
+        for number, leg in enumerate(self.legs, 1):
+            leg.validate(number)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

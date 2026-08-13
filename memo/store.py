@@ -68,15 +68,39 @@ def find_session(session_id: str, paths: Paths | None = None) -> SessionLocation
     paths = paths or Paths.discover()
     scratch = paths.scratch / session_id
     if scratch.is_dir():
-        return SessionLocation("scratch", scratch)
-    directory_matches = sorted(paths.archive.glob(f"*/{session_id}/session.json")) if paths.archive.exists() else []
+        try:
+            SessionMeta.load(scratch / "meta.json")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        else:
+            return SessionLocation("scratch", scratch)
+    directory_matches = []
+    for candidate in sorted(paths.archive.glob(f"*/{session_id}/session.json")) if paths.archive.exists() else []:
+        try:
+            DirectorySession.load(candidate)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        directory_matches.append(candidate)
     if len(directory_matches) > 1:
         namespaces = ", ".join(path.parent.parent.name for path in directory_matches)
         raise AmbiguousSessionError(f"session {session_id} exists in multiple namespaces: {namespaces}")
     if directory_matches:
         match = directory_matches[0].parent
         return SessionLocation("directory", match, match.parent.name)
-    matches = sorted(paths.archive.glob(f"*/{session_id}.tar.gz")) if paths.archive.exists() else []
+    matches = []
+    for candidate in sorted(paths.archive.glob(f"*/{session_id}.tar.gz")) if paths.archive.exists() else []:
+        try:
+            with tarfile.open(candidate, "r:gz") as archive:
+                handle = archive.extractfile(archive.getmember("meta.json"))
+                if handle is None:
+                    continue
+                meta = SessionMeta.from_dict(json.loads(handle.read()))
+                meta.validate()
+                if meta.session_id != session_id:
+                    continue
+        except (OSError, ValueError, TypeError, KeyError, tarfile.TarError, json.JSONDecodeError):
+            continue
+        matches.append(candidate)
     if not matches:
         raise SessionNotFoundError(f"session not found: {session_id}")
     if len(matches) > 1:

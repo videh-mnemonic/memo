@@ -15,6 +15,7 @@ import pytest
 
 from memo.cli import main
 from memo.config import Paths
+from memo.load import trace_json
 from memo.protocol import request
 from memo.session_store import SessionStore
 
@@ -58,8 +59,38 @@ with (trace / "session-live.jsonl").open("w") as f:
 '''
 
 
+RESUME_STUB = '''#!/usr/bin/env python3
+import json, os, pathlib, sys
+if "--version" in sys.argv:
+    print("stub 1.0")
+    raise SystemExit(0)
+trace = pathlib.Path(os.environ["MEMO_TRACE_DIR"])
+trace.mkdir(parents=True, exist_ok=True)
+provider = pathlib.Path(sys.argv[0]).name
+session_id = os.environ.get("STUB_SESSION_ID", "resume123")
+prompt = os.environ.get("STUB_PROMPT", "first prompt")
+with (trace / f"{provider}-{session_id}.jsonl").open("w") as f:
+    f.write(json.dumps({"session_id":session_id, "type":"user", "content":prompt}) + "\\n")
+'''
+
+
 def _tree(path: Path) -> dict[str, bytes]:
     return {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*") if p.is_file() and ".git" not in p.parts}
+
+
+def _install_resume_stubs(tmp_path: Path, monkeypatch, work: Path) -> Path:
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    for provider in ("claude", "codex"):
+        stub = binary / provider
+        stub.write_text(RESUME_STUB)
+        stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    memo_home = tmp_path / "memo-home"
+    monkeypatch.setenv("MEMO_HOME", str(memo_home))
+    monkeypatch.setenv("MEMO_TRACE_DIR", str(tmp_path / "traces"))
+    monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.chdir(work)
+    return memo_home
 
 
 def test_real_repo_capture_save_load(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -231,6 +262,95 @@ def test_live_session_id_collision_keeps_provisional_session(tmp_path: Path, mon
     meta = json.loads((provisional[0] / "meta.json").read_text())
     assert meta["legs"][0]["complete"] is True
     assert meta["legs"][0]["trace_file"] == "leg-001.jsonl"
+
+
+@pytest.mark.parametrize(
+    ("provider", "resume_args"),
+    [
+        ("claude", ["--resume", "resume123"]),
+        ("claude", ["-r", "resume123"]),
+        ("codex", ["--resume", "resume123"]),
+        ("codex", ["-r", "resume123"]),
+        ("codex", ["resume", "resume123"]),
+    ],
+)
+def test_agent_resume_forms_append_a_leg(
+    tmp_path: Path, monkeypatch, provider: str, resume_args: list[str]
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    memo_home = _install_resume_stubs(tmp_path, monkeypatch, work)
+
+    assert main([provider]) == 0
+    monkeypatch.setenv("STUB_PROMPT", "second prompt")
+    assert main([provider, *resume_args]) == 0
+
+    session = memo_home / "scratch" / "resume123"
+    meta = json.loads((session / "meta.json").read_text())
+    assert meta["provider"] == provider
+    assert [leg["leg_id"] for leg in meta["legs"]] == ["001", "002"]
+    assert [leg["trace_file"] for leg in meta["legs"]] == ["leg-001.jsonl", "leg-002.jsonl"]
+    assert "first prompt" in (session / "traces" / "leg-001.jsonl").read_text()
+    assert "second prompt" in (session / "traces" / "leg-002.jsonl").read_text()
+
+
+def test_resume_rejects_provider_mismatch(tmp_path: Path, monkeypatch, capsys) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    memo_home = _install_resume_stubs(tmp_path, monkeypatch, work)
+    assert main(["claude"]) == 0
+
+    assert main(["codex", "--resume", "resume123"]) == 1
+    assert "belongs to claude, not codex" in capsys.readouterr().err
+    meta = json.loads((memo_home / "scratch" / "resume123" / "meta.json").read_text())
+    assert len(meta["legs"]) == 1
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_two_leg_session_save_load_and_replay_bounds(tmp_path: Path, monkeypatch, provider: str) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    memo_home = _install_resume_stubs(tmp_path, monkeypatch, work)
+    assert main([provider]) == 0
+    monkeypatch.setenv("STUB_PROMPT", "second prompt")
+    assert main([provider, "--resume", "resume123"]) == 0
+
+    scratch_events = json.loads(trace_json("resume123"))
+    assert [event["event"]["content"] for event in scratch_events] == ["first prompt", "second prompt"]
+    assert main(["--save", "--session", "resume123"]) == 0
+    archived_events = json.loads(trace_json("resume123"))
+    assert archived_events == scratch_events
+
+    for selector, expected, unexpected in (
+        ("initial", None, "first prompt"),
+        ("leg:1", "first prompt", "second prompt"),
+        ("final", "second prompt", None),
+    ):
+        destination = tmp_path / f"replay-{provider}-{selector.replace(':', '-')}"
+        assert main(["--load", "resume123", "--replay", "--at", selector, "--path", str(destination)]) == 0
+        task = (destination / "MEMO_TASK.md").read_text()
+        if expected is not None:
+            assert expected in task
+        if unexpected is not None:
+            assert unexpected not in task
+
+
+def test_archived_resume_id_creates_child_session(tmp_path: Path, monkeypatch) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    memo_home = _install_resume_stubs(tmp_path, monkeypatch, work)
+    assert main(["claude"]) == 0
+    assert main(["--save", "--session", "resume123"]) == 0
+
+    monkeypatch.setenv("STUB_SESSION_ID", "resume123")
+    monkeypatch.setenv("STUB_PROMPT", "child prompt")
+    assert main(["claude", "--resume", "resume123"]) == 0
+
+    children = list((memo_home / "scratch").glob("provisional-*"))
+    assert len(children) == 1
+    child = json.loads((children[0] / "meta.json").read_text())
+    assert child["session_id"] != "resume123"
+    assert child["resumes"] == "resume123"
 
 
 def test_public_cli_starts_background_directory_recording(tmp_path: Path, monkeypatch, capsys) -> None:
