@@ -305,3 +305,37 @@ def test_two_interactive_attachments_publish_one_directory_checkpoint(tmp_path: 
             request(str(socket_path), "shutdown")
         for master in masters:
             os.close(master)
+
+
+def test_end_restore_export_and_restart_directory_session(tmp_path: Path, monkeypatch, capsys) -> None:
+    home = tmp_path / "memo-home"
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "note.txt").write_text("recorded\n")
+    monkeypatch.setenv("MEMO_HOME", str(home))
+    monkeypatch.setenv("MEMO_CHECKPOINT_INTERVAL", "60")
+
+    assert main(["--background", str(root)]) == 0
+    first_session = next(home.glob("archive/*/*/session.json")).parent
+    assert main(["--end", str(root)]) == 0
+    assert "completed:" in capsys.readouterr().out
+    first_meta = json.loads((first_session / "session.json").read_text())
+    assert first_meta["state"] == "complete"
+    paths = Paths.discover()
+    assert paths.registry is not None
+    from memo.registry import Registry
+    with Registry(paths.registry) as registry:
+        assert registry.lookup(root) is None
+
+    restored = tmp_path / "restored"
+    assert main(["--load", first_session.name, "--at", "final", "--path", str(restored)]) == 0
+    assert (restored / "note.txt").read_text() == "recorded\n"
+    assert main(["--load", first_session.name, "--terminals"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+    assert main(["--background", str(root)]) == 0
+    sessions = [path.parent for path in home.glob("archive/*/*/session.json")]
+    assert len(sessions) == 2
+    assert {path.name for path in sessions} != {first_session.name}
+    assert paths.socket is not None
+    request(str(paths.socket), "shutdown")

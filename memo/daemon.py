@@ -107,6 +107,9 @@ class MemoDaemon:
             request_event.wait(max(0.0, deadline - time.monotonic()))
             if self._stop.is_set():
                 return
+            current = self.registry.lookup(active.root)
+            if current is None or current.session_id != active.session_id or current.state != "active":
+                return
             if request_event.is_set():
                 request_event.clear()
                 if self._stop.wait(watcher_debounce()):
@@ -166,8 +169,84 @@ class MemoDaemon:
                 "root": str(active.root),
                 "archive_namespace": active.archive_namespace,
                 "generation": head.generation if head else 0,
+                "state": active.state,
+                "attachments": len([
+                    item for item in self.registry.list_attachments(active.session_id)
+                    if item.detached_utc is None
+                ]),
             }
         }
+
+    def _end(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            root = Path(payload["path"]).expanduser().resolve(strict=True)
+        except (KeyError, TypeError) as error:
+            raise ProtocolError("end requires a path") from error
+        active = self.registry.lookup(root)
+        if active is None:
+            completed = [
+                session for _, session in self.store.list_sessions()
+                if Path(session.root) == root and session.state == "complete"
+            ]
+            if completed:
+                session = max(completed, key=lambda item: item.updated_utc)
+                manifest = self.store.head(session.archive_namespace, session.session_id)
+                return {
+                    "session_id": session.session_id,
+                    "state": "complete",
+                    "generation": manifest.generation if manifest else 0,
+                    "already_complete": True,
+                }
+            raise FileNotFoundError("no active recording for path")
+        if active.state == "active":
+            active = self.registry.transition(active.session_id, "active", "ending")
+        session = self._session_model(active)
+        if session.state != "ending":
+            session.state = "ending"
+            session.updated_utc = utcnow()
+            self.store.update_session(session)
+        detached_at = utcnow()
+        for attachment in self.registry.list_attachments(active.session_id):
+            if attachment.detached_utc is None:
+                self.registry.detach(attachment.terminal_id, detached_at)
+        manifest = self.publisher.publish(session)
+        session.state = "complete"
+        session.updated_utc = manifest.created_utc
+        self.store.update_session(session)
+        self.registry.transition(active.session_id, "ending", "complete")
+        self.registry.remove(active.session_id)
+        request_event = self._checkpoint_requests.get(active.session_id)
+        if request_event:
+            request_event.set()
+        observer = self._observers.pop(active.session_id, None)
+        if observer:
+            observer.stop()
+            observer.join(timeout=2)
+        return {
+            "session_id": active.session_id,
+            "state": "complete",
+            "generation": manifest.generation,
+            "checkpoint_id": manifest.checkpoint_id,
+            "already_complete": False,
+        }
+
+    def _status(self) -> dict[str, Any]:
+        sessions = []
+        for active in self.registry.list_active():
+            head = self.store.head(active.archive_namespace, active.session_id)
+            sessions.append({
+                "session_id": active.session_id,
+                "root": str(active.root),
+                "archive_namespace": active.archive_namespace,
+                "state": active.state,
+                "generation": head.generation if head else 0,
+                "latest_checkpoint_utc": head.created_utc if head else None,
+                "attachments": len([
+                    item for item in self.registry.list_attachments(active.session_id)
+                    if item.detached_utc is None
+                ]),
+            })
+        return {"sessions": sessions}
 
     def dispatch(self, message: Request) -> dict[str, Any]:
         if message.operation == "health":
@@ -197,6 +276,10 @@ class MemoDaemon:
             return {"terminal_id": terminal_id, "detached": True}
         if message.operation == "lookup":
             return self._lookup(message.payload)
+        if message.operation == "end":
+            return self._end(message.payload)
+        if message.operation == "status":
+            return self._status()
         if message.operation == "checkpoint":
             active = self.registry.lookup(Path(message.payload["path"]))
             if active is None:
@@ -231,6 +314,9 @@ class MemoDaemon:
                 self.store.check_integrity(active.archive_namespace, active.session_id)
             self.streams.recover_all()
             self.registry.expire_attachments(utcnow())
+            for active in self.registry.list_active():
+                if active.state == "ending":
+                    self._end({"path": str(active.root)})
         self.socket_path.unlink(missing_ok=True)
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server = server
@@ -299,6 +385,13 @@ def attach(path: Path, paths: Paths | None = None) -> dict[str, Any]:
     ensure_daemon(paths)
     assert paths.socket is not None
     return request(str(paths.socket), "attach", {"path": str(path)})
+
+
+def end(path: Path, paths: Paths | None = None) -> dict[str, Any]:
+    paths = paths or Paths.discover()
+    ensure_daemon(paths)
+    assert paths.socket is not None
+    return request(str(paths.socket), "end", {"path": str(path)}, timeout=60.0)
 
 
 def main() -> int:

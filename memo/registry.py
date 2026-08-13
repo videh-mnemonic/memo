@@ -17,6 +17,7 @@ class ActiveSession:
     root: Path
     archive_namespace: str
     created_utc: str
+    state: str = "active"
 
 
 @dataclass(frozen=True)
@@ -50,8 +51,14 @@ class Registry:
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS active_sessions ("
             "root TEXT PRIMARY KEY, session_id TEXT UNIQUE NOT NULL, "
-            "archive_namespace TEXT NOT NULL, created_utc TEXT NOT NULL)"
+            "archive_namespace TEXT NOT NULL, created_utc TEXT NOT NULL, "
+            "state TEXT NOT NULL DEFAULT 'active')"
         )
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(active_sessions)")}
+        if "state" not in columns:
+            self.connection.execute(
+                "ALTER TABLE active_sessions ADD COLUMN state TEXT NOT NULL DEFAULT 'active'"
+            )
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS attachments ("
             "terminal_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, "
@@ -70,14 +77,15 @@ class Registry:
         self.close()
 
     @staticmethod
-    def _row(value: tuple[str, str, str, str]) -> ActiveSession:
-        root, session_id, namespace, created = value
-        return ActiveSession(session_id, Path(root), namespace, created)
+    def _row(value: tuple[str, str, str, str, str]) -> ActiveSession:
+        root, session_id, namespace, created, state = value
+        return ActiveSession(session_id, Path(root), namespace, created, state)
 
     def list_active(self) -> list[ActiveSession]:
         with self._lock:
             rows = self.connection.execute(
-                "SELECT root, session_id, archive_namespace, created_utc FROM active_sessions ORDER BY root"
+                "SELECT root, session_id, archive_namespace, created_utc, state "
+                "FROM active_sessions ORDER BY root"
             ).fetchall()
         return [self._row(row) for row in rows]
 
@@ -85,7 +93,8 @@ class Registry:
         root = str(canonical_root(path))
         with self._lock:
             row = self.connection.execute(
-                "SELECT root, session_id, archive_namespace, created_utc FROM active_sessions WHERE root = ?",
+                "SELECT root, session_id, archive_namespace, created_utc, state "
+                "FROM active_sessions WHERE root = ?",
                 (root,),
             ).fetchone()
         return self._row(row) if row else None
@@ -97,11 +106,15 @@ class Registry:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
                 rows = self.connection.execute(
-                    "SELECT root, session_id, archive_namespace, created_utc FROM active_sessions"
+                    "SELECT root, session_id, archive_namespace, created_utc, state FROM active_sessions"
                 ).fetchall()
                 for row in rows:
                     active = self._row(row)
                     if active.root == root:
+                        if active.state != "active":
+                            raise RuntimeError(
+                                f"recording is {active.state}: {active.session_id}"
+                            )
                         self.connection.execute("COMMIT")
                         return active, False
                     if _overlaps(active.root, root):
@@ -110,7 +123,8 @@ class Registry:
                         )
                 active = ActiveSession(session_id or uuid.uuid4().hex, root, archive_namespace, created_utc)
                 self.connection.execute(
-                    "INSERT INTO active_sessions(root, session_id, archive_namespace, created_utc) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO active_sessions(root, session_id, archive_namespace, created_utc, state) "
+                    "VALUES (?, ?, ?, ?, 'active')",
                     (str(root), active.session_id, archive_namespace, created_utc),
                 )
                 self.connection.execute("COMMIT")
@@ -124,6 +138,13 @@ class Registry:
                             terminal_id: str | None = None) -> Attachment:
         attachment = Attachment(terminal_id or uuid.uuid4().hex, session_id, 0, attached_utc)
         with self._lock:
+            state = self.connection.execute(
+                "SELECT state FROM active_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if state is None:
+                raise KeyError(f"unknown active session: {session_id}")
+            if state[0] != "active":
+                raise RuntimeError(f"recording is {state[0]}: {session_id}")
             self.connection.execute(
                 "INSERT INTO attachments(terminal_id, session_id, accepted_sequence, attached_utc) "
                 "VALUES (?, ?, 0, ?)",
@@ -191,8 +212,30 @@ class Registry:
             ).fetchall()
         return [Attachment(*row) for row in rows]
 
+    def transition(self, session_id: str, expected: str, state: str) -> ActiveSession:
+        if expected not in {"active", "ending"} or state not in {"ending", "complete"}:
+            raise ValueError("invalid session transition")
+        with self._lock:
+            cursor = self.connection.execute(
+                "UPDATE active_sessions SET state = ? WHERE session_id = ? AND state = ?",
+                (state, session_id, expected),
+            )
+            row = self.connection.execute(
+                "SELECT root, session_id, archive_namespace, created_utc, state "
+                "FROM active_sessions WHERE session_id = ?", (session_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown active session: {session_id}")
+        active = self._row(row)
+        if cursor.rowcount != 1 and active.state != state:
+            raise RuntimeError(
+                f"cannot transition session {session_id} from {active.state} to {state}"
+            )
+        return active
+
     def remove(self, session_id: str) -> None:
         with self._lock:
+            self.connection.execute("DELETE FROM attachments WHERE session_id = ?", (session_id,))
             self.connection.execute("DELETE FROM active_sessions WHERE session_id = ?", (session_id,))
 
     def remove_stale(self, archive_root: Path) -> list[str]:

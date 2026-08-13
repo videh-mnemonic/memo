@@ -3,10 +3,15 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import Paths
 from .models import CheckpointManifest, DirectorySession
+
+if TYPE_CHECKING:
+    from .streams import StreamEvent
 
 
 def _json_bytes(value: dict[str, object]) -> bytes:
@@ -40,6 +45,9 @@ class SessionStore:
     def session_path(self, namespace: str, session_id: str) -> Path:
         assert self.paths.directory_archive is not None
         return self.paths.directory_archive / namespace / session_id
+
+    def list_sessions(self) -> list[tuple[Path, DirectorySession]]:
+        return list_directory_sessions(self.paths)
 
     def create(self, session: DirectorySession) -> Path:
         session.validate()
@@ -93,6 +101,88 @@ class SessionStore:
                     if not chunk_path.is_file():
                         raise ValueError(f"terminal stream references missing chunk: {terminal_id}/{chunk}")
         return manifest
+
+    def checkpoint(self, namespace: str, session_id: str,
+                   selector: str | int | None = None) -> CheckpointManifest:
+        path = self.session_path(namespace, session_id)
+        if selector is None or selector == "final" or selector == "HEAD":
+            manifest = self.head(namespace, session_id)
+            if manifest is None:
+                raise ValueError(f"session has no published checkpoint: {session_id}")
+            return manifest
+        matches: list[Path]
+        if isinstance(selector, int) or str(selector).isdigit():
+            generation = int(selector)
+            matches = sorted((path / "checkpoints").glob("*.json"))
+            manifests = [CheckpointManifest.load(item) for item in matches]
+            found = [item for item in manifests if item.generation == generation]
+            if len(found) != 1:
+                raise ValueError(f"checkpoint generation not found: {generation}")
+            manifest = found[0]
+        else:
+            checkpoint_id = str(selector).removeprefix("checkpoint:")
+            if Path(checkpoint_id).name != checkpoint_id:
+                raise ValueError(f"invalid checkpoint selector: {selector}")
+            manifest = CheckpointManifest.load(path / "checkpoints" / f"{checkpoint_id}.json")
+        self._validate_manifest(path, session_id, manifest)
+        return manifest
+
+    @staticmethod
+    def _validate_manifest(path: Path, session_id: str,
+                           manifest: CheckpointManifest) -> None:
+        if manifest.session_id != session_id:
+            raise ValueError("checkpoint belongs to another session")
+        snapshot = path / manifest.snapshot
+        if not snapshot.is_dir():
+            raise ValueError(f"checkpoint references missing snapshot: {manifest.snapshot}")
+        for entry in manifest.entries:
+            if entry.kind == "file" or entry.retained:
+                if not (snapshot / entry.path).is_file():
+                    raise ValueError(f"checkpoint references missing snapshot file: {entry.path}")
+
+    def restore(self, namespace: str, session_id: str, destination: Path,
+                selector: str | int | None = None, force: bool = False) -> Path:
+        manifest = self.checkpoint(namespace, session_id, selector)
+        source = self.session_path(namespace, session_id) / manifest.snapshot
+        if destination.exists():
+            occupied = not destination.is_dir() or any(destination.iterdir())
+            if occupied and not force:
+                raise FileExistsError(f"destination is not empty: {destination}")
+            if occupied:
+                if destination.is_dir():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination, dirs_exist_ok=True, copy_function=shutil.copy2)
+        return destination
+
+    def stream_events(self, namespace: str, session_id: str,
+                      terminal_id: str | None = None,
+                      selector: str | int | None = None) -> list[StreamEvent]:
+        from .streams import merged_timeline
+        manifest = self.checkpoint(namespace, session_id, selector)
+        terminals = manifest.stream_high_water
+        if terminal_id is not None and terminal_id not in terminals:
+            raise KeyError(f"terminal stream not found: {terminal_id}")
+        selected = [terminal_id] if terminal_id is not None else sorted(terminals)
+        chunks = []
+        root = self.session_path(namespace, session_id) / "streams" / "terminals"
+        for stream_id in selected:
+            metadata_path = root / stream_id / "stream.json"
+            if terminals[stream_id] == 0:
+                continue
+            if not metadata_path.is_file():
+                raise ValueError(f"checkpoint references missing terminal stream: {stream_id}")
+            metadata = json.loads(metadata_path.read_text())
+            for relative in metadata.get("chunks", []):
+                chunk = metadata_path.parent / relative
+                if not chunk.is_file():
+                    raise ValueError(f"terminal stream references missing chunk: {stream_id}/{relative}")
+                chunks.append(chunk)
+        events = merged_timeline(chunks)
+        return [event for event in events
+                if event.sequence <= terminals.get(event.terminal_id, -1)]
 
     def check_integrity(self, namespace: str, session_id: str) -> CheckpointManifest | None:
         path = self.session_path(namespace, session_id)

@@ -5,8 +5,9 @@ import re
 import sys
 from pathlib import Path
 
-from .daemon import activate
-from .load import inspect_session, reconstruct, replay, trace_json, unpack, write_traces
+from .daemon import activate, end
+from .load import (inspect_session, reconstruct, replay, terminal_json, trace_json,
+                   unpack, write_terminals, write_traces)
 from .relay import run as run_relay
 from .save import save_sessions
 from .status import render_status
@@ -29,6 +30,7 @@ def parser() -> argparse.ArgumentParser:
     action.add_argument("--load", metavar="SESSION_ID", help="load a scratch or shipped session")
     action.add_argument("--background", action="store_true",
                         help="start or join a directory recording without a terminal")
+    action.add_argument("--end", action="store_true", help="finalize a directory recording")
     result.add_argument("recording_path", nargs="?", type=Path,
                         help="directory to record (defaults to the current directory)")
     result.add_argument("--all", action="store_true", help="with --save, ship every scratch session")
@@ -38,8 +40,10 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument("--inspect", action="store_true")
     mode.add_argument("--unpack", action="store_true")
     mode.add_argument("--traces", action="store_true")
+    mode.add_argument("--terminals", action="store_true")
     mode.add_argument("--replay", action="store_true")
-    result.add_argument("--at", choices=["initial", "final"], help="reconstruction point (or use leg:N)")
+    result.add_argument("--at", help="reconstruction point, generation:N, or checkpoint:ID")
+    result.add_argument("--terminal", metavar="ID", help="select one terminal stream")
     result.add_argument("--path", type=Path, help="output file or directory")
     result.add_argument("--raw", action="store_true", help="preserve raw vendor trace records")
     result.add_argument("--force", action="store_true", help="replace a non-empty reconstruction directory")
@@ -66,16 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as error:
             print(f"memo: {error}", file=sys.stderr)
             return 1
-    # argparse choices cannot express leg:N; normalize it after a permissive pre-scan.
-    leg_at = None
-    if "--at" in argv:
-        index = argv.index("--at")
-        if index + 1 < len(argv) and argv[index + 1].startswith("leg:"):
-            leg_at = argv[index + 1]
-            argv[index + 1] = "initial"
     args = parser().parse_args(argv)
-    if leg_at:
-        args.at = leg_at
     try:
         if args.status:
             print(render_status(), end="")
@@ -93,6 +88,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(trace_json(args.load, args.raw), end="")
                 else:
                     write_traces(args.load, args.path, args.raw)
+            elif args.terminals:
+                if not args.path or str(args.path) == "-":
+                    print(terminal_json(args.load, args.terminal, args.at), end="")
+                else:
+                    write_terminals(args.load, args.path, args.terminal, args.at)
             elif args.replay:
                 if not args.path or not args.at:
                     raise ValueError("--replay requires --at and --path DIR")
@@ -111,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"{action}: {result['session_id']} "
                 f"generation={result['generation']} root={result['root']}"
             )
+            return 0
+        if args.end:
+            result = end(args.recording_path or Path.cwd())
+            action = "already complete" if result["already_complete"] else "completed"
+            print(f"{action}: {result['session_id']} generation={result['generation']}")
             return 0
         return run_relay(args.recording_path or Path.cwd())
     except Exception as error:
