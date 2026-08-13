@@ -39,7 +39,14 @@ class MemoDaemon:
         assert self.paths.socket is not None
         self.registry = Registry(self.paths.registry)
         self.store = SessionStore(self.paths)
-        self.publisher = CheckpointPublisher(self.store)
+        from .streams import StreamStore
+        self.streams = StreamStore(self.paths, self.registry)
+        self.publisher = CheckpointPublisher(
+            self.store,
+            lambda session: self.streams.seal_session(
+                session.archive_namespace, session.session_id
+            ),
+        )
         self.interval = checkpoint_interval() if interval is None else interval
         self.socket_path = self.paths.socket
         self._stop = threading.Event()
@@ -134,6 +141,27 @@ class MemoDaemon:
             return {"status": "ok"}
         if message.operation == "start":
             return self._start(message.payload)
+        if message.operation == "attach":
+            started = self._start(message.payload)
+            attachment = self.registry.allocate_attachment(started["session_id"], utcnow())
+            return {**started, "terminal_id": attachment.terminal_id,
+                    "accepted_sequence": attachment.accepted_sequence}
+        if message.operation == "events":
+            terminal_id = str(message.payload["terminal_id"])
+            attachment = self.registry.attachment(terminal_id)
+            if attachment is None:
+                raise KeyError(f"unknown terminal attachment: {terminal_id}")
+            values = message.payload.get("events")
+            if not isinstance(values, list):
+                raise ProtocolError("events requires an event list")
+            accepted = self.streams.append(
+                attachment.session_id, terminal_id, values, time.time_ns()
+            )
+            return {"terminal_id": terminal_id, "accepted_sequence": accepted}
+        if message.operation == "detach":
+            terminal_id = str(message.payload["terminal_id"])
+            self.registry.detach(terminal_id, utcnow())
+            return {"terminal_id": terminal_id, "detached": True}
         if message.operation == "lookup":
             return self._lookup(message.payload)
         if message.operation == "checkpoint":
@@ -222,6 +250,13 @@ def activate(path: Path, paths: Paths | None = None) -> dict[str, Any]:
     ensure_daemon(paths)
     assert paths.socket is not None
     return request(str(paths.socket), "start", {"path": str(path)})
+
+
+def attach(path: Path, paths: Paths | None = None) -> dict[str, Any]:
+    paths = paths or Paths.discover()
+    ensure_daemon(paths)
+    assert paths.socket is not None
+    return request(str(paths.socket), "attach", {"path": str(path)})
 
 
 def main() -> int:

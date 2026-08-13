@@ -4,6 +4,9 @@ import json
 import os
 import stat
 import subprocess
+import pty
+import select
+import sys
 import threading
 import time
 from pathlib import Path
@@ -241,3 +244,64 @@ def test_public_cli_starts_background_directory_recording(tmp_path: Path, monkey
     assert "joined:" in capsys.readouterr().out
     assert paths.socket is not None
     request(str(paths.socket), "shutdown")
+
+
+def test_two_interactive_attachments_publish_one_directory_checkpoint(tmp_path: Path) -> None:
+    home = tmp_path / "memo-home"
+    root = tmp_path / "work"
+    root.mkdir()
+    shell = tmp_path / "shell"
+    shell.write_text(
+        "#!/bin/sh\nread name\nprintf '%s\\n' \"$name\" > \"$name.txt\"\nprintf 'done:%s\\n' \"$name\"\n"
+    )
+    shell.chmod(0o755)
+    environment = {**os.environ, "MEMO_HOME": str(home), "SHELL": str(shell),
+                   "MEMO_CHECKPOINT_INTERVAL": "1"}
+    processes = []
+    masters = []
+    try:
+        for name in ("one", "two"):
+            master, slave = pty.openpty()
+            process = subprocess.Popen(
+                [sys.executable, "-m", "memo.cli", str(root)], stdin=slave, stdout=slave,
+                stderr=slave, env=environment, close_fds=True,
+            )
+            os.close(slave)
+            processes.append(process)
+            masters.append(master)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not list(home.glob("archive/*/*/session.json")):
+                time.sleep(0.05)
+            time.sleep(0.1)
+            os.write(master, f"{name}\n".encode())
+        for name, process, master in zip(("one", "two"), processes, masters):
+            output = bytearray()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and f"done:{name}".encode() not in output:
+                readable, _, _ = select.select([master], [], [], 0.1)
+                if readable:
+                    try:
+                        output.extend(os.read(master, 4096))
+                    except OSError:
+                        break
+            assert f"done:{name}".encode() in output
+            assert process.wait(timeout=5) == 0
+        paths = Paths(home, home / "scratch", home / "archive", tmp_path / "unpack")
+        assert paths.socket is not None
+        request(str(paths.socket), "checkpoint", {"path": str(root)})
+        session = next(home.glob("archive/*/*"))
+        manifest = SessionStore(paths).head(session.parent.name, session.name)
+        assert manifest is not None
+        assert len(manifest.stream_high_water) == 2
+        assert (session / manifest.snapshot / "one.txt").read_text().strip() == "one"
+        assert (session / manifest.snapshot / "two.txt").read_text().strip() == "two"
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+        socket_path = home / "runtime" / "memo.sock"
+        if socket_path.exists():
+            request(str(socket_path), "shutdown")
+        for master in masters:
+            os.close(master)

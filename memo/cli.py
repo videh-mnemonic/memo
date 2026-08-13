@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .daemon import activate
 from .load import inspect_session, reconstruct, replay, trace_json, unpack, write_traces
+from .relay import run as run_relay
 from .save import save_sessions
 from .status import render_status
 from .wrapper import run
@@ -111,9 +112,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"generation={result['generation']} root={result['root']}"
             )
             return 0
-        if args.recording_path is not None:
-            raise ValueError("interactive recording is not available yet; use --background")
-        raise ValueError("choose an action or use --background [path]")
+        return run_relay(args.recording_path or Path.cwd())
     except Exception as error:
         print(f"memo: {error}", file=sys.stderr)
         return 1

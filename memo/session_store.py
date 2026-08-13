@@ -47,6 +47,7 @@ class SessionStore:
         path.mkdir(parents=True, exist_ok=False)
         (path / "checkpoints").mkdir()
         (path / "snapshots").mkdir()
+        (path / "streams" / "terminals").mkdir(parents=True)
         atomic_write(path / "session.json", _json_bytes(session.to_dict()))
         return path
 
@@ -71,6 +72,14 @@ class SessionStore:
         manifest = CheckpointManifest.load(path / "checkpoints" / f"{checkpoint_id}.json")
         if not (path / manifest.snapshot).is_dir():
             raise ValueError(f"HEAD references missing snapshot: {manifest.snapshot}")
+        for terminal_id, sequence in manifest.stream_high_water.items():
+            metadata_path = path / "streams" / "terminals" / terminal_id / "stream.json"
+            if sequence and not metadata_path.is_file():
+                raise ValueError(f"HEAD references missing terminal stream: {terminal_id}")
+            if sequence:
+                metadata = json.loads(metadata_path.read_text())
+                if metadata.get("highest_sequence", -1) < sequence:
+                    raise ValueError(f"terminal stream does not reach checkpoint: {terminal_id}")
         return manifest
 
     def next_generation(self, namespace: str, session_id: str) -> int:

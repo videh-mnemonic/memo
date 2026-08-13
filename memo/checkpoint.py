@@ -56,8 +56,9 @@ class _State:
 
 
 class CheckpointPublisher:
-    def __init__(self, store: SessionStore):
+    def __init__(self, store: SessionStore, seal_streams=None):
         self.store = store
+        self.seal_streams = seal_streams or (lambda _session: {})
         self._condition = threading.Condition()
         self._states: dict[str, _State] = {}
 
@@ -87,6 +88,7 @@ class CheckpointPublisher:
                 self._condition.notify_all()
 
     def _publish_once(self, session: DirectorySession) -> CheckpointManifest:
+        stream_high_water = self.seal_streams(session)
         generation = self.store.next_generation(session.archive_namespace, session.session_id)
         checkpoint_id = f"{generation:08d}-{uuid.uuid4().hex[:12]}"
         session_path = self.store.session_path(session.archive_namespace, session.session_id)
@@ -100,6 +102,7 @@ class CheckpointPublisher:
                 created_utc=utcnow(),
                 snapshot=f"snapshots/{checkpoint_id}",
                 entries=entries,
+                stream_high_water=stream_high_water,
             )
             return self.store.publish(session, manifest, temporary)
         except BaseException:

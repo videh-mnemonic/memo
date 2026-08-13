@@ -137,6 +137,7 @@ class CheckpointManifest:
     created_utc: str
     snapshot: str
     entries: list[SnapshotEntry] = field(default_factory=list)
+    stream_high_water: dict[str, int] = field(default_factory=dict)
     schema_version: int = CHECKPOINT_SCHEMA_VERSION
 
     def validate(self) -> None:
@@ -153,6 +154,11 @@ class CheckpointManifest:
                 raise ValueError(f"unsafe snapshot entry: {entry.path}")
             if entry.kind not in {"file", "directory"}:
                 raise ValueError(f"unsupported snapshot entry kind: {entry.kind}")
+        for terminal_id, sequence in self.stream_high_water.items():
+            if not terminal_id or Path(terminal_id).name != terminal_id:
+                raise ValueError(f"unsafe terminal stream id: {terminal_id}")
+            if not isinstance(sequence, int) or sequence < 0:
+                raise ValueError(f"invalid stream high-water mark: {terminal_id}={sequence}")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
