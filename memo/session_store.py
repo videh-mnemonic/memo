@@ -70,8 +70,16 @@ class SessionStore:
         if not checkpoint_id or Path(checkpoint_id).name != checkpoint_id:
             raise ValueError("invalid HEAD checkpoint id")
         manifest = CheckpointManifest.load(path / "checkpoints" / f"{checkpoint_id}.json")
+        if manifest.session_id != session_id:
+            raise ValueError("HEAD references checkpoint for another session")
         if not (path / manifest.snapshot).is_dir():
             raise ValueError(f"HEAD references missing snapshot: {manifest.snapshot}")
+        snapshot = path / manifest.snapshot
+        for entry in manifest.entries:
+            if entry.kind == "file" or entry.retained:
+                artifact = snapshot / entry.path
+                if not artifact.is_file():
+                    raise ValueError(f"HEAD references missing snapshot file: {entry.path}")
         for terminal_id, sequence in manifest.stream_high_water.items():
             metadata_path = path / "streams" / "terminals" / terminal_id / "stream.json"
             if sequence and not metadata_path.is_file():
@@ -80,7 +88,18 @@ class SessionStore:
                 metadata = json.loads(metadata_path.read_text())
                 if metadata.get("highest_sequence", -1) < sequence:
                     raise ValueError(f"terminal stream does not reach checkpoint: {terminal_id}")
+                for chunk in metadata.get("chunks", []):
+                    chunk_path = metadata_path.parent / chunk
+                    if not chunk_path.is_file():
+                        raise ValueError(f"terminal stream references missing chunk: {terminal_id}/{chunk}")
         return manifest
+
+    def check_integrity(self, namespace: str, session_id: str) -> CheckpointManifest | None:
+        path = self.session_path(namespace, session_id)
+        session = self.load_session(namespace, session_id)
+        if session.session_id != session_id or session.archive_namespace != namespace:
+            raise ValueError("session metadata does not match archive location")
+        return self.head(namespace, session_id)
 
     def next_generation(self, namespace: str, session_id: str) -> int:
         current = self.head(namespace, session_id)

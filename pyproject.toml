@@ -9,7 +9,10 @@ description = "Capture, ship, reconstruct, and replay coding-agent sessions"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
-dependencies = []
+dependencies = [
+    "pathspec>=0.12.1",
+    "watchdog>=6.0",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

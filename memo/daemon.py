@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from .checkpoint import CheckpointPublisher, utcnow
-from .config import Paths, checkpoint_interval
+from .config import Paths, checkpoint_interval, recovery_enabled, watcher_debounce, watcher_enabled
 from .identity import local_namespace
 from .models import DirectorySession
 from .protocol import (
@@ -51,6 +51,8 @@ class MemoDaemon:
         self.socket_path = self.paths.socket
         self._stop = threading.Event()
         self._workers: dict[str, threading.Thread] = {}
+        self._checkpoint_requests: dict[str, threading.Event] = {}
+        self._observers: dict[str, Any] = {}
         self._worker_lock = threading.Lock()
         self._server: socket.socket | None = None
         self._lock_handle: IO[str] | None = None
@@ -76,14 +78,45 @@ class MemoDaemon:
                 return
             worker = threading.Thread(target=self._checkpoint_loop, args=(active,), daemon=True)
             self._workers[active.session_id] = worker
+            self._checkpoint_requests.setdefault(active.session_id, threading.Event())
             worker.start()
+            self._ensure_watcher(active)
+
+    def _ensure_watcher(self, active: ActiveSession) -> None:
+        if not watcher_enabled() or active.session_id in self._observers:
+            return
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+
+        request_event = self._checkpoint_requests[active.session_id]
+
+        class Handler(FileSystemEventHandler):
+            def on_any_event(self, event) -> None:
+                if not event.is_directory or event.event_type != "opened":
+                    request_event.set()
+
+        observer = Observer()
+        observer.schedule(Handler(), str(active.root), recursive=True)
+        observer.start()
+        self._observers[active.session_id] = observer
 
     def _checkpoint_loop(self, active: ActiveSession) -> None:
-        while not self._stop.wait(self.interval):
+        request_event = self._checkpoint_requests[active.session_id]
+        deadline = time.monotonic() + self.interval
+        while not self._stop.is_set():
+            request_event.wait(max(0.0, deadline - time.monotonic()))
+            if self._stop.is_set():
+                return
+            if request_event.is_set():
+                request_event.clear()
+                if self._stop.wait(watcher_debounce()):
+                    return
+                request_event.clear()
             try:
                 self.publisher.publish(self._session_model(active))
             except Exception as error:
                 print(f"memo daemon: checkpoint failed for {active.session_id}: {error}", file=sys.stderr)
+            deadline = time.monotonic() + self.interval
 
     def _start(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -193,6 +226,11 @@ class MemoDaemon:
     def serve_forever(self) -> None:
         self._acquire_daemon_lock()
         self.registry.remove_stale(self.paths.archive)
+        if recovery_enabled():
+            for active in self.registry.list_active():
+                self.store.check_integrity(active.archive_namespace, active.session_id)
+            self.streams.recover_all()
+            self.registry.expire_attachments(utcnow())
         self.socket_path.unlink(missing_ok=True)
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server = server
@@ -210,6 +248,10 @@ class MemoDaemon:
                     continue
                 threading.Thread(target=self._handle, args=(connection,), daemon=True).start()
         finally:
+            for observer in self._observers.values():
+                observer.stop()
+            for observer in self._observers.values():
+                observer.join(timeout=2)
             server.close()
             self.socket_path.unlink(missing_ok=True)
             self.registry.close()

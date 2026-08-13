@@ -1,0 +1,85 @@
+import base64
+import json
+import struct
+from pathlib import Path
+
+from memo.config import Paths
+from memo.models import CheckpointManifest, DirectorySession, SnapshotEntry
+from memo.registry import Registry
+from memo.session_store import SessionStore
+from memo.streams import StreamStore
+
+
+def _setup(tmp_path: Path):
+    home = tmp_path / "home"
+    paths = Paths(home, home / "scratch", home / "archive", tmp_path / "unpack")
+    paths.ensure_storage()
+    root = tmp_path / "root"
+    root.mkdir()
+    registry = Registry(paths.registry)
+    active, _ = registry.start_or_join(root, "namespace", "now", "session")
+    registry.allocate_attachment(active.session_id, "now", "terminal")
+    store = SessionStore(paths)
+    store.create(DirectorySession("session", str(root.resolve()), "namespace", "now", "now"))
+    return paths, registry, store
+
+
+def test_recovery_truncates_partial_frame_and_restores_ack(tmp_path: Path) -> None:
+    paths, registry, _ = _setup(tmp_path)
+    streams = StreamStore(paths, registry)
+    event = {"sequence": 1, "direction": "output",
+             "data": base64.b64encode(b"durable").decode()}
+    streams.append("session", "terminal", [event], 10)
+    spool = paths.spool / "session" / "spool" / "terminal.frames"
+    valid_size = spool.stat().st_size
+    with spool.open("ab") as handle:
+        handle.write(struct.pack("!I", 100) + b"partial")
+    registry.recover_sequence("terminal", 0)
+
+    assert streams.recover_spool("session", "terminal") == 1
+    assert spool.stat().st_size == valid_size
+    assert registry.attachment("terminal").accepted_sequence == 1
+    assert streams.seal_session("namespace", "session") == {"terminal": 1}
+    registry.close()
+
+
+def test_integrity_keeps_last_head_and_ignores_unpublished_artifacts(tmp_path: Path) -> None:
+    _, registry, store = _setup(tmp_path)
+    session = store.load_session("namespace", "session")
+    session_path = store.session_path("namespace", "session")
+    prepared = session_path / "prepared"
+    prepared.mkdir()
+    (prepared / "file.txt").write_text("complete")
+    manifest = CheckpointManifest("one", "session", 1, "now", "snapshots/one",
+                                  [SnapshotEntry("file.txt", "file", 0o644, 8)])
+    store.publish(session, manifest, prepared)
+    (session_path / "snapshots" / ".abandoned").mkdir()
+    (session_path / "checkpoints" / ".abandoned.tmp").write_text("partial")
+
+    assert store.check_integrity("namespace", "session") == manifest
+    assert (session_path / "HEAD").read_text().strip() == "one"
+    registry.close()
+
+
+def test_integrity_rejects_missing_published_stream_chunk(tmp_path: Path) -> None:
+    paths, registry, store = _setup(tmp_path)
+    streams = StreamStore(paths, registry)
+    event = {"sequence": 1, "direction": "output", "data": base64.b64encode(b"x").decode()}
+    streams.append("session", "terminal", [event], 10)
+    streams.seal_session("namespace", "session")
+    session = store.load_session("namespace", "session")
+    prepared = store.session_path("namespace", "session") / "prepared"
+    prepared.mkdir()
+    manifest = CheckpointManifest("one", "session", 1, "now", "snapshots/one", [], {"terminal": 1})
+    store.publish(session, manifest, prepared)
+    metadata_path = store.session_path("namespace", "session") / "streams/terminals/terminal/stream.json"
+    metadata = json.loads(metadata_path.read_text())
+    (metadata_path.parent / metadata["chunks"][0]).unlink()
+
+    try:
+        store.check_integrity("namespace", "session")
+    except ValueError as error:
+        assert "missing chunk" in str(error)
+    else:
+        raise AssertionError("missing stream chunk was accepted")
+    registry.close()

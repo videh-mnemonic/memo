@@ -121,6 +121,53 @@ class StreamStore:
                 result.append(StreamEvent.from_dict(json.loads(body)))
         return result
 
+    def recover_spool(self, session_id: str, terminal_id: str) -> int:
+        spool = self._spool(session_id, terminal_id)
+        if not spool.is_file():
+            self.registry.recover_sequence(terminal_id, 0)
+            return 0
+        valid_end = 0
+        events: list[StreamEvent] = []
+        with spool.open("r+b") as handle:
+            while True:
+                frame_start = handle.tell()
+                header = handle.read(4)
+                if not header:
+                    valid_end = frame_start
+                    break
+                if len(header) != 4:
+                    break
+                size = struct.unpack("!I", header)[0]
+                if size > 16 * 1024 * 1024:
+                    break
+                body = handle.read(size)
+                if len(body) != size:
+                    break
+                try:
+                    event = StreamEvent.from_dict(json.loads(body))
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                    break
+                expected = len(events) + 1
+                if event.terminal_id != terminal_id or event.sequence != expected:
+                    break
+                events.append(event)
+                valid_end = handle.tell()
+            handle.truncate(valid_end)
+            handle.flush()
+            os.fsync(handle.fileno())
+        accepted = events[-1].sequence if events else 0
+        self.registry.recover_sequence(terminal_id, accepted)
+        return accepted
+
+    def recover_all(self) -> dict[str, int]:
+        recovered = {}
+        for active in self.registry.list_active():
+            for attachment in self.registry.list_attachments(active.session_id):
+                recovered[attachment.terminal_id] = self.recover_spool(
+                    active.session_id, attachment.terminal_id
+                )
+        return recovered
+
     def seal_session(self, namespace: str, session_id: str) -> dict[str, int]:
         session_path = self.paths.archive / namespace / session_id
         high_water: dict[str, int] = {}
@@ -141,8 +188,10 @@ class StreamStore:
                     "chunks": [],
                 }
                 previous = int(metadata["highest_sequence"])
+                if previous > attachment.accepted_sequence:
+                    raise ValueError(f"stream metadata exceeds durable spool: {attachment.terminal_id}")
                 new_events = [event for event in events if event.sequence > previous]
-                end = events[-1].sequence
+                end = attachment.accepted_sequence
                 if new_events:
                     chunk_id = f"{new_events[0].sequence:08d}-{end:08d}"
                     chunk = chunks / f"{chunk_id}.jsonl.gz"

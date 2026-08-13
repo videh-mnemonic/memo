@@ -156,6 +156,26 @@ class Registry:
                     f"event sequence does not follow acknowledged sequence {current.accepted_sequence}"
                 )
 
+    def recover_sequence(self, terminal_id: str, accepted: int) -> None:
+        with self._lock:
+            cursor = self.connection.execute(
+                "UPDATE attachments SET accepted_sequence = ? WHERE terminal_id = ?",
+                (accepted, terminal_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"unknown terminal attachment: {terminal_id}")
+
+    def expire_attachments(self, detached_utc: str) -> list[str]:
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT terminal_id FROM attachments WHERE detached_utc IS NULL"
+            ).fetchall()
+            self.connection.execute(
+                "UPDATE attachments SET detached_utc = ? WHERE detached_utc IS NULL",
+                (detached_utc,),
+            )
+        return [row[0] for row in rows]
+
     def detach(self, terminal_id: str, detached_utc: str) -> None:
         with self._lock:
             self.connection.execute(

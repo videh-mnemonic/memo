@@ -123,6 +123,8 @@ class SnapshotEntry:
     kind: str
     mode: int
     size: int | None = None
+    detail: str | None = None
+    retained: bool = False
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "SnapshotEntry":
@@ -152,7 +154,10 @@ class CheckpointManifest:
             path = Path(entry.path)
             if path.is_absolute() or ".." in path.parts:
                 raise ValueError(f"unsafe snapshot entry: {entry.path}")
-            if entry.kind not in {"file", "directory"}:
+            if entry.kind not in {
+                "file", "directory", "ignored-policy", "oversized", "special",
+                "missing", "unstable",
+            }:
                 raise ValueError(f"unsupported snapshot entry kind: {entry.kind}")
         for terminal_id, sequence in self.stream_high_water.items():
             if not terminal_id or Path(terminal_id).name != terminal_id:

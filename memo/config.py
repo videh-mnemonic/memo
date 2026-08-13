@@ -49,3 +49,37 @@ def checkpoint_interval() -> float:
         return max(1.0, float(value))
     except ValueError:
         return 15.0
+
+
+def _positive_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _positive_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def maximum_file_size() -> int:
+    return _positive_int("MEMO_MAX_FILE_SIZE", 100 * 1024 * 1024)
+
+
+def spool_flush_interval() -> float:
+    return _positive_float("MEMO_SPOOL_FLUSH_INTERVAL", 0.25)
+
+
+def watcher_enabled() -> bool:
+    return os.environ.get("MEMO_WATCHER", "1").lower() not in {"0", "false", "no", "off"}
+
+
+def watcher_debounce() -> float:
+    return _positive_float("MEMO_WATCHER_DEBOUNCE", 0.25)
+
+
+def recovery_enabled() -> bool:
+    return os.environ.get("MEMO_RECOVERY", "1").lower() not in {"0", "false", "no", "off"}
