@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from .daemon import activate, end, push
-from .load import inspect_session
+from .load import inspect_session, replay_session, trace_json, write_traces
 from .relay import run as run_relay
 from .status import render_status
 
@@ -76,8 +76,21 @@ def main(argv: list[str] | None = None) -> int:
             from .transport import pull_session
             destination = pull_session(args.session_id, force=args.force)
             print(f"pulled: {args.session_id} path={destination}")
-        elif args.command in {"traces", "replay"}:
-            raise NotImplementedError(f"{args.command} is not available until Phase 2")
+        elif args.command == "traces":
+            terminal_ids = None
+            if args.terminals is not None:
+                terminal_ids = [value.strip() for value in args.terminals.split(",")]
+                if not terminal_ids or any(not value for value in terminal_ids):
+                    raise ValueError("terminal IDs must be a comma-separated nonempty list")
+            if args.path is None or str(args.path) == "-":
+                print(trace_json(args.session_id, terminal_ids), end="")
+            else:
+                write_traces(args.session_id, args.path, terminal_ids)
+        elif args.command == "replay":
+            destination = replay_session(
+                args.session_id, args.at, args.directory, args.include_prompts, args.force
+            )
+            print(f"replayed: {args.session_id} step={args.at} path={destination}")
         elif args.command == "record":
             return run_relay(args.recording_path or Path.cwd())
         else:

@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from .config import Paths
 from .models import DirectorySession, StepManifest
@@ -149,6 +149,12 @@ class SessionStore:
     def restore(self, namespace: str, session_id: str, destination: Path,
                 selector: str | int = -1, force: bool = False) -> Path:
         manifest = self.step(namespace, session_id, selector)
+        return self.restore_manifest(namespace, session_id, manifest, destination, force)
+
+    def restore_manifest(self, namespace: str, session_id: str, manifest: StepManifest,
+                         destination: Path, force: bool = False) -> Path:
+        path = self.session_path(namespace, session_id)
+        self._validate_manifest(path, session_id, manifest)
         source = self.session_path(namespace, session_id) / manifest.snapshot
         if destination.exists():
             occupied = not destination.is_dir() or any(destination.iterdir())
@@ -163,14 +169,24 @@ class SessionStore:
     def stream_events(self, namespace: str, session_id: str,
                       terminal_id: str | None = None,
                       selector: str | int = -1) -> list[StreamEvent]:
-        from .streams import merged_timeline
         manifest = self.step(namespace, session_id, selector)
+        terminal_ids = None if terminal_id is None else [terminal_id]
+        return self.stream_events_for_manifest(namespace, session_id, manifest, terminal_ids)
+
+    def stream_events_for_manifest(self, namespace: str, session_id: str,
+                                   manifest: StepManifest,
+                                   terminal_ids: Iterable[str] | None = None) -> list[StreamEvent]:
+        from .streams import merged_timeline
+        path = self.session_path(namespace, session_id)
+        self._validate_manifest(path, session_id, manifest, streams=True)
         terminals = manifest.stream_high_water
-        if terminal_id is not None and terminal_id not in terminals:
-            raise KeyError(f"terminal stream not found: {terminal_id}")
-        selected = [terminal_id] if terminal_id else sorted(terminals)
+        selected = sorted(terminals) if terminal_ids is None else list(terminal_ids)
+        unknown = [terminal_id for terminal_id in selected if terminal_id not in terminals]
+        if unknown:
+            raise KeyError(f"terminal stream not found: {', '.join(unknown)}")
+        selected = sorted(set(selected))
         chunks = []
-        root = self.session_path(namespace, session_id) / "streams" / "terminals"
+        root = path / "streams" / "terminals"
         for stream_id in selected:
             if terminals[stream_id] == 0:
                 continue

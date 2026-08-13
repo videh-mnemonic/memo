@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -52,6 +53,58 @@ def test_background_joins_existing_directory_recording(tmp_path: Path, monkeypat
         capsys.readouterr()
         assert main(["background", str(root)]) == 0
         assert "joined:" in capsys.readouterr().out
+    finally:
+        socket = home / "runtime/memo.sock"
+        if socket.exists():
+            request(str(socket), "shutdown")
+
+
+def test_public_traces_and_replay_use_step_bounded_terminal_input(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    home = tmp_path / "memo-home"
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "note.txt").write_text("initial\n")
+    monkeypatch.setenv("MEMO_HOME", str(home))
+    try:
+        assert main(["background", str(root)]) == 0
+        capsys.readouterr()
+        session_dir = next(home.glob("archive/*/*/session.json")).parent
+        socket = home / "runtime/memo.sock"
+        attached = request(str(socket), "attach", {"path": str(root)})
+        terminal_id = attached["terminal_id"]
+        request(str(socket), "events", {
+            "terminal_id": terminal_id,
+            "events": [{
+                "sequence": 1,
+                "direction": "input",
+                "data": base64.b64encode(b"recorded input\n").decode(),
+            }],
+        })
+        (root / "note.txt").write_text("updated\n")
+        request(str(socket), "step", {"path": str(root)})
+
+        assert main(["traces", session_dir.name]) == 0
+        traces = json.loads(capsys.readouterr().out)
+        assert traces[0]["terminal_id"] == terminal_id
+        assert traces[0]["data"] == "recorded input\n"
+        trace_path = tmp_path / "trace.json"
+        assert main(["traces", session_dir.name, "--terminals", terminal_id,
+                     "--path", str(trace_path)]) == 0
+        assert json.loads(trace_path.read_text()) == traces
+
+        initial = tmp_path / "initial"
+        assert main(["replay", session_dir.name, "0", str(initial)]) == 0
+        capsys.readouterr()
+        assert (initial / "note.txt").read_text() == "initial\n"
+        assert not (initial / ".prompts.md").exists()
+        latest = tmp_path / "latest"
+        assert main(["replay", session_dir.name, "-1", str(latest),
+                     "--include-prompts"]) == 0
+        capsys.readouterr()
+        assert (latest / "note.txt").read_text() == "updated\n"
+        assert "recorded input" in (latest / ".prompts.md").read_text()
     finally:
         socket = home / "runtime/memo.sock"
         if socket.exists():
