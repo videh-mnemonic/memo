@@ -43,7 +43,7 @@ def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> No
         assert termios.tcgetattr(slave) == original
         session = next(home.glob("archive/*/*"))
         socket_path = home / "runtime" / "memo.sock"
-        request(str(socket_path), "checkpoint", {"path": str(root)})
+        request(str(socket_path), "step", {"path": str(root)})
         assert list(session.glob("streams/terminals/*"))
     finally:
         if process.poll() is None:

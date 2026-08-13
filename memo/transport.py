@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import Paths, TransportConfig
-from .models import CheckpointManifest, DirectorySession
+from .models import DirectorySession, StepManifest
 from .session_store import SessionStore, atomic_write
 
 
@@ -88,9 +88,9 @@ def atomic_install_directory(prepared: Path, destination: Path, force: bool = Fa
             shutil.rmtree(backup)
 
 
-def _generation_paths(session_path: Path, manifest: CheckpointManifest) -> list[Path]:
+def _generation_paths(session_path: Path, manifest: StepManifest) -> list[Path]:
     paths = [session_path / "session.json", session_path / "HEAD",
-             session_path / "checkpoints" / f"{manifest.checkpoint_id}.json"]
+             session_path / "steps" / f"{manifest.step}.json"]
     paths.extend((session_path / manifest.snapshot).rglob("*"))
     paths.append(session_path / manifest.snapshot)
     terminal_root = session_path / "streams" / "terminals"
@@ -104,10 +104,10 @@ def _generation_paths(session_path: Path, manifest: CheckpointManifest) -> list[
     return [path for path in paths if path.exists()]
 
 
-def package_generation(store: SessionStore, session: DirectorySession) -> tuple[bytes, str, CheckpointManifest]:
+def package_generation(store: SessionStore, session: DirectorySession) -> tuple[bytes, str, StepManifest]:
     manifest = store.head(session.archive_namespace, session.session_id)
     if manifest is None:
-        raise ValueError(f"session has no published checkpoint: {session.session_id}")
+        raise ValueError(f"session has no published step: {session.session_id}")
     root = store.session_path(session.archive_namespace, session.session_id)
     data = deterministic_archive(root, _generation_paths(root, manifest))
     return data, digest_bytes(data), manifest
@@ -129,14 +129,14 @@ def push_session(store: SessionStore, session: DirectorySession, config: Transpo
                  client: Any | None = None) -> dict[str, object]:
     manifest = store.head(session.archive_namespace, session.session_id)
     if manifest is None:
-        raise ValueError(f"session has no published checkpoint: {session.session_id}")
-    if session.last_pushed_generation == manifest.generation:
-        return {"session_id": session.session_id, "generation": manifest.generation,
+        raise ValueError(f"session has no published step: {session.session_id}")
+    if session.last_pushed_step == manifest.step:
+        return {"session_id": session.session_id, "step": manifest.step,
                 "digest": session.last_pushed_digest, "status": "skipped"}
     data, digest, manifest = package_generation(store, session)
     client = client or config.client()
     base = _key(config, session.archive_namespace, session.session_id)
-    version = f"{base}/generations/{manifest.generation}-{digest}.tar.gz"
+    version = f"{base}/steps/{manifest.step}-{digest}.tar.gz"
     checksum = f"{version}.sha256"
     temporary = f"{base}/tmp/{uuid.uuid4().hex}.tar.gz"
     client.put_object(Bucket=config.bucket, Key=temporary, Body=data)
@@ -147,18 +147,18 @@ def push_session(store: SessionStore, session: DirectorySession, config: Transpo
                           Body=f"{digest}  {Path(version).name}\n".encode())
         pointer = json.dumps({"schema_version": 1, "session_id": session.session_id,
                               "namespace": session.archive_namespace,
-                              "generation": manifest.generation, "digest": digest,
+                              "step": manifest.step, "digest": digest,
                               "object": version, "checksum": checksum},
                              sort_keys=True).encode()
         final_key = f"{base}/latest.json"
         client.put_object(Bucket=config.bucket, Key=final_key, Body=pointer)
     finally:
         client.delete_object(Bucket=config.bucket, Key=temporary)
-    session.last_pushed_generation = manifest.generation
+    session.last_pushed_step = manifest.step
     session.last_pushed_digest = digest
     session.remote_object = final_key
     store.update_session(session)
-    return {"session_id": session.session_id, "generation": manifest.generation,
+    return {"session_id": session.session_id, "step": manifest.step,
             "digest": digest, "object": final_key, "status": "pushed"}
 
 
@@ -212,9 +212,9 @@ def pull_session(session_id: str, paths: Paths | None = None,
     destination = store.session_path(pointer["namespace"], session_id)
     if destination.exists() and not force:
         local = store.head(pointer["namespace"], session_id)
-        if local and local.generation >= int(pointer["generation"]):
+        if local and local.step >= int(pointer["step"]):
             raise FileExistsError(
-                f"local generation {local.generation} is not older than remote generation {pointer['generation']}"
+                f"local step {local.step} is not older than remote step {pointer['step']}"
             )
         raise FileExistsError(f"local session exists: {session_id}; use --force to replace it")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -222,12 +222,12 @@ def pull_session(session_id: str, paths: Paths | None = None,
     try:
         safe_extract_bytes(data, temporary)
         pulled = DirectorySession.load(temporary / "session.json")
-        manifest = CheckpointManifest.load(
-            temporary / "checkpoints" / f"{(temporary / 'HEAD').read_text().strip()}.json"
+        manifest = StepManifest.load(
+            temporary / "steps" / f"{(temporary / 'HEAD').read_text().strip()}.json"
         )
-        if pulled.session_id != session_id or manifest.generation != int(pointer["generation"]):
+        if pulled.session_id != session_id or manifest.step != int(pointer["step"]):
             raise ValueError("downloaded session does not match remote pointer")
-        pulled.last_pushed_generation = manifest.generation
+        pulled.last_pushed_step = manifest.step
         pulled.last_pushed_digest = pointer["digest"]
         pulled.remote_object = keys[0]
         atomic_write(temporary / "session.json",
