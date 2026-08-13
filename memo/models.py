@@ -8,6 +8,7 @@ from typing import Any
 
 DIRECTORY_FORMAT_VERSION = 1
 CHECKPOINT_SCHEMA_VERSION = 1
+AGENT_SESSION_FORMAT_VERSION = 1
 
 
 @dataclass
@@ -28,7 +29,7 @@ class Leg:
 @dataclass
 class SessionMeta:
     session_id: str
-    tool: str
+    provider: str
     repo_kind: str
     repo_root: str
     repo_name: str
@@ -46,8 +47,14 @@ class SessionMeta:
     shipped_at: str | None = None
     archive_sha256: str | None = None
     branch: str = ""
+    format: str = "memo-agent-session"
+    format_version: int = AGENT_SESSION_FORMAT_VERSION
 
     def validate(self) -> None:
+        if self.format != "memo-agent-session" or self.format_version != AGENT_SESSION_FORMAT_VERSION:
+            raise ValueError("unsupported agent session format")
+        if not self.provider:
+            raise ValueError("agent session provider is required")
         if self.repo_kind not in {"real", "synthetic"}:
             raise ValueError(f"invalid repo_kind: {self.repo_kind}")
         ns = self.archive_namespace

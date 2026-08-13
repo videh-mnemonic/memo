@@ -85,6 +85,9 @@ def test_real_repo_capture_save_load(tmp_path: Path, monkeypatch, capsys) -> Non
 
     assert main(["claude"]) == 0
     meta = json.loads((memo_home / "scratch" / "abc123" / "meta.json").read_text())
+    assert meta["format"] == "memo-agent-session"
+    assert meta["format_version"] == 1
+    assert meta["provider"] == "claude"
     assert meta["archive_namespace"].startswith("local_repo_")
     assert main(["--save", "--all"]) == 0
     archive = memo_home / "archive" / meta["archive_namespace"] / "abc123.tar.gz"
@@ -105,16 +108,20 @@ def test_real_repo_capture_save_load(tmp_path: Path, monkeypatch, capsys) -> Non
     assert _tree(restored) == _tree(repo)
     exported = tmp_path / "normalized.json"
     assert main(["--load", "abc123", "--traces", "--path", str(exported)]) == 0
-    assert json.loads(exported.read_text())[0]["type"] == "user_input"
+    first_event = json.loads(exported.read_text())[0]
+    assert first_event["schema_version"] == 1
+    assert first_event["provider"] == "claude"
+    assert first_event["event"]["type"] == "user_input"
+    assert first_event["native"]["record"]["session_id"] == "abc123"
     assert main(["--load", "abc123", "--inspect"]) == 0
     inspected = capsys.readouterr().out
     assert "Session: abc123" in inspected
     assert "State: saved" in inspected
     assert "001: complete" in inspected
     assert main(["--load", "abc123", "--traces"]) == 0
-    assert json.loads(capsys.readouterr().out)[0]["content"] == "change it"
+    assert json.loads(capsys.readouterr().out)[0]["event"]["content"] == "change it"
     assert main(["--load", "abc123", "--traces", "--path", "-"]) == 0
-    assert json.loads(capsys.readouterr().out)[0]["content"] == "change it"
+    assert json.loads(capsys.readouterr().out)[0]["event"]["content"] == "change it"
     replayed = tmp_path / "replayed"
     assert main(["--load", "abc123", "--replay", "--at", "final", "--path", str(replayed)]) == 0
     assert "change it" in (replayed / "MEMO_TASK.md").read_text()
@@ -135,6 +142,8 @@ def test_synthetic_does_not_create_dot_git(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.chdir(work)
     assert main(["codex"]) == 0
+    meta = next((tmp_path / "memo-home" / "scratch").glob("*/meta.json"))
+    assert json.loads(meta.read_text())["provider"] == "codex"
     assert not (work / ".git").exists()
     assert main(["--save", "--all"]) == 0
     restored = tmp_path / "synthetic-restored"
@@ -181,7 +190,9 @@ def test_live_session_checkpoints_before_exit(tmp_path: Path, monkeypatch) -> No
         assert (session / "legs" / "001" / "commits.patch").is_file()
         exported = tmp_path / "live-traces.json"
         assert main(["--load", "live123", "--traces", "--path", str(exported)]) == 0
-        assert json.loads(exported.read_text())[0]["content"] == "keep recording"
+        event = json.loads(exported.read_text())[0]
+        assert event["provider"] == "codex"
+        assert event["event"]["content"] == "keep recording"
         restored = tmp_path / "live-restored"
         assert main(["--load", "live123", "--at", "final", "--path", str(restored)]) == 0
         assert (restored / "tracked.txt").read_text() == "live tracked\n"

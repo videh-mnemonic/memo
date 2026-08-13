@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from .daemon import activate, end, push
+from .harnesses import get_harness, registered_harnesses
 from .load import (inspect_session, reconstruct, replay, terminal_json, trace_json,
                    unpack, write_terminals, write_traces)
 from .relay import run as run_relay
@@ -66,9 +67,10 @@ def _print_summary(summary: object) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] in {"claude", "codex"}:
+    harness_names = {harness.name for harness in registered_harnesses()}
+    if argv and argv[0] in harness_names:
         try:
-            return run(argv[0], argv[1:])
+            return run(get_harness(argv[0]), argv[1:])
         except Exception as error:
             print(f"memo: {error}", file=sys.stderr)
             return 1

@@ -8,8 +8,9 @@ import tarfile
 from pathlib import Path
 
 from .config import Paths
+from .harnesses import get_harness
+from .harnesses.harness import all_traces
 from .models import DirectorySession, SessionMeta
-from .normalize import all_traces
 from .session_store import SessionStore
 from .transport import atomic_install_directory
 from .store import find_session
@@ -115,7 +116,7 @@ def inspect_session(session_id: str, paths: Paths | None = None) -> str:
         f"State: {state}",
         f"Source: {location.path}",
         f"Unpacked: {source}",
-        f"Tool: {meta.tool}",
+        f"Provider: {meta.provider}",
         f"Repository: {meta.repo_name}",
         f"Original root: {meta.repo_root}",
         f"Namespace: {meta.archive_namespace}",
@@ -239,7 +240,8 @@ def trace_json(session_id: str, raw: bool = False, paths: Paths | None = None) -
     if location.kind == "directory":
         return terminal_json(session_id, paths=paths)
     source = unpack(session_id, paths)
-    return json.dumps(all_traces(source, raw), indent=2, ensure_ascii=False) + "\n"
+    meta = SessionMeta.load(source / "meta.json")
+    return json.dumps(all_traces(get_harness(meta.provider), source, raw), indent=2, ensure_ascii=False) + "\n"
 
 
 def terminal_json(session_id: str, terminal_id: str | None = None,
@@ -299,13 +301,17 @@ def replay(session_id: str, at: str, destination: Path, force: bool = False,
     reconstruct(session_id, at, destination, force, paths)
     meta = SessionMeta.load(source / "meta.json")
     through = int(at.partition(":")[2]) if at.startswith("leg:") else None
-    records = [] if at == "initial" else all_traces(source, through_leg=through)
-    prompts = [_prompt_text(r["content"]) for r in records if r["type"] == "user_input"]
+    records = ([] if at == "initial" else
+               all_traces(get_harness(meta.provider), source, through_leg=through))
+    prompts = [
+        _prompt_text(record["event"]["content"])
+        for record in records if record["event"]["type"] == "user_input"
+    ]
     lines = [
         "# Memo task", "", f"- Session ID: {meta.session_id}", f"- Repository: {meta.repo_name}",
         f"- Original root: {meta.repo_root}",
         f"- Canonical remote: {meta.canonical_remote or '(none)'}", f"- Branch: {meta.branch or '(unknown)'}",
-        f"- Tool: {meta.tool}", f"- Time: {meta.first_seen_utc} — {meta.last_activity_utc}", "", "## User prompts", "",
+        f"- Provider: {meta.provider}", f"- Time: {meta.first_seen_utc} — {meta.last_activity_utc}", "", "## User prompts", "",
     ]
     if prompts:
         for index, prompt in enumerate(prompts, 1):

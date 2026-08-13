@@ -13,10 +13,11 @@ from pathlib import Path
 
 from .config import Paths
 from .gitsnap import branch, git_env, head, snapshot_final, snapshot_initial, write_commit_patch
+from .harnesses.harness import AgentHarness, source_records
 from .identity import discover_repo_identity
 from .models import Leg, SessionMeta
 from .store import SessionLock
-from .tracewatch import locate, mark, session_id
+from .tracewatch import locate, mark
 
 
 def utcnow() -> str:
@@ -77,11 +78,12 @@ def _adopt_session_id(meta: SessionMeta, paths: Paths, session_dir: Path, leg_id
     return target, target / "legs" / leg_id
 
 
-def _new_meta(tool: str, cwd: Path, provisional: str, resumes: str | None = None) -> SessionMeta:
+def _new_meta(harness: AgentHarness, cwd: Path, provisional: str,
+              resumes: str | None = None) -> SessionMeta:
     identity = discover_repo_identity(cwd)
     now = utcnow()
     return SessionMeta(
-        session_id=provisional, tool=tool, repo_kind=identity.repo_kind,
+        session_id=provisional, provider=harness.name, repo_kind=identity.repo_kind,
         repo_root=str(identity.repo_root), repo_name=identity.repo_name,
         remote=identity.remote, canonical_remote=identity.canonical_remote,
         archive_namespace=identity.archive_namespace, initial_head="", final_head="",
@@ -89,22 +91,22 @@ def _new_meta(tool: str, cwd: Path, provisional: str, resumes: str | None = None
     )
 
 
-def run(tool: str, args: list[str]) -> int:
+def run(harness: AgentHarness, args: list[str]) -> int:
     paths = Paths.discover()
     paths.ensure_storage()
-    resume = _resume_id(tool, args)
+    resume = harness.parse_resume(args)
     existing = paths.scratch / resume if resume else None
     if existing and existing.is_dir():
         session_dir = existing
         meta = SessionMeta.load(session_dir / "meta.json")
-        if meta.tool != tool:
-            raise RuntimeError(f"session {resume} belongs to {meta.tool}, not {tool}")
+        if meta.provider != harness.name:
+            raise RuntimeError(f"session {resume} belongs to {meta.provider}, not {harness.name}")
         is_new = False
     else:
         provisional = f"provisional-{uuid.uuid4().hex}"
         session_dir = paths.scratch / provisional
         session_dir.mkdir(parents=True)
-        meta = _new_meta(tool, Path.cwd(), provisional, resume)
+        meta = _new_meta(harness, Path.cwd(), provisional, resume)
         meta.save(session_dir / "meta.json")
         is_new = True
 
@@ -122,21 +124,22 @@ def run(tool: str, args: list[str]) -> int:
         else:
             before = head(meta, session_dir)
         started = utcnow()
-        start = _facts(Path.cwd(), before, tool)
+        start = _facts(Path.cwd(), before, harness.executable)
         start["git_head_before"] = start.pop("git_head")
         start["start_utc"] = started
         (leg_dir / "start.json").write_text(json.dumps(start, indent=2) + "\n")
         meta.legs.append(Leg(leg_id, args, started, None, None, None, False))
         meta.last_activity_utc = started
         meta.save(session_dir / "meta.json")
-        marker = mark(tool)
+        roots = harness.trace_roots()
+        marker = mark(roots)
         trace_name = None
 
         def checkpoint() -> None:
             nonlocal session_dir, leg_dir, trace_name
-            trace = locate(tool, marker)
+            trace = locate(roots, marker)
             if trace:
-                actual_id = session_id(trace)
+                actual_id = harness.identify_session(source_records(trace), trace)
                 if is_new and meta.repo_kind != "synthetic" and actual_id != meta.session_id:
                     session_dir, leg_dir = _adopt_session_id(meta, paths, session_dir, leg_id, actual_id)
                 trace_name = _copy_trace(trace, session_dir, leg_id)
@@ -150,7 +153,7 @@ def run(tool: str, args: list[str]) -> int:
             meta.save(session_dir / "meta.json")
 
         try:
-            process = subprocess.Popen([tool, *args], env=git_env(meta, session_dir))
+            process = subprocess.Popen([harness.executable, *args], env=git_env(meta, session_dir))
             interval = _checkpoint_interval()
             next_checkpoint = time.monotonic()
             while True:
@@ -166,7 +169,7 @@ def run(tool: str, args: list[str]) -> int:
                 time.sleep(min(0.25, interval))
         except FileNotFoundError:
             exit_code = 127
-            print(f"memo: executable not found: {tool}", file=os.sys.stderr)
+            print(f"memo: executable not found: {harness.executable}", file=os.sys.stderr)
         except KeyboardInterrupt:
             try:
                 process.wait(timeout=2)
@@ -177,8 +180,9 @@ def run(tool: str, args: list[str]) -> int:
                     exit_code = process.wait()
                 else:
                     exit_code = 130
-        trace = locate(tool, marker)
-        actual_id = session_id(trace) if trace else meta.session_id.removeprefix("provisional-")
+        trace = locate(roots, marker)
+        actual_id = (harness.identify_session(source_records(trace), trace) if trace
+                     else meta.session_id.removeprefix("provisional-"))
         if is_new and actual_id != meta.session_id:
             session_dir, leg_dir = _adopt_session_id(meta, paths, session_dir, leg_id, actual_id)
         if trace:
@@ -186,7 +190,7 @@ def run(tool: str, args: list[str]) -> int:
         after = snapshot_final(meta, session_dir)
         write_commit_patch(meta, session_dir, before, after, leg_dir / "commits.patch")
         ended = utcnow()
-        end = _facts(Path.cwd(), after, tool)
+        end = _facts(Path.cwd(), after, harness.executable)
         end["git_head_after"] = end.pop("git_head")
         end["end_utc"] = ended
         end["exit_code"] = exit_code

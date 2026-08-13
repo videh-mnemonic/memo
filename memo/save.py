@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import Paths
+from .harnesses import get_harness
 from .models import SessionMeta
 from .store import SessionLock, SessionLockedError, list_scratch
 from .transport import atomic_write as _atomic_write, deterministic_archive
@@ -73,6 +74,7 @@ def _archive_bytes(session_dir: Path) -> bytes:
 
 def ship(session_dir: Path, meta: SessionMeta, paths: Paths) -> tuple[Path, str | None]:
     meta.validate()
+    get_harness(meta.provider)
     archive_dir = paths.archive / meta.archive_namespace
     archive_dir.mkdir(parents=True, exist_ok=True)
     destination = archive_dir / f"{meta.session_id}.tar.gz"

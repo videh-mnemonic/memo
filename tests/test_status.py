@@ -17,7 +17,7 @@ def _paths(tmp_path: Path) -> Paths:
 def _meta(session_id: str, *, shipped: bool = False) -> SessionMeta:
     return SessionMeta(
         session_id=session_id,
-        tool="codex",
+        provider="codex",
         repo_kind="real",
         repo_root="/work/example",
         repo_name="example",
