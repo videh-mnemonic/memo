@@ -51,15 +51,15 @@ class SessionStore:
         paths.ensure_storage()
 
     def session_path(self, namespace: str, session_id: str) -> Path:
-        assert self.paths.directory_archive is not None
-        return self.paths.directory_archive / namespace / session_id
+        assert self.paths.archive is not None
+        return self.paths.archive / namespace / session_id
 
     def list_sessions(self) -> list[tuple[Path, DirectorySession]]:
         return list_directory_sessions(self.paths)
 
     def find(self, session_id: str) -> tuple[Path, DirectorySession]:
-        assert self.paths.directory_archive is not None
-        matches = sorted(self.paths.directory_archive.glob(f"*/{session_id}/session.json"))
+        assert self.paths.archive is not None
+        matches = sorted(self.paths.archive.glob(f"*/{session_id}/session.json"))
         if not matches:
             raise SessionNotFoundError(f"session not found: {session_id}")
         if len(matches) > 1:
@@ -245,9 +245,9 @@ class SessionStore:
 
 
 def list_directory_sessions(paths: Paths) -> list[tuple[Path, DirectorySession]]:
-    assert paths.directory_archive is not None
+    assert paths.archive is not None
     result = []
-    for session_file in sorted(paths.directory_archive.glob("*/*/session.json")):
+    for session_file in sorted(paths.archive.glob("*/*/session.json")):
         try:
             result.append((session_file.parent, DirectorySession.load(session_file)))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):

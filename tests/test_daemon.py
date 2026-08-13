@@ -12,13 +12,25 @@ from memo.protocol import request
 from memo.session_store import SessionStore
 
 
-def test_background_recording_publishes_periodic_step(tmp_path: Path) -> None:
+def test_background_recording_publishes_periodic_step(
+    tmp_path: Path, monkeypatch
+) -> None:
     home = tmp_path / "memo-home"
-    paths = Paths(home, home / "scratch", home / "archive", tmp_path / "unpack")
+    paths = Paths(home)
     root = tmp_path / "work"
     root.mkdir()
     (root / "file.txt").write_text("first")
+    monkeypatch.setenv("MEMO_WATCHER", "0")
+    monkeypatch.setenv("MEMO_RECOVERY", "0")
     daemon = MemoDaemon(paths, interval=0.15)
+    recovered = threading.Event()
+    recover_all = daemon.streams.recover_all
+
+    def record_recovery():
+        recovered.set()
+        return recover_all()
+
+    monkeypatch.setattr(daemon.streams, "recover_all", record_recovery)
     thread = threading.Thread(target=daemon.serve_forever)
     thread.start()
     try:
@@ -27,6 +39,8 @@ def test_background_recording_publishes_periodic_step(tmp_path: Path) -> None:
         while time.monotonic() < deadline and not paths.socket.exists():
             time.sleep(0.01)
         started = request(str(paths.socket), "start", {"path": str(root)})
+        assert recovered.is_set()
+        assert started["session_id"] in daemon._observers
         store = SessionStore(paths)
         first = store.head(started["archive_namespace"], started["session_id"])
         assert first is not None
@@ -53,7 +67,7 @@ def test_background_recording_publishes_periodic_step(tmp_path: Path) -> None:
 
 def test_concurrent_terminal_ingestion_is_sealed_in_one_step(tmp_path: Path) -> None:
     home = tmp_path / "memo-home"
-    paths = Paths(home, home / "scratch", home / "archive", tmp_path / "unpack")
+    paths = Paths(home)
     root = tmp_path / "work"
     root.mkdir()
     daemon = MemoDaemon(paths, interval=10)

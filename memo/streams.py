@@ -169,6 +169,7 @@ class StreamStore:
         return recovered
 
     def seal_session(self, namespace: str, session_id: str) -> dict[str, int]:
+        assert self.paths.archive is not None
         session_path = self.paths.archive / namespace / session_id
         high_water: dict[str, int] = {}
         for attachment in self.registry.list_attachments(session_id):

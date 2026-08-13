@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import Paths, maximum_file_size
+from .config import MAX_FILE_SIZE_BYTES, Paths
 from .ignore import IgnorePolicy
 from .models import DirectorySession, SnapshotEntry, StepManifest
 from .session_store import SessionStore
@@ -58,7 +58,7 @@ def scan_tree(root: Path, destination: Path, *, previous: Path | None = None,
     entries: list[SnapshotEntry] = []
     seen: set[str] = set()
     policy = IgnorePolicy(root, paths)
-    size_limit = maximum_file_size() if max_file_size is None else max_file_size
+    size_limit = MAX_FILE_SIZE_BYTES if max_file_size is None else max_file_size
     destination.mkdir(parents=True, exist_ok=True)
     for current, directories, files in os.walk(root, topdown=True, followlinks=False):
         current_path = Path(current)

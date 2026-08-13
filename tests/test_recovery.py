@@ -12,7 +12,7 @@ from memo.streams import StreamStore
 
 def _setup(tmp_path: Path):
     home = tmp_path / "home"
-    paths = Paths(home, home / "scratch", home / "archive", tmp_path / "unpack")
+    paths = Paths(home)
     paths.ensure_storage()
     root = tmp_path / "root"
     root.mkdir()

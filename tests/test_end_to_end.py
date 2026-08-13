@@ -16,7 +16,6 @@ def test_public_lifecycle_and_inspect_use_zero_based_steps(tmp_path: Path, monke
     root.mkdir()
     (root / "note.txt").write_text("recorded\n")
     monkeypatch.setenv("MEMO_HOME", str(home))
-    monkeypatch.setenv("MEMO_CHECKPOINT_INTERVAL", "60")
     monkeypatch.chdir(root)
     try:
         assert main(["background"]) == 0

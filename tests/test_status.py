@@ -8,7 +8,7 @@ from memo.step import StepPublisher
 
 
 def _paths(tmp_path: Path) -> Paths:
-    return Paths(tmp_path, tmp_path / "scratch", tmp_path / "archive", tmp_path / "unpack")
+    return Paths(tmp_path)
 
 
 def test_status_lists_directory_step(tmp_path: Path) -> None:

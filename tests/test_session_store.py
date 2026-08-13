@@ -10,7 +10,7 @@ from memo.session_store import SessionStore
 
 
 def _paths(tmp_path: Path) -> Paths:
-    return Paths(tmp_path, tmp_path / "scratch", tmp_path / "archive", tmp_path / "unpack")
+    return Paths(tmp_path)
 
 
 def _session(root: Path) -> DirectorySession:

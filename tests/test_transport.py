@@ -47,7 +47,7 @@ class FakeS3:
 
 
 def _paths(root: Path) -> Paths:
-    return Paths(root, root / "scratch", root / "archive", root / "unpack")
+    return Paths(root)
 
 
 def _published(paths: Paths, root: Path, generation: int = 1) -> tuple[SessionStore, DirectorySession]:

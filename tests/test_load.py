@@ -16,7 +16,7 @@ from memo.streams import StreamEvent
 
 
 def _paths(tmp_path: Path) -> Paths:
-    return Paths(tmp_path, tmp_path / "scratch", tmp_path / "archive", tmp_path / "unpack")
+    return Paths(tmp_path)
 
 
 def _write_stream(session_path: Path, terminal_id: str, events: list[StreamEvent]) -> None:

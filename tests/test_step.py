@@ -7,7 +7,7 @@ from memo.step import scan_tree
 
 def _paths(tmp_path: Path) -> Paths:
     home = tmp_path / "home"
-    return Paths(home, home / "scratch", home / "archive", tmp_path / "unpack")
+    return Paths(home)
 
 
 def test_scan_records_policy_size_special_and_deletion(tmp_path: Path) -> None:
