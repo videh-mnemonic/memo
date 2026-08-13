@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from memo.load import inspect_session, reconstruct, terminal_json
-from memo.models import CheckpointManifest, DirectorySession, SnapshotEntry
+from memo.load import inspect_session, reconstruct, terminal_json, trace_json
+from memo.models import CheckpointManifest, DirectorySession, SessionMeta, SnapshotEntry
 from memo.session_store import SessionStore, atomic_write
 from memo.streams import StreamEvent
 from memo.config import Paths
@@ -35,6 +35,25 @@ def _fixture(tmp_path: Path) -> tuple[Paths, SessionStore, DirectorySession]:
         )
         store.publish(session, manifest, prepared)
     return paths, store, session
+
+
+def _agent_fixture(tmp_path: Path) -> Paths:
+    paths = _paths(tmp_path / "home")
+    session = paths.scratch / "agent-session"
+    (session / "traces").mkdir(parents=True)
+    SessionMeta(
+        session_id="agent-session", provider="claude", repo_kind="synthetic",
+        repo_root=str(tmp_path), repo_name="repo", remote="", canonical_remote="",
+        archive_namespace="local", initial_head="", final_head="",
+        first_seen_utc="start", last_activity_utc="end",
+    ).save(session / "meta.json")
+    (session / "traces" / "leg-002.jsonl").write_text(
+        '{"type":"assistant","content":"done"}\ninvalid\n'
+    )
+    (session / "traces" / "leg-001.jsonl").write_text(
+        '{"type":"user","content":{"text":"fix it"}}\n["native"]\n'
+    )
+    return paths
 
 
 def test_directory_inspect_and_checkpoint_reconstruction(tmp_path: Path) -> None:
@@ -90,3 +109,21 @@ def test_invalid_directory_manifest_is_rejected(tmp_path: Path) -> None:
     (session_path / head.snapshot / "note.txt").unlink()
     with pytest.raises(ValueError, match="missing snapshot file"):
         inspect_session("session", paths)
+
+
+def test_agent_trace_export_preserves_normal_and_raw_contracts(tmp_path: Path) -> None:
+    paths = _agent_fixture(tmp_path)
+
+    normal = json.loads(trace_json("agent-session", paths=paths))
+    raw = json.loads(trace_json("agent-session", raw=True, paths=paths))
+
+    assert [(item["position"]["trace"], item["position"]["seq"], item["event"]["type"]) for item in normal] == [
+        ("001", 0, "user_input"), ("001", 1, "unknown"),
+        ("002", 0, "agent_message"), ("002", 1, "parse_error"),
+    ]
+    assert normal[0]["event"]["content"] == {"text": "fix it"}
+    assert normal[1]["native"]["record"] == ["native"]
+    assert raw == [
+        {"type": "user", "content": {"text": "fix it"}}, ["native"],
+        {"type": "assistant", "content": "done"},
+    ]

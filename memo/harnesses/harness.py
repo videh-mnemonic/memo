@@ -100,7 +100,7 @@ class AgentHarness(ABC):
     def unknown(self, record: SourceRecord, context: ParseContext) -> TraceEvent:
         value = record.value
         native_type = value.get("type") if isinstance(value, dict) else None
-        native_version = value.get("version") if isinstance(value, dict) else None
+        native_version = _native_version(value)
         return self.event(
             record, context, "unknown", content=None,
             native_type=native_type, native_version=native_version,
@@ -114,7 +114,7 @@ class AgentHarness(ABC):
 
 
 def source_records(path: Path) -> Iterable[SourceRecord]:
-    with path.open(errors="replace") as handle:
+    with path.open(encoding="utf-8", errors="replace") as handle:
         for seq, line in enumerate(handle):
             try:
                 value = json.loads(line)
@@ -122,6 +122,20 @@ def source_records(path: Path) -> Iterable[SourceRecord]:
                 yield SourceRecord(seq=seq, line=line.rstrip("\n"), error=str(error))
                 continue
             yield SourceRecord(seq=seq, value=value, line=line.rstrip("\n"))
+
+
+def _native_version(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return None
+    for key in ("version", "schema_version", "schemaVersion"):
+        if key in value:
+            return value[key]
+    payload = value.get("payload")
+    if isinstance(payload, dict):
+        for key in ("version", "schema_version", "schemaVersion"):
+            if key in payload:
+                return payload[key]
+    return None
 
 
 def trace_events(harness: AgentHarness, path: Path, trace: str) -> list[dict[str, Any]]:
@@ -144,12 +158,8 @@ def all_traces(
         trace = path.stem.removeprefix("leg-")
         if through_leg is not None and int(trace) > through_leg:
             continue
-        records = list(source_records(path))
         if raw:
-            result.extend(record.value for record in records if record.error is None)
+            result.extend(record.value for record in source_records(path) if record.error is None)
         else:
-            for record in records:
-                context = ParseContext(trace=trace, seq=record.seq)
-                event = harness.parse_error(record, context) if record.error else harness.parse_record(record, context)
-                result.append(event.to_dict())
+            result.extend(trace_events(harness, path, trace))
     return result
