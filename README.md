@@ -111,3 +111,36 @@ memo --load <id> --replay --at final  --path <dir>
 ```
 
 Scratch sessions live under `$MEMO_HOME/scratch`. Remote-backed repositories share a canonical remote namespace across clones; repositories without a usable remote use a namespace derived from their canonical local path. Synthetic capture never writes `.git` into the user's directory.
+
+## CLI Interface
+
+The command-line interface has the following general forms:
+
+```console
+memo [ACTION] [OPTIONS] [PATH]
+memo claude [CLAUDE_ARGS...]
+memo codex [CODEX_ARGS...]
+```
+
+With no action, `memo [PATH]` starts or joins a recording for `PATH` (the current
+directory by default) and opens the configured shell. `memo claude` and `memo codex`
+instead run the selected agent and pass all remaining arguments through unchanged.
+
+Actions are mutually exclusive:
+
+- `--background [PATH]` starts or joins a recording without opening a terminal.
+- `--end [PATH]` finalizes a directory recording.
+- `--status` lists scratch and archived sessions.
+- `--save` archives eligible legacy scratch sessions. Use `--all`, `--session ID`,
+  or `--older-than DURATION` (for example, `30m`, `12h`, or `2d`) to select them.
+- `--load SESSION_ID` reads or restores a session. Pair it with one of `--inspect`,
+  `--unpack`, `--traces`, `--terminals`, `--replay`, or `--at POINT`.
+- `--push` uploads changed directory sessions; `--session ID` limits the push to one.
+- `--pull SESSION_ID` downloads a directory session.
+
+Loading and restoring accept `--path PATH` for the output, `--at POINT` for a
+checkpoint (`initial`, `final`, `generation:N`, `checkpoint:ID`, or legacy `leg:N`),
+and `--force` when an existing non-empty destination may be replaced. Trace exports
+accept `--raw`; terminal exports accept `--terminal ID`. Omitting `--path` (or using
+`--path -`) writes trace and terminal JSON to standard output. Run `memo --help` for
+the complete option list.
