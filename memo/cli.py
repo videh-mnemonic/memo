@@ -5,7 +5,10 @@ import re
 import sys
 from pathlib import Path
 
-from .load import inspect_session, reconstruct, replay, trace_json, unpack, write_traces
+from .daemon import activate, end, push
+from .load import (inspect_session, reconstruct, replay, terminal_json, trace_json,
+                   unpack, write_terminals, write_traces)
+from .relay import run as run_relay
 from .save import save_sessions
 from .status import render_status
 from .wrapper import run
@@ -21,10 +24,17 @@ def _hours(value: str) -> float:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="memo", description="Capture and replay coding-agent sessions")
-    action = result.add_mutually_exclusive_group(required=True)
+    action = result.add_mutually_exclusive_group()
     action.add_argument("--status", action="store_true", help="list scratch and saved sessions")
     action.add_argument("--save", action="store_true", help="ship eligible scratch sessions")
     action.add_argument("--load", metavar="SESSION_ID", help="load a scratch or shipped session")
+    action.add_argument("--background", action="store_true",
+                        help="start or join a directory recording without a terminal")
+    action.add_argument("--end", action="store_true", help="finalize a directory recording")
+    action.add_argument("--push", action="store_true", help="push changed directory sessions")
+    action.add_argument("--pull", metavar="SESSION_ID", help="pull a directory session")
+    result.add_argument("recording_path", nargs="?", type=Path,
+                        help="directory to record (defaults to the current directory)")
     result.add_argument("--all", action="store_true", help="with --save, ship every scratch session")
     result.add_argument("--session", metavar="ID", help="with --save, ship one session")
     result.add_argument("--older-than", default=48.0, type=_hours, metavar="DURATION")
@@ -32,8 +42,10 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument("--inspect", action="store_true")
     mode.add_argument("--unpack", action="store_true")
     mode.add_argument("--traces", action="store_true")
+    mode.add_argument("--terminals", action="store_true")
     mode.add_argument("--replay", action="store_true")
-    result.add_argument("--at", choices=["initial", "final"], help="reconstruction point (or use leg:N)")
+    result.add_argument("--at", help="reconstruction point, generation:N, or checkpoint:ID")
+    result.add_argument("--terminal", metavar="ID", help="select one terminal stream")
     result.add_argument("--path", type=Path, help="output file or directory")
     result.add_argument("--raw", action="store_true", help="preserve raw vendor trace records")
     result.add_argument("--force", action="store_true", help="replace a non-empty reconstruction directory")
@@ -60,16 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as error:
             print(f"memo: {error}", file=sys.stderr)
             return 1
-    # argparse choices cannot express leg:N; normalize it after a permissive pre-scan.
-    leg_at = None
-    if "--at" in argv:
-        index = argv.index("--at")
-        if index + 1 < len(argv) and argv[index + 1].startswith("leg:"):
-            leg_at = argv[index + 1]
-            argv[index + 1] = "initial"
     args = parser().parse_args(argv)
-    if leg_at:
-        args.at = leg_at
     try:
         if args.status:
             print(render_status(), end="")
@@ -87,6 +90,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(trace_json(args.load, args.raw), end="")
                 else:
                     write_traces(args.load, args.path, args.raw)
+            elif args.terminals:
+                if not args.path or str(args.path) == "-":
+                    print(terminal_json(args.load, args.terminal, args.at), end="")
+                else:
+                    write_terminals(args.load, args.path, args.terminal, args.at)
             elif args.replay:
                 if not args.path or not args.at:
                     raise ValueError("--replay requires --at and --path DIR")
@@ -98,6 +106,34 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 raise ValueError("--load requires --inspect, --unpack, --at, --traces, or --replay")
             return 0
+        if args.background:
+            result = activate(args.recording_path or Path.cwd())
+            action = "joined" if result["joined"] else "started"
+            print(
+                f"{action}: {result['session_id']} "
+                f"generation={result['generation']} root={result['root']}"
+            )
+            return 0
+        if args.end:
+            result = end(args.recording_path or Path.cwd())
+            action = "already complete" if result["already_complete"] else "completed"
+            print(f"{action}: {result['session_id']} generation={result['generation']}")
+            return 0
+        if args.push:
+            result = push(args.session)
+            for session_id in result["pushed"]:
+                print(f"pushed: {session_id}")
+            for session_id in result["skipped"]:
+                print(f"skipped: unchanged: {session_id}")
+            for session_id, error in result["failed"]:
+                print(f"failed: {session_id}: {error}", file=sys.stderr)
+            return 1 if result["failed"] else 0
+        if args.pull:
+            from .transport import pull_session
+            destination = pull_session(args.pull, force=args.force)
+            print(f"pulled: {args.pull} path={destination}")
+            return 0
+        return run_relay(args.recording_path or Path.cwd())
     except Exception as error:
         print(f"memo: {error}", file=sys.stderr)
         return 1

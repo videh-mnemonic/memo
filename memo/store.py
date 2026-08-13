@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import IO
 
 from .config import Paths
-from .models import SessionMeta
+from .models import DirectorySession, SessionMeta
+from .registry import Registry
+from .session_store import list_directory_sessions
 
 
 class SessionNotFoundError(FileNotFoundError):
@@ -67,6 +69,13 @@ def find_session(session_id: str, paths: Paths | None = None) -> SessionLocation
     scratch = paths.scratch / session_id
     if scratch.is_dir():
         return SessionLocation("scratch", scratch)
+    directory_matches = sorted(paths.archive.glob(f"*/{session_id}/session.json")) if paths.archive.exists() else []
+    if len(directory_matches) > 1:
+        namespaces = ", ".join(path.parent.parent.name for path in directory_matches)
+        raise AmbiguousSessionError(f"session {session_id} exists in multiple namespaces: {namespaces}")
+    if directory_matches:
+        match = directory_matches[0].parent
+        return SessionLocation("directory", match, match.parent.name)
     matches = sorted(paths.archive.glob(f"*/{session_id}.tar.gz")) if paths.archive.exists() else []
     if not matches:
         raise SessionNotFoundError(f"session not found: {session_id}")
@@ -74,6 +83,22 @@ def find_session(session_id: str, paths: Paths | None = None) -> SessionLocation
         namespaces = ", ".join(p.parent.name for p in matches)
         raise AmbiguousSessionError(f"session {session_id} exists in multiple namespaces: {namespaces}")
     return SessionLocation("archive", matches[0], matches[0].parent.name)
+
+
+def list_directory_saved(paths: Paths | None = None) -> list[tuple[Path, DirectorySession]]:
+    return list_directory_sessions(paths or Paths.discover())
+
+
+def find_active(path: Path, paths: Paths | None = None) -> DirectorySession | None:
+    paths = paths or Paths.discover()
+    assert paths.registry is not None
+    if not paths.registry.exists():
+        return None
+    with Registry(paths.registry) as registry:
+        active = registry.lookup(path)
+    if active is None:
+        return None
+    return DirectorySession.load(paths.archive / active.archive_namespace / active.session_id / "session.json")
 
 
 def list_scratch(paths: Paths | None = None) -> list[tuple[Path, SessionMeta]]:

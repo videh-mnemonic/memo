@@ -1,10 +1,57 @@
 # memo
 
-`memo` wraps Claude Code and Codex CLI sessions, preserving their Git starting point, commits, final working tree, and traces as portable archives.
+`memo` continuously records a directory and its attached terminals. A per-user daemon publishes complete directory checkpoints every 15 seconds into a writable local archive.
 
 Requires Python 3.11+ and Git. Install for development with `pip install -e .`, or personally with `pipx install .`. Set `MEMO_HOME` to override the default storage directory, `~/memo`.
 
 ## Commands
+
+Start or join the recording for the current directory and open your configured shell:
+
+```console
+memo .
+```
+
+Several terminals can join the same canonical directory. Each terminal has an independently ordered input/output stream. To record without opening a shell, use `memo --background .`.
+
+End the recording explicitly, then inspect or restore its final checkpoint:
+
+```console
+memo --end .
+memo --status
+memo --load <id> --inspect
+memo --load <id> --at final --path <dir>
+memo --load <id> --at generation:2 --path <dir>
+memo --load <id> --terminals
+memo --load <id> --terminals --terminal <terminal-id> --path <file.json>
+```
+
+Directory sessions live at `$MEMO_HOME/archive/<namespace>/<id>/`. Immutable checkpoint manifests and snapshots are published through an atomic `HEAD` pointer. `.gitignore` and `.memoignore` control capture; ignored, oversized, unstable, and special entries remain represented in checkpoint metadata. Set `MEMO_MAX_FILE_SIZE` to change the default 100 MiB file limit.
+
+`--at final` resolves `HEAD` once. Historical directory checkpoints can be selected with `generation:N` or `checkpoint:ID`. Restores refuse to replace non-empty destinations unless `--force` is supplied.
+
+## S3 Transport
+
+Set `MEMO_S3_BUCKET` to enable S3-compatible transport. Optional settings are
+`MEMO_S3_ENDPOINT`, `MEMO_S3_REGION`, `MEMO_S3_PREFIX`, and `MEMO_AWS_PROFILE`.
+Credentials come from the standard AWS SDK credential chain and are never written
+to session metadata.
+
+```console
+memo --push
+memo --push --session <id>
+memo --pull <id>
+memo --pull <id> --force
+```
+
+The daemon retries changed generations every 15 minutes. Override the cadence with
+`MEMO_PUSH_INTERVAL`, or disable automatic push with `MEMO_AUTO_PUSH=0`. Pushes are
+complete deterministic packages, so bandwidth scales with the committed generation
+size. Data and checksum objects publish before `latest.json`. Pull verifies both,
+rejects unsafe archive entries, and atomically installs without removing prior local
+state when an operation fails. A local session is not replaced without `--force`.
+
+## Legacy Sessions
 
 Run an agent normally through memo; all arguments and terminal I/O pass through:
 
@@ -15,7 +62,7 @@ memo codex [args...]
 
 Native resume flags append a leg when the referenced session is still in scratch. Resuming a shipped session starts a child session that records the old session ID.
 
-Inspect captured sessions (both scratch and saved archives), and ship scratch sessions:
+Legacy invocation-scoped scratch and tar sessions remain discoverable and loadable. The compatibility save route is:
 
 ```console
 memo --status

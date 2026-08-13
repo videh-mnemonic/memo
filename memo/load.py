@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import base64
 import shutil
 import subprocess
 import tarfile
 from pathlib import Path
 
 from .config import Paths
-from .models import SessionMeta
+from .models import DirectorySession, SessionMeta
 from .normalize import all_traces
+from .session_store import SessionStore
+from .transport import atomic_install_directory
 from .store import find_session
 
 
@@ -39,6 +42,8 @@ def safe_extract_tar(path: Path, target: Path) -> None:
 def unpack(session_id: str, paths: Paths | None = None) -> Path:
     paths = paths or Paths.discover()
     location = find_session(session_id, paths)
+    if location.kind == "directory":
+        return location.path
     target = paths.unpack / session_id
     marker = target / ".unpacked-ok"
     source = f"{location.kind}:{location.path}"
@@ -57,7 +62,7 @@ def unpack(session_id: str, paths: Paths | None = None) -> Path:
         else:
             safe_extract_tar(location.path, temporary)
         (temporary / ".unpacked-ok").write_text(source + "\n")
-        temporary.replace(target)
+        atomic_install_directory(temporary, target, force=True)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
@@ -78,6 +83,30 @@ def _size(path: Path) -> str:
 def inspect_session(session_id: str, paths: Paths | None = None) -> str:
     paths = paths or Paths.discover()
     location = find_session(session_id, paths)
+    if location.kind == "directory":
+        assert location.namespace is not None
+        store = SessionStore(paths)
+        session = DirectorySession.load(location.path / "session.json")
+        head = store.checkpoint(location.namespace, session_id)
+        streams = sorted(head.stream_high_water)
+        lines = [
+            f"Session: {session.session_id}",
+            f"Format: directory",
+            f"State: {session.state}",
+            f"Source: {location.path}",
+            f"Root: {session.root}",
+            f"Namespace: {session.archive_namespace}",
+            f"Created: {session.created_utc}",
+            f"Updated: {session.updated_utc}",
+            f"Generation: {head.generation}",
+            f"Checkpoint: {head.checkpoint_id}",
+            f"Checkpoint time: {head.created_utc}",
+            f"Snapshot entries: {len(head.entries)}",
+            f"Terminal streams: {len(streams)}",
+        ]
+        lines.extend(f"  {terminal_id}: sequence={head.stream_high_water[terminal_id]}"
+                     for terminal_id in streams)
+        return "\n".join(lines) + "\n"
     source = unpack(session_id, paths)
     meta = SessionMeta.load(source / "meta.json")
     state = "saved" if location.kind == "archive" else location.kind
@@ -162,6 +191,23 @@ def _extract_untracked(path: Path, destination: Path) -> None:
 
 def reconstruct(session_id: str, at: str, destination: Path, force: bool = False,
                 paths: Paths | None = None) -> Path:
+    paths = paths or Paths.discover()
+    location = find_session(session_id, paths)
+    if location.kind == "directory":
+        assert location.namespace is not None
+        selector: str | int | None = at
+        if at.startswith("checkpoint:"):
+            selector = at
+        elif at.startswith("generation:"):
+            try:
+                selector = int(at.partition(":")[2])
+            except ValueError as error:
+                raise ValueError(f"invalid generation selector: {at}") from error
+        elif at not in {"final", "HEAD"}:
+            raise ValueError(f"invalid directory reconstruction point: {at}")
+        return SessionStore(paths).restore(
+            location.namespace, session_id, destination, selector, force
+        )
     source = unpack(session_id, paths)
     _prepare_destination(destination, force)
     _run(["git", "clone", str(source / "git" / "initial.bundle"), str(destination)])
@@ -188,8 +234,37 @@ def reconstruct(session_id: str, at: str, destination: Path, force: bool = False
 
 
 def trace_json(session_id: str, raw: bool = False, paths: Paths | None = None) -> str:
+    paths = paths or Paths.discover()
+    location = find_session(session_id, paths)
+    if location.kind == "directory":
+        return terminal_json(session_id, paths=paths)
     source = unpack(session_id, paths)
     return json.dumps(all_traces(source, raw), indent=2, ensure_ascii=False) + "\n"
+
+
+def terminal_json(session_id: str, terminal_id: str | None = None,
+                  at: str | int | None = None, paths: Paths | None = None) -> str:
+    paths = paths or Paths.discover()
+    location = find_session(session_id, paths)
+    if location.kind != "directory" or location.namespace is None:
+        raise ValueError("terminal streams are only available for directory sessions")
+    events = SessionStore(paths).stream_events(
+        location.namespace, session_id, terminal_id, at
+    )
+    values = []
+    for event in events:
+        value = event.to_dict()
+        value["data"] = base64.b64decode(event.data).decode("utf-8", errors="replace")
+        values.append(value)
+    return json.dumps(values, indent=2, ensure_ascii=False) + "\n"
+
+
+def write_terminals(session_id: str, destination: Path, terminal_id: str | None = None,
+                    at: str | int | None = None, paths: Paths | None = None) -> Path:
+    data = terminal_json(session_id, terminal_id, at, paths)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(data)
+    return destination
 
 
 def write_traces(session_id: str, destination: Path, raw: bool = False,

@@ -9,13 +9,18 @@ description = "Capture, ship, reconstruct, and replay coding-agent sessions"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
-dependencies = []
+dependencies = [
+    "boto3>=1.35",
+    "pathspec>=0.12.1",
+    "watchdog>=6.0",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
 [project.scripts]
 memo = "memo.cli:main"
+memo-daemon = "memo.daemon:main"
 
 [tool.setuptools.packages.find]
 include = ["memo*"]

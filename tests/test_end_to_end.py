@@ -4,11 +4,19 @@ import json
 import os
 import stat
 import subprocess
+import pty
+import select
+import sys
 import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from memo.cli import main
+from memo.config import Paths
+from memo.protocol import request
+from memo.session_store import SessionStore
 
 
 STUB = '''#!/usr/bin/env python3
@@ -212,3 +220,150 @@ def test_live_session_id_collision_keeps_provisional_session(tmp_path: Path, mon
     meta = json.loads((provisional[0] / "meta.json").read_text())
     assert meta["legs"][0]["complete"] is True
     assert meta["legs"][0]["trace_file"] == "leg-001.jsonl"
+
+
+def test_public_cli_starts_background_directory_recording(tmp_path: Path, monkeypatch, capsys) -> None:
+    home = tmp_path / "memo-home"
+    root = tmp_path / "plain-directory"
+    root.mkdir()
+    (root / "notes.txt").write_text("initial\n")
+    monkeypatch.setenv("MEMO_HOME", str(home))
+    monkeypatch.setenv("MEMO_CHECKPOINT_INTERVAL", "1")
+
+    assert main(["--background", str(root)]) == 0
+    output = capsys.readouterr().out
+    assert "started:" in output
+    paths = Paths.discover()
+    sessions = list((home / "archive").glob("*/*/session.json"))
+    assert len(sessions) == 1
+    session_dir = sessions[0].parent
+    store = SessionStore(paths)
+    head = store.head(session_dir.parent.name, session_dir.name)
+    assert head is not None
+    assert (session_dir / head.snapshot / "notes.txt").read_text() == "initial\n"
+
+    assert main(["--background", str(root)]) == 0
+    assert "joined:" in capsys.readouterr().out
+    assert paths.socket is not None
+    request(str(paths.socket), "shutdown")
+
+
+def test_two_interactive_attachments_publish_one_directory_checkpoint(tmp_path: Path) -> None:
+    home = tmp_path / "memo-home"
+    root = tmp_path / "work"
+    root.mkdir()
+    shell = tmp_path / "shell"
+    shell.write_text(
+        "#!/bin/sh\nread name\nprintf '%s\\n' \"$name\" > \"$name.txt\"\nprintf 'done:%s\\n' \"$name\"\n"
+    )
+    shell.chmod(0o755)
+    environment = {**os.environ, "MEMO_HOME": str(home), "SHELL": str(shell),
+                   "MEMO_CHECKPOINT_INTERVAL": "1"}
+    processes = []
+    masters = []
+    try:
+        for name in ("one", "two"):
+            master, slave = pty.openpty()
+            process = subprocess.Popen(
+                [sys.executable, "-m", "memo.cli", str(root)], stdin=slave, stdout=slave,
+                stderr=slave, env=environment, close_fds=True,
+            )
+            os.close(slave)
+            processes.append(process)
+            masters.append(master)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not list(home.glob("archive/*/*/session.json")):
+                time.sleep(0.05)
+            time.sleep(0.1)
+            os.write(master, f"{name}\n".encode())
+        for name, process, master in zip(("one", "two"), processes, masters):
+            output = bytearray()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and f"done:{name}".encode() not in output:
+                readable, _, _ = select.select([master], [], [], 0.1)
+                if readable:
+                    try:
+                        output.extend(os.read(master, 4096))
+                    except OSError:
+                        break
+            assert f"done:{name}".encode() in output
+            assert process.wait(timeout=5) == 0
+        paths = Paths(home, home / "scratch", home / "archive", tmp_path / "unpack")
+        assert paths.socket is not None
+        request(str(paths.socket), "checkpoint", {"path": str(root)})
+        session = next(home.glob("archive/*/*"))
+        manifest = SessionStore(paths).head(session.parent.name, session.name)
+        assert manifest is not None
+        assert len(manifest.stream_high_water) == 2
+        assert (session / manifest.snapshot / "one.txt").read_text().strip() == "one"
+        assert (session / manifest.snapshot / "two.txt").read_text().strip() == "two"
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+        socket_path = home / "runtime" / "memo.sock"
+        if socket_path.exists():
+            request(str(socket_path), "shutdown")
+        for master in masters:
+            os.close(master)
+
+
+def test_end_restore_export_and_restart_directory_session(tmp_path: Path, monkeypatch, capsys) -> None:
+    home = tmp_path / "memo-home"
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "note.txt").write_text("recorded\n")
+    monkeypatch.setenv("MEMO_HOME", str(home))
+    monkeypatch.setenv("MEMO_CHECKPOINT_INTERVAL", "60")
+
+    assert main(["--background", str(root)]) == 0
+    first_session = next(home.glob("archive/*/*/session.json")).parent
+    assert main(["--end", str(root)]) == 0
+    assert "completed:" in capsys.readouterr().out
+    first_meta = json.loads((first_session / "session.json").read_text())
+    assert first_meta["state"] == "complete"
+    paths = Paths.discover()
+    assert paths.registry is not None
+    from memo.registry import Registry
+    with Registry(paths.registry) as registry:
+        assert registry.lookup(root) is None
+
+    restored = tmp_path / "restored"
+    assert main(["--load", first_session.name, "--at", "final", "--path", str(restored)]) == 0
+    assert (restored / "note.txt").read_text() == "recorded\n"
+    assert main(["--load", first_session.name, "--terminals"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+    assert main(["--background", str(root)]) == 0
+    sessions = [path.parent for path in home.glob("archive/*/*/session.json")]
+    assert len(sessions) == 2
+    assert {path.name for path in sessions} != {first_session.name}
+    assert paths.socket is not None
+    request(str(paths.socket), "shutdown")
+
+
+def test_push_pull_and_restore_directory_generation(tmp_path: Path) -> None:
+    from test_transport import FakeS3, _paths, _published
+    from memo.config import TransportConfig
+    from memo.transport import pull_session, push_session
+
+    root = tmp_path / "source"
+    root.mkdir()
+    source_paths = _paths(tmp_path / "source-home")
+    store, session = _published(source_paths, root)
+    client = FakeS3()
+    config = TransportConfig("bucket", "e2e")
+    assert push_session(store, session, config, client)["status"] == "pushed"
+
+    destination_paths = _paths(tmp_path / "destination-home")
+    pull_session("session", destination_paths, config, client=client)
+    restored = tmp_path / "restored"
+    destination_store = SessionStore(destination_paths)
+    destination_store.restore("namespace", "session", restored)
+    assert (restored / "file.txt").read_text() == "generation 1\n"
+
+    (restored / "local-only.txt").write_text("preserved")
+    with pytest.raises(FileExistsError):
+        pull_session("session", destination_paths, config, client=client)
+    assert (restored / "local-only.txt").read_text() == "preserved"
