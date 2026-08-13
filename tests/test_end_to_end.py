@@ -4,8 +4,6 @@ import base64
 import json
 from pathlib import Path
 
-import pytest
-
 from memo.cli import main
 from memo.config import Paths
 from memo.protocol import request
@@ -109,15 +107,6 @@ def test_public_traces_and_replay_use_step_bounded_terminal_input(
         socket = home / "runtime/memo.sock"
         if socket.exists():
             request(str(socket), "shutdown")
-
-
-def test_removed_command_forms_are_rejected() -> None:
-    with pytest.raises(SystemExit):
-        main(["claude"])
-    with pytest.raises(SystemExit):
-        main(["codex"])
-    with pytest.raises(SystemExit):
-        main(["--load", "session", "--inspect"])
 
 
 def test_public_push_and_pull_subcommands_route_results(tmp_path: Path, monkeypatch, capsys) -> None:

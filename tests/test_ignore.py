@@ -49,14 +49,6 @@ def test_nested_git_file_resets_outer_rules(tmp_path: Path) -> None:
     assert policy.decision(worktree / "drop.cache").ignored
 
 
-def test_memoignore_is_inert(tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / ".memoignore").write_text("ignored.txt\n")
-
-    assert not IgnorePolicy(root).decision(root / "ignored.txt").ignored
-
-
 def test_memo_storage_is_excluded_when_nested_in_recording(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()

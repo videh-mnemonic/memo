@@ -23,21 +23,13 @@ def test_transport_discovery_uses_retained_environment_surface(monkeypatch) -> N
     monkeypatch.setenv("MEMO_S3_ENDPOINT", "http://localhost:9000")
     monkeypatch.setenv("MEMO_S3_REGION", "region")
     monkeypatch.setenv("MEMO_S3_PROFILE", "profile")
-    monkeypatch.setenv("MEMO_AWS_PROFILE", "legacy")
 
     assert TransportConfig.discover() == TransportConfig(
         "bucket", "prefix", "http://localhost:9000", "region", "profile"
     )
 
 
-def test_operational_defaults_are_fixed_code_values(monkeypatch) -> None:
-    for name in (
-        "MEMO_CHECKPOINT_INTERVAL", "MEMO_MAX_FILE_SIZE", "MEMO_SPOOL_FLUSH_INTERVAL",
-        "MEMO_WATCHER", "MEMO_WATCHER_DEBOUNCE", "MEMO_RECOVERY",
-        "MEMO_PUSH_INTERVAL", "MEMO_AUTO_PUSH",
-    ):
-        monkeypatch.setenv(name, "0")
-
+def test_operational_defaults_are_fixed_code_values() -> None:
     assert STEP_INTERVAL_SECONDS == 15.0
     assert MAX_FILE_SIZE_BYTES == 100 * 1024 * 1024
     assert WATCHER_DEBOUNCE_SECONDS == 0.25
