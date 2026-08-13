@@ -11,11 +11,118 @@ import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, BinaryIO, Iterable
+
+import zstandard
 
 from .config import Paths, TransportConfig
 from .models import CheckpointManifest, DirectorySession
 from .session_store import SessionStore, atomic_write
+
+
+MULTIPART_PART_SIZE = 8 * 1024 * 1024
+
+
+class HashingWriter:
+    def __init__(self, target: BinaryIO, digest: Any | None = None) -> None:
+        self.target = target
+        self.digest = digest or hashlib.sha256()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data: bytes) -> int:
+        self.digest.update(data)
+        written = self.target.write(data)
+        if written != len(data):
+            raise OSError(f"short write: expected {len(data)} bytes, wrote {written}")
+        return written
+
+    def flush(self) -> None:
+        flush = getattr(self.target, "flush", None)
+        if flush is not None:
+            flush()
+
+    def hexdigest(self) -> str:
+        return self.digest.hexdigest()
+
+
+class MultipartUploadWriter:
+    def __init__(self, client: Any, bucket: str, key: str, upload_id: str,
+                 part_size: int = MULTIPART_PART_SIZE) -> None:
+        if part_size <= 0:
+            raise ValueError("multipart part size must be positive")
+        self.client = client
+        self.bucket = bucket
+        self.key = key
+        self.upload_id = upload_id
+        self.part_size = part_size
+        self.buffer = bytearray()
+        self.parts: list[dict[str, object]] = []
+        self.finished = False
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data: bytes) -> int:
+        if self.finished:
+            raise ValueError("multipart upload writer is finished")
+        view = memoryview(data)
+        consumed = 0
+        while consumed < len(view):
+            count = min(self.part_size - len(self.buffer), len(view) - consumed)
+            self.buffer.extend(view[consumed:consumed + count])
+            consumed += count
+            if len(self.buffer) == self.part_size:
+                self._upload_buffer()
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+    def _upload_buffer(self) -> None:
+        part_number = len(self.parts) + 1
+        response = self.client.upload_part(
+            Bucket=self.bucket,
+            Key=self.key,
+            UploadId=self.upload_id,
+            PartNumber=part_number,
+            Body=bytes(self.buffer),
+        )
+        self.parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+        self.buffer.clear()
+
+    def finish(self) -> list[dict[str, object]]:
+        if not self.finished:
+            if self.buffer or not self.parts:
+                self._upload_buffer()
+            self.finished = True
+        return list(self.parts)
+
+
+def write_deterministic_tar_zst(root: Path, paths: Iterable[Path], target: BinaryIO) -> None:
+    compressor = zstandard.ZstdCompressor(
+        level=3,
+        threads=1,
+        write_content_size=False,
+        write_checksum=False,
+        write_dict_id=False,
+    )
+    with compressor.stream_writer(target, closefd=False) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+            for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
+                relative = path.relative_to(root)
+                if relative.as_posix() == "session.lock" or path.is_socket():
+                    continue
+                info = archive.gettarinfo(str(path), arcname=relative.as_posix())
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                info.mtime = 0
+                if info.isfile():
+                    with path.open("rb") as handle:
+                        archive.addfile(info, handle)
+                else:
+                    archive.addfile(info)
 
 
 def deterministic_archive(root: Path, paths: Iterable[Path] | None = None) -> bytes:
@@ -113,6 +220,36 @@ def package_generation(store: SessionStore, session: DirectorySession) -> tuple[
     return data, digest_bytes(data), manifest
 
 
+def _multipart_package_generation(store: SessionStore, session: DirectorySession, config: TransportConfig,
+                                  client: Any, temporary: str) -> tuple[str, CheckpointManifest]:
+    manifest = store.head(session.archive_namespace, session.session_id)
+    if manifest is None:
+        raise ValueError(f"session has no published checkpoint: {session.session_id}")
+    root = store.session_path(session.archive_namespace, session.session_id)
+    response = client.create_multipart_upload(Bucket=config.bucket, Key=temporary)
+    upload_id = response["UploadId"]
+    try:
+        multipart = MultipartUploadWriter(client, config.bucket, temporary, upload_id)
+        hashing = HashingWriter(multipart)
+        write_deterministic_tar_zst(root, _generation_paths(root, manifest), hashing)
+        parts = multipart.finish()
+        client.complete_multipart_upload(
+            Bucket=config.bucket,
+            Key=temporary,
+            UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+    except BaseException:
+        try:
+            client.abort_multipart_upload(
+                Bucket=config.bucket, Key=temporary, UploadId=upload_id
+            )
+        except BaseException:
+            pass
+        raise
+    return hashing.hexdigest(), manifest
+
+
 @dataclass
 class PushSummary:
     pushed: list[str] = field(default_factory=list)
@@ -133,27 +270,28 @@ def push_session(store: SessionStore, session: DirectorySession, config: Transpo
     if session.last_pushed_generation == manifest.generation:
         return {"session_id": session.session_id, "generation": manifest.generation,
                 "digest": session.last_pushed_digest, "status": "skipped"}
-    data, digest, manifest = package_generation(store, session)
     client = client or config.client()
     base = _key(config, session.archive_namespace, session.session_id)
-    version = f"{base}/generations/{manifest.generation}-{digest}.tar.gz"
+    temporary = f"{base}/tmp/{uuid.uuid4().hex}.tar.zst"
+    digest, manifest = _multipart_package_generation(store, session, config, client, temporary)
+    version = f"{base}/generations/{manifest.generation}-{digest}.tar.zst"
     checksum = f"{version}.sha256"
-    temporary = f"{base}/tmp/{uuid.uuid4().hex}.tar.gz"
-    client.put_object(Bucket=config.bucket, Key=temporary, Body=data)
     try:
         client.copy_object(Bucket=config.bucket, Key=version,
                            CopySource={"Bucket": config.bucket, "Key": temporary})
         client.put_object(Bucket=config.bucket, Key=checksum,
                           Body=f"{digest}  {Path(version).name}\n".encode())
-        pointer = json.dumps({"schema_version": 1, "session_id": session.session_id,
-                              "namespace": session.archive_namespace,
-                              "generation": manifest.generation, "digest": digest,
-                              "object": version, "checksum": checksum},
-                             sort_keys=True).encode()
-        final_key = f"{base}/latest.json"
-        client.put_object(Bucket=config.bucket, Key=final_key, Body=pointer)
-    finally:
+    except BaseException:
         client.delete_object(Bucket=config.bucket, Key=temporary)
+        raise
+    client.delete_object(Bucket=config.bucket, Key=temporary)
+    pointer = json.dumps({"schema_version": 1, "session_id": session.session_id,
+                          "namespace": session.archive_namespace,
+                          "generation": manifest.generation, "digest": digest,
+                          "object": version, "checksum": checksum},
+                         sort_keys=True).encode()
+    final_key = f"{base}/latest.json"
+    client.put_object(Bucket=config.bucket, Key=final_key, Body=pointer)
     session.last_pushed_generation = manifest.generation
     session.last_pushed_digest = digest
     session.remote_object = final_key
