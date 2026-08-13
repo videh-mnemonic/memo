@@ -18,6 +18,24 @@ from memo.transport import (MULTIPART_PART_SIZE, MultipartUploadWriter,
                             pull_session, push_session, safe_extract_bytes)
 
 
+class TrackingBody(io.BytesIO):
+    def __init__(self, data: bytes, max_chunk: int = 4096) -> None:
+        super().__init__(data)
+        self.max_chunk = max_chunk
+        self.read_sizes: list[int] = []
+        self.was_closed = False
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            raise AssertionError("unbounded response body read")
+        self.read_sizes.append(size)
+        return super().read(min(size, self.max_chunk))
+
+    def close(self) -> None:
+        self.was_closed = True
+        super().close()
+
+
 class FakeS3:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
@@ -26,6 +44,7 @@ class FakeS3:
         self.fail_operation: tuple[str, object] | None = None
         self.uploads: dict[str, dict[str, object]] = {}
         self.aborted: set[str] = set()
+        self.response_bodies: list[tuple[str, TrackingBody]] = []
 
     @staticmethod
     def _bytes(value) -> bytes:
@@ -79,8 +98,11 @@ class FakeS3:
         self.operations.append(("delete", Key))
         self.objects.pop(Key, None)
 
-    def get_object(self, *, Bucket: str, Key: str) -> dict[str, io.BytesIO]:
-        return {"Body": io.BytesIO(self.objects[Key])}
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, TrackingBody]:
+        self.operations.append(("get", Key))
+        body = TrackingBody(self.objects[Key])
+        self.response_bodies.append((Key, body))
+        return {"Body": body}
 
     def list_objects_v2(self, *, Bucket: str, Prefix: str) -> dict[str, object]:
         return {"Contents": [{"Key": key} for key in sorted(self.objects) if key.startswith(Prefix)]}
@@ -246,6 +268,101 @@ def test_pull_verifies_checksum_and_refuses_local_conflict(tmp_path: Path) -> No
     with pytest.raises(ValueError, match="checksum mismatch"):
         pull_session("session", other_paths, config, client=client)
     assert not other_paths.archive.joinpath("namespace", "session").exists()
+
+
+def test_pull_streams_bounded_reads_and_closes_all_response_bodies(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    store, session = _published(_paths(tmp_path / "source-home"), source_root)
+    client = FakeS3()
+    config = TransportConfig("bucket", "prefix")
+    push_session(store, session, config, client)
+
+    pull_session("session", _paths(tmp_path / "clean-home"), config, client=client)
+
+    assert len(client.response_bodies) == 3
+    assert all(body.was_closed for _, body in client.response_bodies)
+    assert all(body.read_sizes and max(body.read_sizes) <= 64 * 1024
+               for _, body in client.response_bodies)
+    latest = "prefix/namespace/session/latest.json"
+    pointer = json.loads(client.objects[latest])
+    assert [key for operation, key in client.operations if operation == "get"] == [
+        latest, pointer["checksum"], pointer["object"]
+    ]
+
+
+def test_pull_closes_metadata_body_when_sidecar_disagrees(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    store, session = _published(_paths(tmp_path / "source-home"), source_root)
+    client = FakeS3()
+    config = TransportConfig("bucket", "prefix")
+    push_session(store, session, config, client)
+    pointer = json.loads(client.objects["prefix/namespace/session/latest.json"])
+    client.objects[pointer["checksum"]] = b"0" * 64 + b"  package.tar.zst\n"
+
+    with pytest.raises(ValueError, match="pointer and checksum disagree"):
+        pull_session("session", _paths(tmp_path / "clean-home"), config, client=client)
+
+    assert len(client.response_bodies) == 2
+    assert all(body.was_closed for _, body in client.response_bodies)
+    assert not any(key == pointer["object"] for operation, key in client.operations
+                   if operation == "get")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("schema_version", 2, "schema"),
+        ("session_id", "other", "session identity"),
+        ("namespace", "other", "object identity"),
+        ("object", "prefix/namespace/session/generations/package.tar.gz", ".tar.zst"),
+    ],
+)
+def test_pull_rejects_invalid_pointer_before_package_request(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    store, session = _published(_paths(tmp_path / "source-home"), source_root)
+    client = FakeS3()
+    config = TransportConfig("bucket", "prefix")
+    push_session(store, session, config, client)
+    latest = "prefix/namespace/session/latest.json"
+    pointer = json.loads(client.objects[latest])
+    pointer[field] = value
+    client.objects[latest] = json.dumps(pointer).encode()
+
+    with pytest.raises(ValueError, match=message):
+        pull_session("session", _paths(tmp_path / "clean-home"), config, client=client)
+
+    assert len(client.response_bodies) == 1
+    assert client.response_bodies[0][1].was_closed
+
+
+def test_pull_malformed_package_closes_body_and_removes_staging(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    store, session = _published(_paths(tmp_path / "source-home"), source_root)
+    client = FakeS3()
+    config = TransportConfig("bucket", "prefix")
+    push_session(store, session, config, client)
+    pointer = json.loads(client.objects["prefix/namespace/session/latest.json"])
+    malformed = b"not a zstandard stream"
+    digest = hashlib.sha256(malformed).hexdigest()
+    pointer["digest"] = digest
+    client.objects["prefix/namespace/session/latest.json"] = json.dumps(pointer).encode()
+    client.objects[pointer["checksum"]] = f"{digest}  package.tar.zst\n".encode()
+    client.objects[pointer["object"]] = malformed
+    destination_paths = _paths(tmp_path / "clean-home")
+
+    with pytest.raises(zstandard.ZstdError):
+        pull_session("session", destination_paths, config, client=client)
+
+    assert client.response_bodies[-1][1].was_closed
+    namespace = destination_paths.archive / "namespace"
+    assert not (namespace / "session").exists()
+    assert not list(namespace.glob(".session.pull-*"))
 
 
 def test_safe_extract_rejects_traversal(tmp_path: Path) -> None:

@@ -21,6 +21,8 @@ from .session_store import SessionStore, atomic_write
 
 
 MULTIPART_PART_SIZE = 8 * 1024 * 1024
+METADATA_SIZE_LIMIT = 1024 * 1024
+STREAM_READ_SIZE = 64 * 1024
 
 
 class HashingWriter:
@@ -42,6 +44,32 @@ class HashingWriter:
         flush = getattr(self.target, "flush", None)
         if flush is not None:
             flush()
+
+    def hexdigest(self) -> str:
+        return self.digest.hexdigest()
+
+
+class HashingReader:
+    def __init__(self, source: BinaryIO, digest: Any | None = None,
+                 read_size: int = STREAM_READ_SIZE) -> None:
+        self.source = source
+        self.digest = digest or hashlib.sha256()
+        self.read_size = read_size
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        requested = self.read_size if size < 0 else min(size, self.read_size)
+        data = self.source.read(requested)
+        self.digest.update(data)
+        return data
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:
+        data = self.read(min(len(buffer), self.read_size))
+        count = len(data)
+        buffer[:count] = data
+        return count
 
     def hexdigest(self) -> str:
         return self.digest.hexdigest()
@@ -173,6 +201,30 @@ def safe_extract_bytes(data: bytes, target: Path) -> None:
             except ValueError as error:
                 raise ValueError(f"archive path escapes destination: {member.name}") from error
         archive.extractall(target, members=members, filter="data")
+
+
+def safe_extract_tar_zst_stream(source: BinaryIO, target: Path) -> str:
+    root = target.resolve()
+    hashing = HashingReader(source)
+    decompressor = zstandard.ZstdDecompressor()
+    with decompressor.stream_reader(hashing, closefd=False) as decompressed:
+        with tarfile.open(fileobj=decompressed, mode="r|") as archive:
+            for member in archive:
+                name = Path(member.name)
+                if name.is_absolute() or ".." in name.parts:
+                    raise ValueError(f"unsafe archive path: {member.name}")
+                if member.issym() or member.islnk() or member.isdev():
+                    raise ValueError(f"unsupported archive entry: {member.name}")
+                try:
+                    (root / name).resolve().relative_to(root)
+                except ValueError as error:
+                    raise ValueError(
+                        f"archive path escapes destination: {member.name}"
+                    ) from error
+                archive.extract(member, target, filter="data")
+    while hashing.read(STREAM_READ_SIZE):
+        pass
+    return hashing.hexdigest()
 
 
 def atomic_install_directory(prepared: Path, destination: Path, force: bool = False) -> None:
@@ -321,9 +373,60 @@ def push_sessions(paths: Paths | None = None, config: TransportConfig | None = N
     return summary
 
 
-def _body(response: dict[str, Any]) -> bytes:
+def _bounded_body(response: dict[str, Any], limit: int = METADATA_SIZE_LIMIT) -> bytes:
     body = response["Body"]
-    return body.read() if hasattr(body, "read") else bytes(body)
+    if not hasattr(body, "read"):
+        data = bytes(body)
+        if len(data) > limit:
+            raise ValueError(f"remote metadata exceeds {limit} bytes")
+        return data
+    chunks = bytearray()
+    try:
+        while len(chunks) <= limit:
+            chunk = body.read(min(STREAM_READ_SIZE, limit + 1 - len(chunks)))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        if len(chunks) > limit:
+            raise ValueError(f"remote metadata exceeds {limit} bytes")
+        return bytes(chunks)
+    finally:
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
+
+
+def _validate_pointer(pointer: object, session_id: str, pointer_key: str) -> dict[str, Any]:
+    if not isinstance(pointer, dict):
+        raise ValueError("remote pointer must be a JSON object")
+    if pointer.get("schema_version") != 1:
+        raise ValueError("unsupported remote pointer schema")
+    if pointer.get("session_id") != session_id:
+        raise ValueError("remote pointer session identity mismatch")
+    namespace = pointer.get("namespace")
+    generation = pointer.get("generation")
+    digest = pointer.get("digest")
+    object_key = pointer.get("object")
+    checksum_key = pointer.get("checksum")
+    if not isinstance(namespace, str) or not namespace:
+        raise ValueError("remote pointer has invalid namespace")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise ValueError("remote pointer has invalid generation")
+    if (not isinstance(digest, str) or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)):
+        raise ValueError("remote pointer has invalid digest")
+    if not isinstance(object_key, str) or not object_key.endswith(".tar.zst"):
+        raise ValueError("remote pointer object must be a .tar.zst package")
+    if not isinstance(checksum_key, str) or checksum_key != f"{object_key}.sha256":
+        raise ValueError("remote pointer has invalid checksum object")
+    base = pointer_key.removesuffix("/latest.json")
+    expected_suffix = f"{namespace}/{session_id}"
+    if (base.strip("/") != expected_suffix
+            and not base.strip("/").endswith(f"/{expected_suffix}")):
+        raise ValueError("remote pointer object identity mismatch")
+    if not object_key.startswith(f"{base}/generations/"):
+        raise ValueError("remote pointer object identity mismatch")
+    return pointer
 
 
 def pull_session(session_id: str, paths: Paths | None = None,
@@ -339,13 +442,17 @@ def pull_session(session_id: str, paths: Paths | None = None,
             if item["Key"].endswith(f"/{session_id}/latest.json")]
     if len(keys) != 1:
         raise FileNotFoundError(f"remote session lookup returned {len(keys)} matches: {session_id}")
-    pointer = json.loads(_body(client.get_object(Bucket=config.bucket, Key=keys[0])))
-    data = _body(client.get_object(Bucket=config.bucket, Key=pointer["object"]))
-    checksum = _body(client.get_object(Bucket=config.bucket, Key=pointer["checksum"])).decode()
+    pointer = _validate_pointer(
+        json.loads(_bounded_body(client.get_object(Bucket=config.bucket, Key=keys[0]))),
+        session_id,
+        keys[0],
+    )
+    checksum = _bounded_body(
+        client.get_object(Bucket=config.bucket, Key=pointer["checksum"])
+    ).decode()
     sidecar_digest = checksum.split()[0] if checksum.split() else ""
     if sidecar_digest != pointer["digest"]:
         raise ValueError("remote pointer and checksum disagree")
-    verify_digest(data, pointer["digest"])
     store = SessionStore(paths)
     destination = store.session_path(pointer["namespace"], session_id)
     if destination.exists() and not force:
@@ -358,12 +465,26 @@ def pull_session(session_id: str, paths: Paths | None = None,
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{session_id}.pull-", dir=destination.parent))
     try:
-        safe_extract_bytes(data, temporary)
+        response = client.get_object(Bucket=config.bucket, Key=pointer["object"])
+        body = response["Body"]
+        try:
+            actual_digest = safe_extract_tar_zst_stream(body, temporary)
+        finally:
+            close = getattr(body, "close", None)
+            if close is not None:
+                close()
+        if actual_digest != pointer["digest"]:
+            raise ValueError(
+                f"checksum mismatch: expected {pointer['digest']}, got {actual_digest}"
+            )
         pulled = DirectorySession.load(temporary / "session.json")
         manifest = CheckpointManifest.load(
             temporary / "checkpoints" / f"{(temporary / 'HEAD').read_text().strip()}.json"
         )
-        if pulled.session_id != session_id or manifest.generation != int(pointer["generation"]):
+        if (pulled.session_id != session_id
+                or pulled.archive_namespace != pointer["namespace"]
+                or manifest.session_id != session_id
+                or manifest.generation != pointer["generation"]):
             raise ValueError("downloaded session does not match remote pointer")
         pulled.last_pushed_generation = manifest.generation
         pulled.last_pushed_digest = pointer["digest"]
