@@ -6,6 +6,7 @@ import json
 import os
 import tarfile
 import tempfile
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,7 @@ class FakeS3:
         self.uploads: dict[str, dict[str, object]] = {}
         self.aborted: set[str] = set()
         self.response_bodies: list[tuple[str, TrackingBody]] = []
+        self.part_sizes: list[int] = []
 
     @staticmethod
     def _bytes(value) -> bytes:
@@ -52,12 +54,15 @@ class FakeS3:
 
     def put_object(self, *, Bucket: str, Key: str, Body) -> None:
         self.operations.append(("put", Key))
-        if Key == self.fail_key:
+        if (Key == self.fail_key or self.fail_operation == ("put", Key)
+                or (self.fail_operation == ("put_checksum", None) and Key.endswith(".sha256"))):
             raise OSError("injected upload failure")
         self.objects[Key] = self._bytes(Body)
 
     def create_multipart_upload(self, *, Bucket: str, Key: str) -> dict[str, str]:
         self.operations.append(("create_multipart", Key))
+        if self.fail_operation == ("create_multipart", None):
+            raise OSError("injected multipart initiation failure")
         upload_id = f"upload-{len(self.uploads) + 1}"
         self.uploads[upload_id] = {"key": Key, "parts": {}}
         return {"UploadId": upload_id}
@@ -68,6 +73,7 @@ class FakeS3:
         if self.fail_operation == ("upload_part", PartNumber):
             raise OSError("injected part upload failure")
         data = self._bytes(Body)
+        self.part_sizes.append(len(data))
         parts = self.uploads[UploadId]["parts"]
         assert isinstance(parts, dict)
         parts[PartNumber] = data
@@ -88,14 +94,20 @@ class FakeS3:
 
     def abort_multipart_upload(self, *, Bucket: str, Key: str, UploadId: str) -> None:
         self.operations.append(("abort_multipart", Key))
+        if self.fail_operation == ("abort_multipart", None):
+            raise OSError("injected multipart abort failure")
         self.aborted.add(UploadId)
 
     def copy_object(self, *, Bucket: str, Key: str, CopySource: dict[str, str]) -> None:
         self.operations.append(("copy", Key))
+        if self.fail_operation == ("copy", None):
+            raise OSError("injected copy failure")
         self.objects[Key] = self.objects[CopySource["Key"]]
 
     def delete_object(self, *, Bucket: str, Key: str) -> None:
         self.operations.append(("delete", Key))
+        if self.fail_operation == ("delete", None):
+            raise OSError("injected delete failure")
         self.objects.pop(Key, None)
 
     def get_object(self, *, Bucket: str, Key: str) -> dict[str, TrackingBody]:
@@ -129,6 +141,26 @@ def _published(paths: Paths, root: Path, generation: int = 1,
     )
     store.publish(session, manifest, prepared)
     return store, session
+
+
+def _tar_zst(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
+    raw = io.BytesIO()
+    with zstandard.ZstdCompressor(level=3).stream_writer(raw, closefd=False) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+            for info, data in members:
+                archive.addfile(info, io.BytesIO(data) if data is not None else None)
+    return raw.getvalue()
+
+
+def _replace_remote_package(client: FakeS3, package: bytes) -> dict[str, object]:
+    latest = "prefix/namespace/session/latest.json"
+    pointer = json.loads(client.objects[latest])
+    digest = hashlib.sha256(package).hexdigest()
+    pointer["digest"] = digest
+    client.objects[latest] = json.dumps(pointer).encode()
+    client.objects[str(pointer["checksum"])] = f"{digest}  package.tar.zst\n".encode()
+    client.objects[str(pointer["object"])] = package
+    return pointer
 
 
 def test_push_package_is_deterministic_and_unchanged_generation_is_skipped(tmp_path: Path) -> None:
@@ -247,6 +279,77 @@ def test_failed_final_publication_does_not_advance_local_or_remote_pointer(tmp_p
     assert refreshed.last_pushed_generation is None
 
 
+@pytest.mark.parametrize(
+    ("failure", "abort_expected", "temporary_expected", "generation_expected"),
+    [
+        (("create_multipart", None), False, False, False),
+        (("upload_part", 1), True, False, False),
+        (("complete_multipart", None), True, False, False),
+        (("copy", None), False, False, False),
+        (("put_checksum", None), False, False, True),
+        (("delete", None), False, True, True),
+    ],
+)
+def test_push_failure_boundaries_preserve_old_pointer_and_local_state(
+    tmp_path: Path, failure: tuple[str, object], abort_expected: bool,
+    temporary_expected: bool, generation_expected: bool,
+) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    store, session = _published(_paths(tmp_path / "home"), root)
+    client = FakeS3()
+    latest = "prefix/namespace/session/latest.json"
+    client.objects[latest] = b'{"old": true}'
+    client.fail_operation = failure
+
+    with pytest.raises(OSError, match="injected"):
+        push_session(store, session, TransportConfig("bucket", "prefix"), client)
+
+    assert client.objects[latest] == b'{"old": true}'
+    assert store.load_session("namespace", "session").last_pushed_generation is None
+    assert bool(client.aborted) is abort_expected
+    temporary_keys = [key for key in client.objects if "/tmp/" in key]
+    assert bool(temporary_keys) is temporary_expected
+    generation_keys = [key for key in client.objects
+                       if "/generations/" in key and not key.endswith(".sha256")]
+    assert bool(generation_keys) is generation_expected
+
+
+def test_abort_failure_preserves_part_upload_failure(tmp_path: Path) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    store, session = _published(_paths(tmp_path / "home"), root)
+    client = FakeS3()
+    def fail_part_and_abort(**kwargs):
+        client.operations.append(("upload_part", f"{kwargs['Key']}:{kwargs['PartNumber']}"))
+        client.fail_operation = ("abort_multipart", None)
+        raise OSError("injected part upload failure")
+
+    client.upload_part = fail_part_and_abort  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="part upload"):
+        push_session(store, session, TransportConfig("bucket", "prefix"), client)
+    assert any(operation == "abort_multipart" for operation, _ in client.operations)
+
+
+def test_pointer_failure_leaves_completed_generation_but_not_local_state(tmp_path: Path) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    store, session = _published(_paths(tmp_path / "home"), root)
+    client = FakeS3()
+    latest = "prefix/namespace/session/latest.json"
+    client.objects[latest] = b'{"old": true}'
+    client.fail_key = latest
+
+    with pytest.raises(OSError, match="injected"):
+        push_session(store, session, TransportConfig("bucket", "prefix"), client)
+
+    assert client.objects[latest] == b'{"old": true}'
+    assert not any("/tmp/" in key for key in client.objects)
+    assert any(key.endswith(".tar.zst") for key in client.objects)
+    assert any(key.endswith(".sha256") for key in client.objects)
+    assert store.load_session("namespace", "session").last_pushed_generation is None
+
+
 def test_pull_verifies_checksum_and_refuses_local_conflict(tmp_path: Path) -> None:
     source_root = tmp_path / "source"
     source_root.mkdir()
@@ -363,6 +466,86 @@ def test_pull_malformed_package_closes_body_and_removes_staging(tmp_path: Path) 
     namespace = destination_paths.archive / "namespace"
     assert not (namespace / "session").exists()
     assert not list(namespace.glob(".session.pull-*"))
+
+
+def _regular(name: str, data: bytes = b"data") -> tuple[tarfile.TarInfo, bytes]:
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    return info, data
+
+
+def _directory(name: str) -> tuple[tarfile.TarInfo, None]:
+    info = tarfile.TarInfo(name)
+    info.type = tarfile.DIRTYPE
+    return info, None
+
+
+@pytest.mark.parametrize(
+    ("members", "message"),
+    [
+        ([_regular("../escape")], "unsafe archive path"),
+        ([_regular("/absolute")], "unsafe archive path"),
+        ([(tarfile.TarInfo("link"), None)], "unsupported archive entry"),
+        ([(tarfile.TarInfo("hard"), None)], "unsupported archive entry"),
+        ([(tarfile.TarInfo("device"), None)], "unsupported archive entry"),
+        ([_regular("same"), _regular("same")], "duplicate archive entry"),
+        ([_regular("parent"), _regular("parent/child")], "archive path conflict"),
+        ([_regular("parent/child"), _regular("parent")], "archive path conflict"),
+        ([_regular("valid-prefix"), _regular("../late-escape")], "unsafe archive path"),
+    ],
+    ids=["traversal", "absolute", "symlink", "hardlink", "device", "duplicate",
+         "file-parent", "file-after-child", "late-unsafe"],
+)
+def test_pull_rejects_malicious_members_and_removes_staging(
+    tmp_path: Path, members: list[tuple[tarfile.TarInfo, bytes | None]], message: str,
+) -> None:
+    if message == "unsupported archive entry":
+        info = members[0][0]
+        if info.name == "link":
+            info.type = tarfile.SYMTYPE
+            info.linkname = "target"
+        elif info.name == "hard":
+            info.type = tarfile.LNKTYPE
+            info.linkname = "target"
+        else:
+            info.type = tarfile.CHRTYPE
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    store, session = _published(_paths(tmp_path / "source-home"), source_root)
+    client = FakeS3()
+    config = TransportConfig("bucket", "prefix")
+    push_session(store, session, config, client)
+    _replace_remote_package(client, _tar_zst(members))
+    destination_paths = _paths(tmp_path / "clean-home")
+
+    with pytest.raises(ValueError, match=message):
+        pull_session("session", destination_paths, config, client=client)
+
+    namespace = destination_paths.archive / "namespace"
+    assert not (namespace / "session").exists()
+    assert not list(namespace.glob(".session.pull-*"))
+    assert client.response_bodies[-1][1].was_closed
+
+
+def test_large_package_has_bounded_parts_reads_and_memory(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    content = os.urandom(MULTIPART_PART_SIZE * 2 + 1024 * 1024)
+    store, session = _published(_paths(tmp_path / "source-home"), root, content=content)
+    client = FakeS3()
+    config = TransportConfig("bucket", "prefix")
+
+    tracemalloc.start()
+    push_session(store, session, config, client)
+    pull_session("session", _paths(tmp_path / "clean-home"), config, client=client)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert len(client.part_sizes) >= 3
+    assert max(client.part_sizes) <= MULTIPART_PART_SIZE
+    assert all(size <= 64 * 1024 for _, body in client.response_bodies
+               for size in body.read_sizes)
+    assert peak < 5 * MULTIPART_PART_SIZE
 
 
 def test_safe_extract_rejects_traversal(tmp_path: Path) -> None:

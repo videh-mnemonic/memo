@@ -367,3 +367,27 @@ def test_push_pull_and_restore_directory_generation(tmp_path: Path) -> None:
     with pytest.raises(FileExistsError):
         pull_session("session", destination_paths, config, client=client)
     assert (restored / "local-only.txt").read_text() == "preserved"
+
+
+def test_large_directory_generation_push_pull_and_restore(tmp_path: Path) -> None:
+    from test_transport import FakeS3, _paths, _published
+    from memo.config import TransportConfig
+    from memo.transport import MULTIPART_PART_SIZE, pull_session, push_session
+
+    root = tmp_path / "source"
+    root.mkdir()
+    content = os.urandom(MULTIPART_PART_SIZE + 1024 * 1024)
+    source_paths = _paths(tmp_path / "source-home")
+    store, session = _published(source_paths, root, content=content)
+    client = FakeS3()
+    config = TransportConfig("bucket", "large-e2e")
+
+    push_session(store, session, config, client)
+    destination_paths = _paths(tmp_path / "destination-home")
+    pull_session("session", destination_paths, config, client=client)
+    restored = tmp_path / "restored"
+    SessionStore(destination_paths).restore("namespace", "session", restored)
+
+    assert (restored / "file.txt").read_bytes() == content
+    assert len(client.part_sizes) >= 2
+    assert max(client.part_sizes) <= MULTIPART_PART_SIZE

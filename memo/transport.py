@@ -10,7 +10,7 @@ import tarfile
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable
 
 import zstandard
@@ -110,15 +110,16 @@ class MultipartUploadWriter:
 
     def _upload_buffer(self) -> None:
         part_number = len(self.parts) + 1
+        data = self.buffer
+        self.buffer = bytearray()
         response = self.client.upload_part(
             Bucket=self.bucket,
             Key=self.key,
             UploadId=self.upload_id,
             PartNumber=part_number,
-            Body=bytes(self.buffer),
+            Body=data,
         )
         self.parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-        self.buffer.clear()
 
     def finish(self) -> list[dict[str, object]]:
         if not self.finished:
@@ -207,20 +208,37 @@ def safe_extract_tar_zst_stream(source: BinaryIO, target: Path) -> str:
     root = target.resolve()
     hashing = HashingReader(source)
     decompressor = zstandard.ZstdDecompressor()
+    shapes: dict[tuple[str, ...], str] = {}
     with decompressor.stream_reader(hashing, closefd=False) as decompressed:
         with tarfile.open(fileobj=decompressed, mode="r|") as archive:
             for member in archive:
-                name = Path(member.name)
-                if name.is_absolute() or ".." in name.parts:
+                name = PurePosixPath(member.name)
+                parts = name.parts
+                if (name.is_absolute() or not parts or member.name.endswith("/.")
+                        or any(part in ("", ".", "..") for part in parts)):
                     raise ValueError(f"unsafe archive path: {member.name}")
                 if member.issym() or member.islnk() or member.isdev():
                     raise ValueError(f"unsupported archive entry: {member.name}")
+                if not (member.isfile() or member.isdir()):
+                    raise ValueError(f"unsupported archive entry: {member.name}")
+                key = tuple(parts)
+                if key in shapes:
+                    raise ValueError(f"duplicate archive entry: {member.name}")
+                for index in range(1, len(key)):
+                    if shapes.get(key[:index]) == "file":
+                        raise ValueError(f"archive path conflict: {member.name}")
+                if member.isfile() and any(
+                    existing[:len(key)] == key for existing in shapes if len(existing) > len(key)
+                ):
+                    raise ValueError(f"archive path conflict: {member.name}")
                 try:
-                    (root / name).resolve().relative_to(root)
+                    destination = root.joinpath(*parts)
+                    destination.resolve().relative_to(root)
                 except ValueError as error:
                     raise ValueError(
                         f"archive path escapes destination: {member.name}"
                     ) from error
+                shapes[key] = "file" if member.isfile() else "directory"
                 archive.extract(member, target, filter="data")
     while hashing.read(STREAM_READ_SIZE):
         pass
@@ -334,7 +352,10 @@ def push_session(store: SessionStore, session: DirectorySession, config: Transpo
         client.put_object(Bucket=config.bucket, Key=checksum,
                           Body=f"{digest}  {Path(version).name}\n".encode())
     except BaseException:
-        client.delete_object(Bucket=config.bucket, Key=temporary)
+        try:
+            client.delete_object(Bucket=config.bucket, Key=temporary)
+        except BaseException:
+            pass
         raise
     client.delete_object(Bucket=config.bucket, Key=temporary)
     pointer = json.dumps({"schema_version": 1, "session_id": session.session_id,
@@ -469,10 +490,17 @@ def pull_session(session_id: str, paths: Paths | None = None,
         body = response["Body"]
         try:
             actual_digest = safe_extract_tar_zst_stream(body, temporary)
-        finally:
+        except BaseException:
             close = getattr(body, "close", None)
             if close is not None:
-                close()
+                try:
+                    close()
+                except BaseException:
+                    pass
+            raise
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
         if actual_digest != pointer["digest"]:
             raise ValueError(
                 f"checksum mismatch: expected {pointer['digest']}, got {actual_digest}"
