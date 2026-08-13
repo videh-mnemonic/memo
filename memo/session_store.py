@@ -122,6 +122,10 @@ class SessionStore:
         self._validate_manifest(path, session_id, manifest)
         return manifest
 
+    def steps(self, namespace: str, session_id: str) -> list[StepManifest]:
+        path = self.session_path(namespace, session_id)
+        return self._validate_history(path, namespace, session_id)
+
     @staticmethod
     def _validate_manifest(path: Path, session_id: str, manifest: StepManifest,
                            streams: bool = False) -> None:
@@ -197,10 +201,41 @@ class SessionStore:
                 if event.sequence <= terminals.get(event.terminal_id, -1)]
 
     def check_integrity(self, namespace: str, session_id: str) -> StepManifest | None:
-        session = self.load_session(namespace, session_id)
+        path = self.session_path(namespace, session_id)
+        manifests = self._validate_history(path, namespace, session_id)
+        return manifests[-1] if manifests else None
+
+    @classmethod
+    def _validate_history(cls, path: Path, namespace: str,
+                          session_id: str) -> list[StepManifest]:
+        session = DirectorySession.load(path / "session.json")
         if session.session_id != session_id or session.archive_namespace != namespace:
             raise ValueError("session metadata does not match archive location")
-        return self.head(namespace, session_id)
+        head_path = path / "HEAD"
+        if not head_path.is_file():
+            if any((path / "steps").glob("*.json")):
+                raise ValueError("session has steps but no HEAD")
+            return []
+        head_value = head_path.read_text().strip()
+        if not head_value.isdigit():
+            raise ValueError("invalid numeric HEAD step")
+        head_step = int(head_value)
+        step_files = sorted(
+            (path / "steps").glob("*.json"),
+            key=lambda item: int(item.stem) if item.stem.isdigit() else -1,
+        )
+        expected_names = {f"{step}.json" for step in range(head_step + 1)}
+        actual_names = {item.name for item in step_files}
+        if not expected_names.issubset(actual_names):
+            raise ValueError("published step history is not contiguous through HEAD")
+        manifests = []
+        for step in range(head_step + 1):
+            manifest = StepManifest.load(path / "steps" / f"{step}.json")
+            if manifest.step != step:
+                raise ValueError("step filename does not match manifest")
+            cls._validate_manifest(path, session_id, manifest, streams=True)
+            manifests.append(manifest)
+        return manifests
 
     def next_step(self, namespace: str, session_id: str) -> int:
         current = self.head(namespace, session_id)

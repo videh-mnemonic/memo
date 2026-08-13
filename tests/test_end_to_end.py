@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from memo.cli import main
+from memo.config import Paths
 from memo.protocol import request
 
 
@@ -117,3 +118,21 @@ def test_removed_command_forms_are_rejected() -> None:
         main(["codex"])
     with pytest.raises(SystemExit):
         main(["--load", "session", "--inspect"])
+
+
+def test_public_push_and_pull_subcommands_route_results(tmp_path: Path, monkeypatch, capsys) -> None:
+    from memo import cli, transport
+
+    monkeypatch.setattr(cli, "push", lambda session_id: {
+        "pushed": [session_id], "skipped": [], "failed": [],
+    })
+    assert main(["push", "session"]) == 0
+    assert capsys.readouterr().out == "pushed: session\n"
+
+    destination = Paths(tmp_path / "home").archive / "namespace/session"
+    monkeypatch.setattr(
+        transport, "pull_session",
+        lambda session_id, force=False: destination,
+    )
+    assert main(["pull", "session", "--force"]) == 0
+    assert capsys.readouterr().out == f"pulled: session path={destination}\n"

@@ -88,28 +88,42 @@ def atomic_install_directory(prepared: Path, destination: Path, force: bool = Fa
             shutil.rmtree(backup)
 
 
-def _generation_paths(session_path: Path, manifest: StepManifest) -> list[Path]:
+def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Path]:
     paths = [session_path / "session.json", session_path / "HEAD",
-             session_path / "steps" / f"{manifest.step}.json"]
-    paths.extend((session_path / manifest.snapshot).rglob("*"))
-    paths.append(session_path / manifest.snapshot)
+             session_path / "steps", session_path / "snapshots"]
+    for manifest in manifests:
+        paths.append(session_path / "steps" / f"{manifest.step}.json")
+        paths.extend((session_path / manifest.snapshot).rglob("*"))
+        paths.append(session_path / manifest.snapshot)
     terminal_root = session_path / "streams" / "terminals"
-    for terminal_id, high_water in manifest.stream_high_water.items():
+    high_water_by_terminal: dict[str, int] = {}
+    for manifest in manifests:
+        for terminal_id, high_water in manifest.stream_high_water.items():
+            high_water_by_terminal[terminal_id] = max(
+                high_water, high_water_by_terminal.get(terminal_id, 0)
+            )
+    if high_water_by_terminal:
+        paths.extend([session_path / "streams", terminal_root])
+    for terminal_id, high_water in high_water_by_terminal.items():
         if high_water == 0:
             continue
         metadata = terminal_root / terminal_id / "stream.json"
         paths.extend([metadata, metadata.parent, metadata.parent / "chunks"])
         values = json.loads(metadata.read_text())
         paths.extend(metadata.parent / item for item in values.get("chunks", []))
-    return [path for path in paths if path.exists()]
+    return sorted(
+        {path for path in paths if path.exists()},
+        key=lambda item: item.relative_to(session_path).as_posix(),
+    )
 
 
-def package_generation(store: SessionStore, session: DirectorySession) -> tuple[bytes, str, StepManifest]:
-    manifest = store.head(session.archive_namespace, session.session_id)
-    if manifest is None:
+def package_history(store: SessionStore, session: DirectorySession) -> tuple[bytes, str, StepManifest]:
+    manifests = store.steps(session.archive_namespace, session.session_id)
+    if not manifests:
         raise ValueError(f"session has no published step: {session.session_id}")
+    manifest = manifests[-1]
     root = store.session_path(session.archive_namespace, session.session_id)
-    data = deterministic_archive(root, _generation_paths(root, manifest))
+    data = deterministic_archive(root, _history_paths(root, manifests))
     return data, digest_bytes(data), manifest
 
 
@@ -133,7 +147,7 @@ def push_session(store: SessionStore, session: DirectorySession, config: Transpo
     if session.last_pushed_step == manifest.step:
         return {"session_id": session.session_id, "step": manifest.step,
                 "digest": session.last_pushed_digest, "status": "skipped"}
-    data, digest, manifest = package_generation(store, session)
+    data, digest, manifest = package_history(store, session)
     client = client or config.client()
     base = _key(config, session.archive_namespace, session.session_id)
     version = f"{base}/steps/{manifest.step}-{digest}.tar.gz"
@@ -145,7 +159,7 @@ def push_session(store: SessionStore, session: DirectorySession, config: Transpo
                            CopySource={"Bucket": config.bucket, "Key": temporary})
         client.put_object(Bucket=config.bucket, Key=checksum,
                           Body=f"{digest}  {Path(version).name}\n".encode())
-        pointer = json.dumps({"schema_version": 1, "session_id": session.session_id,
+        pointer = json.dumps({"schema_version": 2, "session_id": session.session_id,
                               "namespace": session.archive_namespace,
                               "step": manifest.step, "digest": digest,
                               "object": version, "checksum": checksum},
@@ -202,6 +216,10 @@ def pull_session(session_id: str, paths: Paths | None = None,
     if len(keys) != 1:
         raise FileNotFoundError(f"remote session lookup returned {len(keys)} matches: {session_id}")
     pointer = json.loads(_body(client.get_object(Bucket=config.bucket, Key=keys[0])))
+    if pointer.get("schema_version") != 2:
+        raise ValueError("unsupported remote session pointer schema")
+    if pointer.get("session_id") != session_id:
+        raise ValueError("remote pointer belongs to another session")
     data = _body(client.get_object(Bucket=config.bucket, Key=pointer["object"]))
     checksum = _body(client.get_object(Bucket=config.bucket, Key=pointer["checksum"])).decode()
     sidecar_digest = checksum.split()[0] if checksum.split() else ""
@@ -222,9 +240,12 @@ def pull_session(session_id: str, paths: Paths | None = None,
     try:
         safe_extract_bytes(data, temporary)
         pulled = DirectorySession.load(temporary / "session.json")
-        manifest = StepManifest.load(
-            temporary / "steps" / f"{(temporary / 'HEAD').read_text().strip()}.json"
+        manifests = SessionStore._validate_history(
+            temporary, str(pointer["namespace"]), session_id
         )
+        if not manifests:
+            raise ValueError("downloaded session has no published steps")
+        manifest = manifests[-1]
         if pulled.session_id != session_id or manifest.step != int(pointer["step"]):
             raise ValueError("downloaded session does not match remote pointer")
         pulled.last_pushed_step = manifest.step
@@ -233,7 +254,6 @@ def pull_session(session_id: str, paths: Paths | None = None,
         atomic_write(temporary / "session.json",
                      (json.dumps(pulled.to_dict(), indent=2, sort_keys=True) + "\n").encode())
         atomic_install_directory(temporary, destination, force=force)
-        store.check_integrity(pointer["namespace"], session_id)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
