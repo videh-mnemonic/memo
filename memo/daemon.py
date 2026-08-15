@@ -10,10 +10,9 @@ import time
 from pathlib import Path
 from typing import IO, Any
 
-from .checkpoint import CheckpointPublisher, utcnow
-from .config import (Paths, TransportConfig, automatic_push_enabled,
-                     automatic_push_interval, checkpoint_interval, recovery_enabled,
-                     watcher_debounce, watcher_enabled)
+from .step import StepPublisher, utcnow
+from .config import (PUSH_INTERVAL_SECONDS, STEP_INTERVAL_SECONDS,
+                     WATCHER_DEBOUNCE_SECONDS, Paths, TransportConfig)
 from .identity import local_namespace
 from .models import DirectorySession
 from .protocol import (
@@ -43,17 +42,17 @@ class MemoDaemon:
         self.store = SessionStore(self.paths)
         from .streams import StreamStore
         self.streams = StreamStore(self.paths, self.registry)
-        self.publisher = CheckpointPublisher(
+        self.publisher = StepPublisher(
             self.store,
             lambda session: self.streams.seal_session(
                 session.archive_namespace, session.session_id
             ),
         )
-        self.interval = checkpoint_interval() if interval is None else interval
+        self.interval = STEP_INTERVAL_SECONDS if interval is None else interval
         self.socket_path = self.paths.socket
         self._stop = threading.Event()
         self._workers: dict[str, threading.Thread] = {}
-        self._checkpoint_requests: dict[str, threading.Event] = {}
+        self._step_requests: dict[str, threading.Event] = {}
         self._observers: dict[str, Any] = {}
         self._worker_lock = threading.Lock()
         self._session_locks: dict[str, threading.RLock] = {}
@@ -88,19 +87,19 @@ class MemoDaemon:
             worker = self._workers.get(active.session_id)
             if worker and worker.is_alive():
                 return
-            worker = threading.Thread(target=self._checkpoint_loop, args=(active,), daemon=True)
+            worker = threading.Thread(target=self._step_loop, args=(active,), daemon=True)
             self._workers[active.session_id] = worker
-            self._checkpoint_requests.setdefault(active.session_id, threading.Event())
+            self._step_requests.setdefault(active.session_id, threading.Event())
             worker.start()
             self._ensure_watcher(active)
 
     def _ensure_watcher(self, active: ActiveSession) -> None:
-        if not watcher_enabled() or active.session_id in self._observers:
+        if active.session_id in self._observers:
             return
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer
 
-        request_event = self._checkpoint_requests[active.session_id]
+        request_event = self._step_requests[active.session_id]
 
         class Handler(FileSystemEventHandler):
             def on_any_event(self, event) -> None:
@@ -112,8 +111,8 @@ class MemoDaemon:
         observer.start()
         self._observers[active.session_id] = observer
 
-    def _checkpoint_loop(self, active: ActiveSession) -> None:
-        request_event = self._checkpoint_requests[active.session_id]
+    def _step_loop(self, active: ActiveSession) -> None:
+        request_event = self._step_requests[active.session_id]
         deadline = time.monotonic() + self.interval
         while not self._stop.is_set():
             request_event.wait(max(0.0, deadline - time.monotonic()))
@@ -124,13 +123,13 @@ class MemoDaemon:
                 return
             if request_event.is_set():
                 request_event.clear()
-                if self._stop.wait(watcher_debounce()):
+                if self._stop.wait(WATCHER_DEBOUNCE_SECONDS):
                     return
                 request_event.clear()
             try:
                 self._publish(self._session_model(active))
             except Exception as error:
-                print(f"memo daemon: checkpoint failed for {active.session_id}: {error}", file=sys.stderr)
+                print(f"memo daemon: step failed for {active.session_id}: {error}", file=sys.stderr)
             deadline = time.monotonic() + self.interval
 
     def _start(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -167,7 +166,7 @@ class MemoDaemon:
             "root": str(active.root),
             "archive_namespace": active.archive_namespace,
             "joined": not is_new,
-            "generation": manifest.generation,
+            "step": manifest.step,
         }
 
     def _lookup(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -180,7 +179,7 @@ class MemoDaemon:
                 "session_id": active.session_id,
                 "root": str(active.root),
                 "archive_namespace": active.archive_namespace,
-                "generation": head.generation if head else 0,
+                "step": head.step if head else None,
                 "state": active.state,
                 "attachments": len([
                     item for item in self.registry.list_attachments(active.session_id)
@@ -206,7 +205,7 @@ class MemoDaemon:
                 return {
                     "session_id": session.session_id,
                     "state": "complete",
-                    "generation": manifest.generation if manifest else 0,
+                    "step": manifest.step if manifest else None,
                     "already_complete": True,
                 }
             raise FileNotFoundError("no active recording for path")
@@ -227,7 +226,7 @@ class MemoDaemon:
         self.store.update_session(session)
         self.registry.transition(active.session_id, "ending", "complete")
         self.registry.remove(active.session_id)
-        request_event = self._checkpoint_requests.get(active.session_id)
+        request_event = self._step_requests.get(active.session_id)
         if request_event:
             request_event.set()
         observer = self._observers.pop(active.session_id, None)
@@ -237,8 +236,7 @@ class MemoDaemon:
         return {
             "session_id": active.session_id,
             "state": "complete",
-            "generation": manifest.generation,
-            "checkpoint_id": manifest.checkpoint_id,
+            "step": manifest.step,
             "already_complete": False,
         }
 
@@ -251,8 +249,8 @@ class MemoDaemon:
                 "root": str(active.root),
                 "archive_namespace": active.archive_namespace,
                 "state": active.state,
-                "generation": head.generation if head else 0,
-                "latest_checkpoint_utc": head.created_utc if head else None,
+                "step": head.step if head else None,
+                "latest_step_utc": head.created_utc if head else None,
                 "attachments": len([
                     item for item in self.registry.list_attachments(active.session_id)
                     if item.detached_utc is None
@@ -282,7 +280,7 @@ class MemoDaemon:
                 "failed": summary.failed}
 
     def _automatic_push_loop(self) -> None:
-        interval = automatic_push_interval()
+        interval = PUSH_INTERVAL_SECONDS
         while not self._stop.wait(interval):
             try:
                 self._push({})
@@ -323,13 +321,12 @@ class MemoDaemon:
             return self._status()
         if message.operation == "push":
             return self._push(message.payload)
-        if message.operation == "checkpoint":
+        if message.operation == "step":
             active = self.registry.lookup(Path(message.payload["path"]))
             if active is None:
                 raise FileNotFoundError("no active recording for path")
             manifest = self._publish(self._session_model(active))
-            return {"session_id": active.session_id, "generation": manifest.generation,
-                    "checkpoint_id": manifest.checkpoint_id}
+            return {"session_id": active.session_id, "step": manifest.step}
         if message.operation == "shutdown":
             self._stop.set()
             return {"status": "stopping"}
@@ -352,14 +349,13 @@ class MemoDaemon:
     def serve_forever(self) -> None:
         self._acquire_daemon_lock()
         self.registry.remove_stale(self.paths.archive)
-        if recovery_enabled():
-            for active in self.registry.list_active():
-                self.store.check_integrity(active.archive_namespace, active.session_id)
-            self.streams.recover_all()
-            self.registry.expire_attachments(utcnow())
-            for active in self.registry.list_active():
-                if active.state == "ending":
-                    self._end({"path": str(active.root)})
+        for active in self.registry.list_active():
+            self.store.check_integrity(active.archive_namespace, active.session_id)
+        self.streams.recover_all()
+        self.registry.expire_attachments(utcnow())
+        for active in self.registry.list_active():
+            if active.state == "ending":
+                self._end({"path": str(active.root)})
         self.socket_path.unlink(missing_ok=True)
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server = server
@@ -370,7 +366,7 @@ class MemoDaemon:
             server.settimeout(0.25)
             for active in self.registry.list_active():
                 self._ensure_worker(active)
-            if automatic_push_enabled() and TransportConfig.discover() is not None:
+            if TransportConfig.discover() is not None:
                 self._push_thread = threading.Thread(target=self._automatic_push_loop, daemon=True)
                 self._push_thread.start()
             while not self._stop.is_set():

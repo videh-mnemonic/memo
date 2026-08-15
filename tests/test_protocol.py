@@ -37,11 +37,11 @@ def test_partial_frame_is_reassembled() -> None:
 @pytest.mark.parametrize(
     "value, message",
     [
-        ({"protocol_version": 2, "schema_version": 1, "operation": "health", "payload": {}},
+        ({"protocol_version": 3, "schema_version": 2, "operation": "health", "payload": {}},
          "protocol version"),
-        ({"protocol_version": 1, "schema_version": 2, "operation": "health", "payload": {}},
+        ({"protocol_version": 2, "schema_version": 3, "operation": "health", "payload": {}},
          "schema version"),
-        ({"protocol_version": 1, "schema_version": 1, "payload": {}}, "malformed"),
+        ({"protocol_version": 2, "schema_version": 2, "payload": {}}, "malformed"),
     ],
 )
 def test_invalid_requests_are_rejected(value: dict[str, object], message: str) -> None:

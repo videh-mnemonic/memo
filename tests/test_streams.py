@@ -18,7 +18,7 @@ def _event(sequence: int, data: bytes = b"x") -> dict[str, object]:
 
 def _store(tmp_path: Path) -> tuple[StreamStore, Registry, str]:
     home = tmp_path / "home"
-    paths = Paths(home, home / "scratch", home / "archive", tmp_path / "unpack")
+    paths = Paths(home)
     paths.ensure_storage()
     assert paths.registry is not None
     registry = Registry(paths.registry)
