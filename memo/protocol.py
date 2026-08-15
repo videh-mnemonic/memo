@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-PROTOCOL_VERSION = 1
-SCHEMA_VERSION = 1
+PROTOCOL_VERSION = 2
+SCHEMA_VERSION = 2
 MAX_FRAME_SIZE = 8 * 1024 * 1024
 
 
