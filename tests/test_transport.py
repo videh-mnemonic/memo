@@ -163,7 +163,7 @@ def _published(paths: Paths, root: Path,
     )
     atomic_write(directory / "agents/runs/run.json", (json.dumps({
         "run_id": "run",
-        "provider": "claude",
+        "harness": "claude",
         "trace_file": "run.jsonl",
     }) + "\n").encode())
     for step, high_water in ((0, 1), (1, 2)):
@@ -449,7 +449,7 @@ def test_pull_preserves_historical_replay_and_manifest_bounded_prompts(tmp_path:
     assert (latest / "file.txt").read_text() == "step 1\n"
     assert "second" in (latest / ".prompts.md").read_text()
     pulled_root = clean_paths.archive / "namespace/session"
-    assert json.loads((pulled_root / "agents/runs/run.json").read_text())["provider"] == "claude"
+    assert json.loads((pulled_root / "agents/runs/run.json").read_text())["harness"] == "claude"
     assert "trace prompt" in (pulled_root / "agents/traces/run.jsonl").read_text()
     assert installed == clean_paths.archive / "namespace/session"
     with pytest.raises(FileExistsError, match="not older"):

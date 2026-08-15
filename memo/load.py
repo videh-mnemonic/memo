@@ -85,7 +85,7 @@ def trace_json(session_id: str, terminal_ids: list[str] | None = None,
                 result.extend(record.value for record in source_records(trace_path)
                               if record.error is None)
             else:
-                result.extend(trace_events(get_harness(metadata["provider"]), trace_path, run_id))
+                result.extend(trace_events(get_harness(metadata["harness"]), trace_path, run_id))
         return json.dumps(result, indent=2, sort_keys=True) + "\n"
     events = store.stream_events_for_manifest(
         session.archive_namespace, session_id, manifest, terminal_ids

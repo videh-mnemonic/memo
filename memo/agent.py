@@ -20,6 +20,10 @@ def _write(path: Path, value: dict[str, object]) -> None:
     atomic_write(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode())
 
 
+def _argument(args: list[str], *flags: str) -> str | None:
+    return next((args[index + 1] for index, value in enumerate(args[:-1]) if value in flags), None)
+
+
 def run(harness: AgentHarness, args: list[str], paths: Paths | None = None) -> int:
     paths = paths or Paths.discover()
     allocation = activate(Path.cwd(), paths)
@@ -28,7 +32,9 @@ def run(harness: AgentHarness, args: list[str], paths: Paths | None = None) -> i
     metadata_path = session_path / "agents" / "runs" / f"{run_id}.json"
     metadata: dict[str, object] = {
         "run_id": run_id,
-        "provider": harness.name,
+        "harness": harness.name,
+        "model": _argument(args, "-m", "--model"),
+        "reasoning": _argument(args, "--effort"),
         "command": [harness.executable, *args],
         "cwd": str(Path.cwd()),
         "started_utc": utcnow(),
@@ -52,6 +58,8 @@ def run(harness: AgentHarness, args: list[str], paths: Paths | None = None) -> i
 
     trace = locate(roots, marker)
     if trace is not None:
+        context = next((value | {"effort": record.value.get("effort", value.get("effort"))} for record in source_records(trace) if isinstance(record.value, dict) for value in (record.value.get("payload"), record.value.get("message")) if isinstance(value, dict) and value.get("model")), {})
+        metadata.update(model=context.get("model", metadata["model"]), reasoning=context.get("effort", metadata["reasoning"]))
         trace_name = f"{run_id}.jsonl"
         destination = session_path / "agents" / "traces" / trace_name
         temporary = destination.with_name(f".{destination.name}.tmp")

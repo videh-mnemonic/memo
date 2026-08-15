@@ -127,7 +127,8 @@ def test_agent_harness_records_command_and_native_trace_in_directory_session(
         "root = pathlib.Path(os.environ['MEMO_TRACE_DIR'])\n"
         "root.mkdir(parents=True, exist_ok=True)\n"
         "record = {'session_id': 'agent-session', 'type': 'user', 'content': 'fix it'}\n"
-        "(root / 'agent-session.jsonl').write_text(json.dumps(record) + '\\n')\n"
+        "reply = {'type': 'assistant', 'effort': 'high', 'message': {'role': 'assistant', 'model': 'test-model'}}\n"
+        "(root / 'agent-session.jsonl').write_text(json.dumps(record) + '\\n' + json.dumps(reply) + '\\n')\n"
     )
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setenv("MEMO_HOME", str(home))
@@ -143,6 +144,9 @@ def test_agent_harness_records_command_and_native_trace_in_directory_session(
         run_id = manifest.agent_runs[0]
         metadata = json.loads((session_dir / "agents/runs" / f"{run_id}.json").read_text())
         assert metadata["command"] == ["claude", "--model", "test-model"]
+        assert (metadata["harness"], metadata["model"], metadata["reasoning"]) == (
+            "claude", "test-model", "high",
+        )
         assert metadata["agent_session_id"] == "agent-session"
         assert metadata["exit_code"] == 0
         assert (session_dir / "agents/traces" / metadata["trace_file"]).is_file()

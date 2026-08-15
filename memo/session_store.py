@@ -158,9 +158,9 @@ class SessionStore:
             metadata = json.loads(metadata_path.read_text())
             if metadata.get("run_id") != run_id:
                 raise ValueError(f"agent run metadata ID does not match: {run_id}")
-            provider = metadata.get("provider")
-            if not isinstance(provider, str) or not provider:
-                raise ValueError(f"agent run provider is required: {run_id}")
+            harness = metadata.get("harness")
+            if not isinstance(harness, str) or not harness:
+                raise ValueError(f"agent run harness is required: {run_id}")
             trace_file = metadata.get("trace_file")
             if trace_file:
                 if not isinstance(trace_file, str) or Path(trace_file).name != trace_file:
