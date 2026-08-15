@@ -4,7 +4,7 @@ import struct
 from pathlib import Path
 
 from memo.config import Paths
-from memo.models import CheckpointManifest, DirectorySession, SnapshotEntry
+from memo.models import DirectorySession, SnapshotEntry, StepManifest
 from memo.registry import Registry
 from memo.session_store import SessionStore
 from memo.streams import StreamStore
@@ -12,7 +12,7 @@ from memo.streams import StreamStore
 
 def _setup(tmp_path: Path):
     home = tmp_path / "home"
-    paths = Paths(home, home / "scratch", home / "archive", tmp_path / "unpack")
+    paths = Paths(home)
     paths.ensure_storage()
     root = tmp_path / "root"
     root.mkdir()
@@ -50,14 +50,14 @@ def test_integrity_keeps_last_head_and_ignores_unpublished_artifacts(tmp_path: P
     prepared = session_path / "prepared"
     prepared.mkdir()
     (prepared / "file.txt").write_text("complete")
-    manifest = CheckpointManifest("one", "session", 1, "now", "snapshots/one",
-                                  [SnapshotEntry("file.txt", "file", 0o644, 8)])
+    manifest = StepManifest("session", 0, "now", "snapshots/0",
+                            [SnapshotEntry("file.txt", "file", 0o644, 8)])
     store.publish(session, manifest, prepared)
     (session_path / "snapshots" / ".abandoned").mkdir()
-    (session_path / "checkpoints" / ".abandoned.tmp").write_text("partial")
+    (session_path / "steps" / ".abandoned.tmp").write_text("partial")
 
     assert store.check_integrity("namespace", "session") == manifest
-    assert (session_path / "HEAD").read_text().strip() == "one"
+    assert (session_path / "HEAD").read_text().strip() == "0"
     registry.close()
 
 
@@ -70,7 +70,7 @@ def test_integrity_rejects_missing_published_stream_chunk(tmp_path: Path) -> Non
     session = store.load_session("namespace", "session")
     prepared = store.session_path("namespace", "session") / "prepared"
     prepared.mkdir()
-    manifest = CheckpointManifest("one", "session", 1, "now", "snapshots/one", [], {"terminal": 1})
+    manifest = StepManifest("session", 0, "now", "snapshots/0", [], {"terminal": 1})
     store.publish(session, manifest, prepared)
     metadata_path = store.session_path("namespace", "session") / "streams/terminals/terminal/stream.json"
     metadata = json.loads(metadata_path.read_text())

@@ -43,15 +43,13 @@ def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> No
         assert termios.tcgetattr(slave) == original
         session = next(home.glob("archive/*/*"))
         socket_path = home / "runtime" / "memo.sock"
-        request(str(socket_path), "checkpoint", {"path": str(root)})
+        request(str(socket_path), "step", {"path": str(root)})
         assert list(session.glob("streams/terminals/*"))
     finally:
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
-        paths = Paths.discover() if os.environ.get("MEMO_HOME") == str(home) else Paths(
-            home, home / "scratch", home / "archive", tmp_path / "unpack"
-        )
+        paths = Paths.discover() if os.environ.get("MEMO_HOME") == str(home) else Paths(home)
         if paths.socket and paths.socket.exists():
             request(str(paths.socket), "shutdown")
         os.close(master)

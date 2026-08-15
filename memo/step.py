@@ -5,14 +5,13 @@ import shutil
 import stat
 import tempfile
 import threading
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import Paths, maximum_file_size
+from .config import MAX_FILE_SIZE_BYTES, Paths
 from .ignore import IgnorePolicy
-from .models import CheckpointManifest, DirectorySession, SnapshotEntry
+from .models import DirectorySession, SnapshotEntry, StepManifest
 from .session_store import SessionStore
 
 
@@ -25,11 +24,9 @@ def _identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
 
 
 def _retain(previous: Path | None, relative: Path, target: Path) -> bool:
-    if previous is None:
+    if previous is None or not (previous / relative).is_file():
         return False
     source = previous / relative
-    if not source.is_file():
-        return False
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, target)
     os.chmod(target, stat.S_IMODE(source.stat().st_mode))
@@ -61,12 +58,12 @@ def scan_tree(root: Path, destination: Path, *, previous: Path | None = None,
     entries: list[SnapshotEntry] = []
     seen: set[str] = set()
     policy = IgnorePolicy(root, paths)
-    size_limit = maximum_file_size() if max_file_size is None else max_file_size
+    size_limit = MAX_FILE_SIZE_BYTES if max_file_size is None else max_file_size
     destination.mkdir(parents=True, exist_ok=True)
     for current, directories, files in os.walk(root, topdown=True, followlinks=False):
         current_path = Path(current)
         relative_dir = current_path.relative_to(root)
-        kept_directories = []
+        kept = []
         for name in sorted(directories):
             source = current_path / name
             relative = source.relative_to(root)
@@ -85,8 +82,8 @@ def scan_tree(root: Path, destination: Path, *, previous: Path | None = None,
                                              stat.S_IMODE(source_stat.st_mode)))
                 seen.add(relative.as_posix())
             else:
-                kept_directories.append(name)
-        directories[:] = kept_directories
+                kept.append(name)
+        directories[:] = kept
         files.sort()
         if relative_dir != Path("."):
             try:
@@ -114,27 +111,24 @@ def scan_tree(root: Path, destination: Path, *, previous: Path | None = None,
                 entries.append(SnapshotEntry(relative_name, "ignored-policy",
                                              stat.S_IMODE(source_stat.st_mode), source_stat.st_size,
                                              decision.source))
-                seen.add(relative_name)
-                continue
-            if not stat.S_ISREG(source_stat.st_mode):
+            elif not stat.S_ISREG(source_stat.st_mode):
                 entries.append(SnapshotEntry(relative_name, "special",
                                              stat.S_IMODE(source_stat.st_mode), detail="non-regular"))
-                seen.add(relative_name)
-                continue
-            target = destination / relative
-            if source_stat.st_size > size_limit:
-                retained = _retain(previous, relative, target)
-                entries.append(SnapshotEntry(relative_name, "oversized",
-                                             stat.S_IMODE(source_stat.st_mode), source_stat.st_size,
-                                             f"limit={size_limit}", retained))
-            elif _stable_copy(source, target, source_stat):
-                entries.append(SnapshotEntry(relative_name, "file",
-                                             stat.S_IMODE(source_stat.st_mode), source_stat.st_size))
             else:
-                retained = _retain(previous, relative, target)
-                entries.append(SnapshotEntry(relative_name, "unstable",
-                                             stat.S_IMODE(source_stat.st_mode), source_stat.st_size,
-                                             "changed-during-read", retained))
+                target = destination / relative
+                if source_stat.st_size > size_limit:
+                    retained = _retain(previous, relative, target)
+                    entries.append(SnapshotEntry(relative_name, "oversized",
+                                                 stat.S_IMODE(source_stat.st_mode), source_stat.st_size,
+                                                 f"limit={size_limit}", retained))
+                elif _stable_copy(source, target, source_stat):
+                    entries.append(SnapshotEntry(relative_name, "file",
+                                                 stat.S_IMODE(source_stat.st_mode), source_stat.st_size))
+                else:
+                    retained = _retain(previous, relative, target)
+                    entries.append(SnapshotEntry(relative_name, "unstable",
+                                                 stat.S_IMODE(source_stat.st_mode), source_stat.st_size,
+                                                 "changed-during-read", retained))
             seen.add(relative_name)
     if previous is not None:
         for old in sorted(previous.rglob("*")):
@@ -151,14 +145,14 @@ class _State:
     requested: bool = False
 
 
-class CheckpointPublisher:
+class StepPublisher:
     def __init__(self, store: SessionStore, seal_streams=None):
         self.store = store
         self.seal_streams = seal_streams or (lambda _session: {})
         self._condition = threading.Condition()
         self._states: dict[str, _State] = {}
 
-    def publish(self, session: DirectorySession) -> CheckpointManifest:
+    def publish(self, session: DirectorySession) -> StepManifest:
         with self._condition:
             state = self._states.setdefault(session.session_id, _State())
             if state.running:
@@ -167,7 +161,7 @@ class CheckpointPublisher:
                     self._condition.wait()
                 current = self.store.head(session.archive_namespace, session.session_id)
                 if current is None:
-                    raise RuntimeError("coalesced checkpoint did not publish")
+                    raise RuntimeError("coalesced step did not publish")
                 return current
             state.running = True
         try:
@@ -183,27 +177,19 @@ class CheckpointPublisher:
                 state.running = False
                 self._condition.notify_all()
 
-    def _publish_once(self, session: DirectorySession) -> CheckpointManifest:
-        stream_high_water = self.seal_streams(session)
+    def _publish_once(self, session: DirectorySession) -> StepManifest:
+        high_water = self.seal_streams(session)
         previous_manifest = self.store.head(session.archive_namespace, session.session_id)
-        previous = None
-        if previous_manifest is not None:
-            previous = self.store.session_path(session.archive_namespace, session.session_id) / previous_manifest.snapshot
-        generation = self.store.next_generation(session.archive_namespace, session.session_id)
-        checkpoint_id = f"{generation:08d}-{uuid.uuid4().hex[:12]}"
+        previous = None if previous_manifest is None else (
+            self.store.session_path(session.archive_namespace, session.session_id) / previous_manifest.snapshot
+        )
+        step = self.store.next_step(session.archive_namespace, session.session_id)
         session_path = self.store.session_path(session.archive_namespace, session.session_id)
-        temporary = Path(tempfile.mkdtemp(prefix=f".{checkpoint_id}.", dir=session_path / "snapshots"))
+        temporary = Path(tempfile.mkdtemp(prefix=f".{step}.", dir=session_path / "snapshots"))
         try:
             entries = scan_tree(Path(session.root), temporary, previous=previous, paths=self.store.paths)
-            manifest = CheckpointManifest(
-                checkpoint_id=checkpoint_id,
-                session_id=session.session_id,
-                generation=generation,
-                created_utc=utcnow(),
-                snapshot=f"snapshots/{checkpoint_id}",
-                entries=entries,
-                stream_high_water=stream_high_water,
-            )
+            manifest = StepManifest(session.session_id, step, utcnow(), f"snapshots/{step}",
+                                    entries, high_water)
             return self.store.publish(session, manifest, temporary)
         except BaseException:
             shutil.rmtree(temporary, ignore_errors=True)

@@ -1,146 +1,102 @@
 # memo
 
-`memo` continuously records a directory and its attached terminals. A per-user daemon publishes complete directory checkpoints every 15 seconds into a writable local archive.
+`memo` continuously records a directory and its attached terminals. A per-user daemon publishes complete, immutable steps to a local archive so recorded work can be inspected, exported, replayed, and transported.
 
-Requires Python 3.11+ and Git. Install for development with `pip install -e .`, or personally with `pipx install .`. Set `MEMO_HOME` to override the default storage directory, `~/memo`.
+Memo requires Python 3.11+ and Git. Install for development with `pip install -e .`, or as a user application with `pipx install .`.
 
-## Commands
+## Record a directory
 
 Start or join the recording for the current directory and open your configured shell:
 
 ```console
-memo .
+memo
 ```
 
-Several terminals can join the same canonical directory. Each terminal has an independently ordered input/output stream. To record without opening a shell, use `memo --background .`.
-
-End the recording explicitly, then inspect or restore its final checkpoint:
+Pass a path to record another directory:
 
 ```console
-memo --end .
-memo --status
-memo --load <id> --inspect
-memo --load <id> --at final --path <dir>
-memo --load <id> --at generation:2 --path <dir>
-memo --load <id> --terminals
-memo --load <id> --terminals --terminal <terminal-id> --path <file.json>
+memo /path/to/project
 ```
 
-Directory sessions live at `$MEMO_HOME/archive/<namespace>/<id>/`. Immutable checkpoint manifests and snapshots are published through an atomic `HEAD` pointer. `.gitignore` and `.memoignore` control capture; ignored, oversized, unstable, and special entries remain represented in checkpoint metadata. Set `MEMO_MAX_FILE_SIZE` to change the default 100 MiB file limit.
-
-`--at final` resolves `HEAD` once. Historical directory checkpoints can be selected with `generation:N` or `checkpoint:ID`. Restores refuse to replace non-empty destinations unless `--force` is supplied.
-
-## S3 Transport
-
-Set `MEMO_S3_BUCKET` to enable S3-compatible transport. Optional settings are
-`MEMO_S3_ENDPOINT`, `MEMO_S3_REGION`, `MEMO_S3_PREFIX`, and `MEMO_AWS_PROFILE`.
-Credentials come from the standard AWS SDK credential chain and are never written
-to session metadata.
+Several terminals can join the same canonical directory. Each terminal has an independently ordered input/output stream. To record without opening a shell, use `background`:
 
 ```console
-memo --push
-memo --push --session <id>
-memo --pull <id>
-memo --pull <id> --force
+memo background [PATH]
 ```
 
-The daemon retries changed generations every 15 minutes. Override the cadence with
-`MEMO_PUSH_INTERVAL`, or disable automatic push with `MEMO_AUTO_PUSH=0`. Pushes are
-complete deterministic packages, so bandwidth scales with the committed generation
-size. Data and checksum objects publish before `latest.json`. Pull verifies both,
-rejects unsafe archive entries, and atomically installs without removing prior local
-state when an operation fails. A local session is not replaced without `--force`.
-
-## Legacy Sessions
-
-Run an agent normally through memo; all arguments and terminal I/O pass through:
+The lifecycle commands default to the current directory when their path is omitted:
 
 ```console
-memo claude [args...]
-memo codex [args...]
+memo status
+memo end [PATH]
 ```
 
-Native resume flags append a leg when the referenced session is still in scratch. Resuming a shipped session starts a child session that records the old session ID.
+Sessions live at `$MEMO_HOME/archive/<namespace>/<id>/`. Each recording begins at step `0`; later publications increment the step by one. Immutable step manifests and snapshots become visible through an atomically updated numeric `HEAD`.
 
-Legacy invocation-scoped scratch and tar sessions remain discoverable and loadable. The compatibility save route is:
+## Inspect, export, and replay
+
+Inspect the latest published state of a recording:
 
 ```console
-memo --status
-memo --load <id> --inspect
-memo --save                         # sessions idle for at least 48 hours
-memo --save --older-than 12h
-memo --save --all
-memo --save --session <id>
+memo inspect <id>
 ```
 
-Archives are written to `$MEMO_HOME/archive/<namespace>/<id>.tar.gz` with an adjacent `.sha256` file. Existing archives are never overwritten.
-
-Find and unpack a session by ID (the namespace is discovered automatically):
+Export terminal events from the latest published step. Output goes to standard output unless `--path` names a file. Use `--terminals` with a comma-separated list to select terminal streams.
 
 ```console
-memo --load <id> --unpack
+memo traces <id>
+memo traces <id> --path <file.json>
+memo traces <id> --terminals <terminal-id>,<terminal-id>
 ```
 
-Reconstruct its repository state:
+Trace records are deterministic and bounded by the latest step's terminal high-water marks.
+
+Replay a recorded filesystem state into a directory:
 
 ```console
-memo --load <id> --at initial --path <dir>
-memo --load <id> --at leg:1  --path <dir>
-memo --load <id> --at final  --path <dir>
+memo replay <id> 0 <dir>
+memo replay <id> -1 <dir>
+memo replay <id> 3 <dir>
 ```
 
-Memo refuses to overwrite a non-empty directory. Add `--force` when replacement is intentional.
+Step `0` is the initial state, `-1` selects the latest published state, and any other nonnegative integer selects that step. Memo refuses to replace a non-empty destination unless `--force` is supplied.
 
-Export traces in the common schema, or retain vendor records with a leg tag:
+Add `--include-prompts` to write `<dir>/.prompts.md`. The document contains decoded terminal input events from the selected step boundary, grouped by terminal with timestamps and metadata. It records terminal input rather than inferred application-specific prompts.
 
 ```console
-memo --load <id> --traces
-memo --load <id> --traces --path <file.json>
-memo --load <id> --traces --path -          # same as omitting --path
-memo --load <id> --traces --raw --path <file.json>
+memo replay <id> -1 <dir> --include-prompts
 ```
 
-TODO: Add optional AWS trace recording for durable off-machine trace storage.
+## Capture policy
 
-Reconstruct a state and add `MEMO_TASK.md` containing the original ordered user prompts:
+Memo applies `.gitignore` rules within each Git repository. Nested repositories, including worktrees and submodules represented by a `.git` file, begin a new ignore scope instead of inheriting rules from an outer repository. Memo's own archive and runtime directories are always excluded when they are inside a recorded tree.
+
+Operational defaults such as the step interval, maximum file size, watcher debounce, and push interval are editable constants in `memo/config.py`.
+
+## S3 transport
+
+Set `MEMO_S3_BUCKET` to enable S3-compatible transport. Credentials come from the standard AWS SDK credential chain and are never written to session metadata.
 
 ```console
-memo --load <id> --replay --at initial --path <dir>
-memo --load <id> --replay --at leg:2  --path <dir>
-memo --load <id> --replay --at final  --path <dir>
+memo push
+memo push <id>
+memo pull <id>
+memo pull <id> --force
 ```
 
-Scratch sessions live under `$MEMO_HOME/scratch`. Remote-backed repositories share a canonical remote namespace across clones; repositories without a usable remote use a namespace derived from their canonical local path. Synthetic capture never writes `.git` into the user's directory.
+Push packages the complete published history: all step manifests, snapshots, and bounded terminal stream data needed for historical replay. Data and checksum objects publish before `latest.json`. Pull verifies package integrity, rejects unsafe archive entries, and installs atomically. Existing local state is not replaced without `--force`.
 
-## CLI Interface
+Automatic push runs whenever S3 transport is configured.
 
-The command-line interface has the following general forms:
+## Configuration
 
-```console
-memo [ACTION] [OPTIONS] [PATH]
-memo claude [CLAUDE_ARGS...]
-memo codex [CODEX_ARGS...]
-```
+Memo reads only location and deployment settings from the environment:
 
-With no action, `memo [PATH]` starts or joins a recording for `PATH` (the current
-directory by default) and opens the configured shell. `memo claude` and `memo codex`
-instead run the selected agent and pass all remaining arguments through unchanged.
+- `MEMO_HOME`: local storage root; defaults to `~/memo`.
+- `MEMO_S3_BUCKET`: bucket name; setting it enables transport and automatic push.
+- `MEMO_S3_PREFIX`: object-key prefix; defaults to `memo`.
+- `MEMO_S3_ENDPOINT`: optional endpoint for an S3-compatible service.
+- `MEMO_S3_REGION`: optional AWS region.
+- `MEMO_S3_PROFILE`: optional AWS SDK profile.
 
-Actions are mutually exclusive:
-
-- `--background [PATH]` starts or joins a recording without opening a terminal.
-- `--end [PATH]` finalizes a directory recording.
-- `--status` lists scratch and archived sessions.
-- `--save` archives eligible legacy scratch sessions. Use `--all`, `--session ID`,
-  or `--older-than DURATION` (for example, `30m`, `12h`, or `2d`) to select them.
-- `--load SESSION_ID` reads or restores a session. Pair it with one of `--inspect`,
-  `--unpack`, `--traces`, `--terminals`, `--replay`, or `--at POINT`.
-- `--push` uploads changed directory sessions; `--session ID` limits the push to one.
-- `--pull SESSION_ID` downloads a directory session.
-
-Loading and restoring accept `--path PATH` for the output, `--at POINT` for a
-checkpoint (`initial`, `final`, `generation:N`, `checkpoint:ID`, or legacy `leg:N`),
-and `--force` when an existing non-empty destination may be replaced. Trace exports
-accept `--raw`; terminal exports accept `--terminal ID`. Omitting `--path` (or using
-`--path -`) writes trace and terminal JSON to standard output. Run `memo --help` for
-the complete option list.
+Run `memo --help` or `memo <command> --help` for the complete command-specific argument list.
