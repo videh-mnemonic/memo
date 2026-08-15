@@ -83,6 +83,14 @@ def _published(paths: Paths, root: Path) -> tuple[SessionStore, DirectorySession
     )
     directory = store.create(session)
     _write_stream(directory)
+    (directory / "agents/traces/run.jsonl").write_text(
+        '{"session_id":"native-session","type":"user","content":"trace prompt"}\n'
+    )
+    atomic_write(directory / "agents/runs/run.json", (json.dumps({
+        "run_id": "run",
+        "provider": "claude",
+        "trace_file": "run.jsonl",
+    }) + "\n").encode())
     for step, high_water in ((0, 1), (1, 2)):
         prepared = Path(tempfile.mkdtemp(prefix="prepared-", dir=directory))
         content = f"step {step}\n"
@@ -94,6 +102,7 @@ def _published(paths: Paths, root: Path) -> tuple[SessionStore, DirectorySession
             f"snapshots/{step}",
             [SnapshotEntry("file.txt", "file", 0o644, len(content))],
             {"terminal": high_water},
+            agent_runs=[] if step == 0 else ["run"],
         )
         store.publish(session, manifest, prepared)
     return store, session
@@ -118,6 +127,7 @@ def test_package_is_deterministic_and_contains_complete_history(tmp_path: Path) 
         "steps/0.json", "steps/1.json", "snapshots/0/file.txt",
         "snapshots/1/file.txt", "streams/terminals/terminal/stream.json",
         "streams/terminals/terminal/chunks/events.jsonl.gz",
+        "agents/runs/run.json", "agents/traces/run.jsonl",
     }.issubset(names)
 
 
@@ -189,6 +199,9 @@ def test_pull_preserves_historical_replay_and_manifest_bounded_prompts(tmp_path:
     assert "second" not in (early / ".prompts.md").read_text()
     assert (latest / "file.txt").read_text() == "step 1\n"
     assert "second" in (latest / ".prompts.md").read_text()
+    pulled_root = clean_paths.archive / "namespace/session"
+    assert json.loads((pulled_root / "agents/runs/run.json").read_text())["provider"] == "claude"
+    assert "trace prompt" in (pulled_root / "agents/traces/run.jsonl").read_text()
     assert installed == clean_paths.archive / "namespace/session"
     with pytest.raises(FileExistsError, match="not older"):
         pull_session("session", clean_paths, config, client=client)

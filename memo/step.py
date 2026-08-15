@@ -185,11 +185,12 @@ class StepPublisher:
         )
         step = self.store.next_step(session.archive_namespace, session.session_id)
         session_path = self.store.session_path(session.archive_namespace, session.session_id)
+        agent_runs = sorted(path.stem for path in (session_path / "agents" / "runs").glob("*.json"))
         temporary = Path(tempfile.mkdtemp(prefix=f".{step}.", dir=session_path / "snapshots"))
         try:
             entries = scan_tree(Path(session.root), temporary, previous=previous, paths=self.store.paths)
             manifest = StepManifest(session.session_id, step, utcnow(), f"snapshots/{step}",
-                                    entries, high_water)
+                                    entries, high_water, agent_runs=agent_runs)
             return self.store.publish(session, manifest, temporary)
         except BaseException:
             shutil.rmtree(temporary, ignore_errors=True)

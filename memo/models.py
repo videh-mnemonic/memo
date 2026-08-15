@@ -79,6 +79,7 @@ class StepManifest:
     entries: list[SnapshotEntry] = field(default_factory=list)
     stream_high_water: dict[str, int] = field(default_factory=dict)
     schema_version: int = STEP_SCHEMA_VERSION
+    agent_runs: list[str] = field(default_factory=list)
 
     def validate(self) -> None:
         if self.schema_version != STEP_SCHEMA_VERSION:
@@ -102,6 +103,9 @@ class StepManifest:
                 raise ValueError(f"unsafe terminal stream id: {terminal_id}")
             if not isinstance(sequence, int) or sequence < 0:
                 raise ValueError(f"invalid stream high-water mark: {terminal_id}={sequence}")
+        for run_id in self.agent_runs:
+            if not run_id or Path(run_id).name != run_id:
+                raise ValueError(f"unsafe agent run id: {run_id}")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

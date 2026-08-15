@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import stat
 from pathlib import Path
 
 from memo.cli import main
 from memo.config import Paths
 from memo.protocol import request
+from memo.session_store import SessionStore
 
 
 def test_public_lifecycle_and_inspect_use_zero_based_steps(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -103,6 +106,54 @@ def test_public_traces_and_replay_use_step_bounded_terminal_input(
         capsys.readouterr()
         assert (latest / "note.txt").read_text() == "updated\n"
         assert "recorded input" in (latest / ".prompts.md").read_text()
+    finally:
+        socket = home / "runtime/memo.sock"
+        if socket.exists():
+            request(str(socket), "shutdown")
+
+
+def test_agent_harness_records_command_and_native_trace_in_directory_session(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    home = tmp_path / "memo-home"
+    root = tmp_path / "work"
+    root.mkdir()
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable = binary / "claude"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib\n"
+        "root = pathlib.Path(os.environ['MEMO_TRACE_DIR'])\n"
+        "root.mkdir(parents=True, exist_ok=True)\n"
+        "record = {'session_id': 'agent-session', 'type': 'user', 'content': 'fix it'}\n"
+        "(root / 'agent-session.jsonl').write_text(json.dumps(record) + '\\n')\n"
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("MEMO_HOME", str(home))
+    monkeypatch.setenv("MEMO_TRACE_DIR", str(tmp_path / "native-traces"))
+    monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.chdir(root)
+    try:
+        assert main(["claude", "--model", "test-model"]) == 0
+        session_dir = next(home.glob("archive/*/*/session.json")).parent
+        manifest = SessionStore(Paths.discover()).head(session_dir.parent.name, session_dir.name)
+        assert manifest is not None and manifest.step == 1
+        assert len(manifest.agent_runs) == 1
+        run_id = manifest.agent_runs[0]
+        metadata = json.loads((session_dir / "agents/runs" / f"{run_id}.json").read_text())
+        assert metadata["command"] == ["claude", "--model", "test-model"]
+        assert metadata["agent_session_id"] == "agent-session"
+        assert metadata["exit_code"] == 0
+        assert (session_dir / "agents/traces" / metadata["trace_file"]).is_file()
+
+        assert main(["traces", session_dir.name]) == 0
+        normalized = json.loads(capsys.readouterr().out)
+        assert normalized[0]["provider"] == "claude"
+        assert normalized[0]["event"]["content"] == "fix it"
+        assert normalized[0]["native"]["record"]["session_id"] == "agent-session"
+        assert main(["traces", session_dir.name, "--raw"]) == 0
+        assert json.loads(capsys.readouterr().out)[0]["session_id"] == "agent-session"
     finally:
         socket = home / "runtime/memo.sock"
         if socket.exists():

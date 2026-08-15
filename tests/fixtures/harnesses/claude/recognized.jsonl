@@ -1,0 +1,2 @@
+{"session_id":"claude-session","type":"user","timestamp":"2026-01-01T00:00:00Z","uuid":"user-1","content":"fix it"}
+{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","uuid":"assistant-1","parentUuid":"user-1","content":"working"}

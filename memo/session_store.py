@@ -77,6 +77,8 @@ class SessionStore:
         (path / "steps").mkdir()
         (path / "snapshots").mkdir()
         (path / "streams" / "terminals").mkdir(parents=True)
+        (path / "agents" / "runs").mkdir(parents=True)
+        (path / "agents" / "traces").mkdir(parents=True)
         atomic_write(path / "session.json", _json_bytes(session.to_dict()))
         return path
 
@@ -149,6 +151,22 @@ class SessionStore:
                     for chunk in metadata.get("chunks", []):
                         if not (metadata_path.parent / chunk).is_file():
                             raise ValueError(f"terminal stream references missing chunk: {terminal_id}/{chunk}")
+        for run_id in manifest.agent_runs:
+            metadata_path = path / "agents" / "runs" / f"{run_id}.json"
+            if not metadata_path.is_file():
+                raise ValueError(f"step references missing agent run: {run_id}")
+            metadata = json.loads(metadata_path.read_text())
+            if metadata.get("run_id") != run_id:
+                raise ValueError(f"agent run metadata ID does not match: {run_id}")
+            provider = metadata.get("provider")
+            if not isinstance(provider, str) or not provider:
+                raise ValueError(f"agent run provider is required: {run_id}")
+            trace_file = metadata.get("trace_file")
+            if trace_file:
+                if not isinstance(trace_file, str) or Path(trace_file).name != trace_file:
+                    raise ValueError(f"agent run references unsafe trace: {run_id}")
+                if not (path / "agents" / "traces" / trace_file).is_file():
+                    raise ValueError(f"agent run references missing trace: {run_id}")
 
     def restore(self, namespace: str, session_id: str, destination: Path,
                 selector: str | int = -1, force: bool = False) -> Path:

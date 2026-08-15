@@ -111,6 +111,17 @@ def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Pa
         paths.extend([metadata, metadata.parent, metadata.parent / "chunks"])
         values = json.loads(metadata.read_text())
         paths.extend(metadata.parent / item for item in values.get("chunks", []))
+    agent_runs = sorted({run_id for manifest in manifests for run_id in manifest.agent_runs})
+    if agent_runs:
+        paths.extend([session_path / "agents", session_path / "agents" / "runs",
+                      session_path / "agents" / "traces"])
+    for run_id in agent_runs:
+        metadata = session_path / "agents" / "runs" / f"{run_id}.json"
+        paths.append(metadata)
+        values = json.loads(metadata.read_text())
+        trace_file = values.get("trace_file")
+        if trace_file:
+            paths.append(session_path / "agents" / "traces" / trace_file)
     return sorted(
         {path for path in paths if path.exists()},
         key=lambda item: item.relative_to(session_path).as_posix(),

@@ -4,7 +4,9 @@ import argparse
 import sys
 from pathlib import Path
 
+from .agent import run as run_agent
 from .daemon import activate, end, push
+from .harnesses import get_harness, registered_harnesses
 from .load import inspect_session, replay_session, trace_json, write_traces
 from .relay import run as run_relay
 from .status import render_status
@@ -25,10 +27,11 @@ def parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status", help="list recordings")
     inspect = subparsers.add_parser("inspect", help="inspect a recording")
     inspect.add_argument("session_id")
-    traces = subparsers.add_parser("traces", help="export terminal traces")
+    traces = subparsers.add_parser("traces", help="export agent or terminal traces")
     traces.add_argument("session_id")
     traces.add_argument("--path", type=Path)
     traces.add_argument("--terminals")
+    traces.add_argument("--raw", action="store_true", help="export native agent records")
     replay = subparsers.add_parser("replay", help="restore a recorded step")
     replay.add_argument("session_id")
     replay.add_argument("at")
@@ -45,6 +48,13 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    harness_names = {harness.name for harness in registered_harnesses()}
+    if argv and argv[0] in harness_names:
+        try:
+            return run_agent(get_harness(argv[0]), argv[1:])
+        except Exception as error:
+            print(f"memo: {error}", file=sys.stderr)
+            return 1
     if not argv:
         argv = ["record"]
     elif argv[0] not in COMMANDS and (argv[0] == "." or Path(argv[0]).exists()):
@@ -83,9 +93,9 @@ def main(argv: list[str] | None = None) -> int:
                 if not terminal_ids or any(not value for value in terminal_ids):
                     raise ValueError("terminal IDs must be a comma-separated nonempty list")
             if args.path is None or str(args.path) == "-":
-                print(trace_json(args.session_id, terminal_ids), end="")
+                print(trace_json(args.session_id, terminal_ids, raw=args.raw), end="")
             else:
-                write_traces(args.session_id, args.path, terminal_ids)
+                write_traces(args.session_id, args.path, terminal_ids, raw=args.raw)
         elif args.command == "replay":
             destination = replay_session(
                 args.session_id, args.at, args.directory, args.include_prompts, args.force
