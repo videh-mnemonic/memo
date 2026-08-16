@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from memo.registry import OverlappingRootError, Registry
+from memo.daemon.registry import OverlappingRootError, Registry
 
 
 def test_canonical_path_create_persists_and_rejects_duplicate(tmp_path: Path) -> None:

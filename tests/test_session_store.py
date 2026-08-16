@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 
 from memo.config import StoragePaths
-from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
-from memo.session_store import SessionNotFoundError, SessionStore
+from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
+from memo.recording.store import SessionNotFoundError, SessionStore
 
 
 def _paths(tmp_path: Path) -> StoragePaths:

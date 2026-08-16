@@ -4,11 +4,11 @@ from pathlib import Path
 import pytest
 
 from memo.config import StoragePaths
-from memo.models import DirectorySession, SessionOrigin
-from memo.registry import Registry
-from memo.session_store import SessionStore, atomic_write
-from memo.status import _age, _format_size, _session_size, render_status
-from memo.step import StepPublisher
+from memo.recording.models import DirectorySession, SessionOrigin
+from memo.daemon.registry import Registry
+from memo.recording.store import SessionStore, atomic_write
+from memo.cli.commands.status import _age, _format_size, _session_size, render_status
+from memo.recording.snapshots import StepPublisher
 
 
 def _paths(tmp_path: Path) -> StoragePaths:

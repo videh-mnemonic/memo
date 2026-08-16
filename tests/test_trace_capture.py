@@ -5,10 +5,10 @@ from pathlib import Path
 
 from memo.agents.collector import TraceCollector
 from memo.config import StoragePaths
-from memo.models import DirectorySession, SessionOrigin
-from memo.registry import AgentLaunch, Registry
-from memo.session_store import SessionStore
-from memo.shim import ensure_shims, run as run_shim
+from memo.recording.models import DirectorySession, SessionOrigin
+from memo.daemon.registry import AgentLaunch, Registry
+from memo.recording.store import SessionStore
+from memo.agents.shim import ensure_shims, run as run_shim
 from memo.agents.tracewatch import TraceCheckpoint, capture, changed, snapshot_complete
 
 

@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 from memo.config import StoragePaths
-from memo.step import scan_tree
+from memo.recording.snapshots import scan_tree
 
 
 def _paths(tmp_path: Path) -> StoragePaths:

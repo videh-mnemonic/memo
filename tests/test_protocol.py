@@ -4,7 +4,7 @@ from multiprocessing import Pipe
 
 import pytest
 
-from memo.protocol import (
+from memo.daemon.protocol import (
     DisconnectedError,
     ProtocolError,
     Request,

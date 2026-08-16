@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from memo.config import StoragePaths
-from memo.protocol import request
+from memo.daemon.protocol import request
 
 
 def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> None:
@@ -24,7 +24,7 @@ def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> No
     original = termios.tcgetattr(slave)
     environment = {**os.environ, "MEMO_HOME": str(home), "SHELL": str(shell)}
     process = subprocess.Popen(
-        [sys.executable, "-c", "from memo.relay import run; from pathlib import Path; raise SystemExit(run(Path(r'%s')))" % root],
+        [sys.executable, "-c", "from memo.recording.relay import run; from pathlib import Path; raise SystemExit(run(Path(r'%s')))" % root],
         stdin=slave, stdout=slave, stderr=slave, env=environment, close_fds=True,
     )
     try:

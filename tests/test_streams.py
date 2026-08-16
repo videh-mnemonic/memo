@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from memo.config import StoragePaths
-from memo.registry import Registry
-from memo.streams import StreamStore, merged_timeline
+from memo.daemon.registry import Registry
+from memo.recording.streams import StreamStore, merged_timeline
 
 
 def _event(sequence: int, data: bytes = b"x") -> dict[str, object]:

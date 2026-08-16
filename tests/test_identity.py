@@ -1,5 +1,5 @@
 from memo import __version__
-from memo.models import SessionOrigin
+from memo.recording.models import SessionOrigin
 
 
 def test_version_and_live_origin(monkeypatch) -> None:

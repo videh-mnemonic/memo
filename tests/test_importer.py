@@ -8,7 +8,7 @@ from memo.agents.harnesses.claude import ClaudeHarness
 from memo.agents.harnesses.codex import CodexHarness
 from memo.agents.importer import import_native_sessions
 from memo.export import trace_json
-from memo.session_store import SessionStore
+from memo.recording.store import SessionStore
 
 
 def _record(session_id: str, cwd: Path, content: str) -> str:

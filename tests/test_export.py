@@ -10,9 +10,9 @@ import pytest
 
 from memo.config import StoragePaths
 from memo.export import replay_session, terminal_ids, trace_json, write_traces
-from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
-from memo.session_store import SessionStore, atomic_write
-from memo.streams import StreamEvent
+from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
+from memo.recording.store import SessionStore, atomic_write
+from memo.recording.streams import StreamEvent
 
 
 def _paths(tmp_path: Path) -> StoragePaths:

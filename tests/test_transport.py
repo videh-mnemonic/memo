@@ -16,9 +16,9 @@ import zstandard
 
 from memo.config import StoragePaths, TransportConfig
 from memo.export import replay_session
-from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
-from memo.session_store import SessionStore, atomic_write
-from memo.streams import StreamEvent
+from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
+from memo.recording.store import SessionStore, atomic_write
+from memo.recording.streams import StreamEvent
 from memo.transport import (MULTIPART_PART_SIZE, MultipartUploadWriter,
                             ensure_local_session, inspect_archived_agent_runs,
                             list_archived_session_ids,

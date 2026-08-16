@@ -4,10 +4,10 @@ import struct
 from pathlib import Path
 
 from memo.config import StoragePaths
-from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
-from memo.registry import Registry
-from memo.session_store import SessionStore
-from memo.streams import StreamStore
+from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
+from memo.daemon.registry import Registry
+from memo.recording.store import SessionStore
+from memo.recording.streams import StreamStore
 
 
 def _setup(tmp_path: Path):

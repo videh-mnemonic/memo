@@ -8,8 +8,8 @@ from pathlib import Path
 
 from memo.config import StoragePaths
 from memo.daemon import MemoDaemon
-from memo.protocol import request
-from memo.session_store import SessionStore
+from memo.daemon.protocol import request
+from memo.recording.store import SessionStore
 
 
 def _running(tmp_path: Path, interval: float = 10) -> tuple[StoragePaths, Path, MemoDaemon, threading.Thread]:
