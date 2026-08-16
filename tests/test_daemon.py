@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from memo.config import StoragePaths
-from memo.daemon import MemoDaemon
+from memo.daemon.server import MemoDaemon
 from memo.daemon.protocol import request
 from memo.recording.store import SessionStore
 
@@ -185,7 +185,7 @@ def test_end_starts_final_push_after_releasing_lifecycle_locks(
     tmp_path: Path, monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "memo.daemon.TransportConfig.discover",
+        "memo.daemon.server.TransportConfig.discover",
         classmethod(lambda cls, required=False: object()),
     )
     called = threading.Event()

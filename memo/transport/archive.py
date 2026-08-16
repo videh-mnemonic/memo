@@ -9,7 +9,7 @@ from typing import Iterable
 
 
 def deterministic_archive(root: Path, paths: Iterable[Path] | None = None) -> bytes:
-    """Build the deterministic in-memory archive used by compatibility callers."""
+    """Build a deterministic in-memory archive."""
     selected = list(paths) if paths is not None else list(root.rglob("*"))
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:

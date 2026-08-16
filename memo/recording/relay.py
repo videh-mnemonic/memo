@@ -7,7 +7,6 @@ import os
 import pty
 import select
 import signal
-import struct
 import termios
 import tty
 from pathlib import Path

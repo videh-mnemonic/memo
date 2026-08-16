@@ -19,8 +19,7 @@ from ..config import StoragePaths, TransportConfig
 from ..recording.models import DirectorySession, SessionOrigin, StepManifest
 from ..recording.store import (SessionNotFoundError, SessionStore, atomic_write,
                                validate_session_id)
-from .archive import (deterministic_archive, digest_bytes, safe_extract_bytes,
-                      verify_digest)
+from .archive import deterministic_archive, digest_bytes
 
 
 MULTIPART_PART_SIZE = 8 * 1024 * 1024

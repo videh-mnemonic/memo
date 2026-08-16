@@ -758,7 +758,7 @@ def test_atomic_install_failure_restores_existing_session(tmp_path: Path, monkey
     destination.mkdir(parents=True)
     (destination / "local.txt").write_text("keep")
 
-    from memo import transport
+    from memo.transport import s3
     original_replace = os.replace
     calls = 0
     def fail_install(source: Path, target: Path) -> None:
@@ -767,7 +767,7 @@ def test_atomic_install_failure_restores_existing_session(tmp_path: Path, monkey
         if calls == 3:
             raise OSError("injected install failure")
         original_replace(source, target)
-    monkeypatch.setattr(transport.os, "replace", fail_install)
+    monkeypatch.setattr(s3.os, "replace", fail_install)
     with pytest.raises(OSError, match="injected install failure"):
         pull_session("session", paths, config, force=True, client=client)
     assert (destination / "local.txt").read_text() == "keep"
