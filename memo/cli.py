@@ -91,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
             action = "already complete" if response["already_complete"] else "completed"
             print(f"{action}: {response['session_id']} step={response['step']}")
+            if response.get("cloud") == "pending":
+                print("cloud upload started; automatic retry remains enabled", file=sys.stderr)
         elif args.command == "push":
             response = push(args.session_id)
             for session_id in response["pushed"]:

@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -316,36 +317,138 @@ def package_history(store: SessionStore, session: DirectorySession) -> tuple[byt
     return data, digest_bytes(data), manifest
 
 
-def _multipart_package_history(store: SessionStore, session: DirectorySession,
-                               config: TransportConfig, client: Any,
-                               temporary: str) -> tuple[str, StepManifest]:
+@dataclass
+class PreparedGeneration:
+    session_id: str
+    step: int
+    digest: str
+    path: Path
+
+    def cleanup(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+def prepare_generation(store: SessionStore, session: DirectorySession) -> PreparedGeneration:
     manifests = store.steps(session.session_id)
     if not manifests:
         raise ValueError(f"session has no published step: {session.session_id}")
     manifest = manifests[-1]
     root = store.session_path(session.session_id)
-    response = client.create_multipart_upload(Bucket=config.bucket, Key=temporary)
+    assert store.paths.runtime is not None
+    upload_dir = store.paths.runtime / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{session.session_id}-{manifest.step:08d}-", suffix=".tar.zst",
+        dir=upload_dir,
+    )
+    path = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            hashing = HashingWriter(handle)
+            write_deterministic_tar_zst(root, _history_paths(root, manifests), hashing)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return PreparedGeneration(session.session_id, manifest.step, hashing.hexdigest(), path)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _error_code(error: BaseException) -> str | None:
+    response = getattr(error, "response", None)
+    if isinstance(response, dict):
+        details = response.get("Error")
+        if isinstance(details, dict):
+            code = details.get("Code")
+            return None if code is None else str(code)
+    return None
+
+
+def _is_precondition_failed(error: BaseException) -> bool:
+    return _error_code(error) in {"PreconditionFailed", "412"}
+
+
+def _is_not_found(error: BaseException) -> bool:
+    return isinstance(error, KeyError) or _error_code(error) in {
+        "NoSuchKey", "NotFound", "404",
+    }
+
+
+def _get_optional(client: Any, config: TransportConfig, key: str) -> bytes | None:
+    try:
+        return _bounded_body(client.get_object(Bucket=config.bucket, Key=key))
+    except Exception as error:
+        if _is_not_found(error):
+            return None
+        raise
+
+
+def _put_immutable(client: Any, config: TransportConfig, key: str, value: bytes) -> None:
+    try:
+        client.put_object(
+            Bucket=config.bucket, Key=key, Body=value, IfNoneMatch="*"
+        )
+    except Exception as error:
+        if not _is_precondition_failed(error):
+            raise
+        existing = _get_optional(client, config, key)
+        if existing != value:
+            raise ValueError(f"remote integrity conflict for {key}") from error
+
+
+def _remote_digest(client: Any, config: TransportConfig, key: str) -> str:
+    response = client.get_object(Bucket=config.bucket, Key=key)
+    body = response["Body"]
+    hashing = hashlib.sha256()
+    try:
+        while True:
+            chunk = body.read(STREAM_READ_SIZE)
+            if not chunk:
+                break
+            hashing.update(chunk)
+    finally:
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
+    return hashing.hexdigest()
+
+
+def _upload_generation(client: Any, config: TransportConfig,
+                       prepared: PreparedGeneration, key: str) -> None:
+    response = client.create_multipart_upload(Bucket=config.bucket, Key=key)
     upload_id = response["UploadId"]
     try:
-        multipart = MultipartUploadWriter(client, config.bucket, temporary, upload_id)
-        hashing = HashingWriter(multipart)
-        write_deterministic_tar_zst(root, _history_paths(root, manifests), hashing)
+        multipart = MultipartUploadWriter(client, config.bucket, key, upload_id)
+        with prepared.path.open("rb") as source:
+            while True:
+                chunk = source.read(STREAM_READ_SIZE)
+                if not chunk:
+                    break
+                multipart.write(chunk)
         parts = multipart.finish()
         client.complete_multipart_upload(
             Bucket=config.bucket,
-            Key=temporary,
+            Key=key,
             UploadId=upload_id,
             MultipartUpload={"Parts": parts},
+            IfNoneMatch="*",
         )
-    except BaseException:
+    except BaseException as error:
         try:
             client.abort_multipart_upload(
-                Bucket=config.bucket, Key=temporary, UploadId=upload_id
+                Bucket=config.bucket, Key=key, UploadId=upload_id
             )
         except BaseException:
             pass
+        if _is_precondition_failed(error):
+            if _remote_digest(client, config, key) != prepared.digest:
+                raise ValueError(f"remote integrity conflict for {key}") from error
+            return
         raise
-    return hashing.hexdigest(), manifest
 
 
 @dataclass
@@ -364,6 +467,45 @@ def _component(value: str) -> str:
     return quote(value, safe="")
 
 
+def publish_generation(store: SessionStore, session: DirectorySession,
+                       prepared: PreparedGeneration, config: TransportConfig,
+                       client: Any | None = None, *, update_local: bool = True) -> dict[str, object]:
+    client = client or config.client()
+    base = _key(config, _component(session.origin.username),
+                _component(session.origin.hostname), "sessions", session.session_id)
+    generation = f"{base}/generations/{prepared.step:08d}.tar.zst"
+    checksum = f"{base}/generations/{prepared.step:08d}.sha256"
+    _upload_generation(client, config, prepared, generation)
+    sidecar = f"{prepared.digest}  {Path(generation).name}\n".encode()
+    _put_immutable(client, config, checksum, sidecar)
+    index_key = _key(config, "index", "sessions", f"{session.session_id}.json")
+    index = json.dumps({
+        "schema_version": 1,
+        "session_id": session.session_id,
+        "memo_version_id": session.origin.memo_version_id,
+        "username": session.origin.username,
+        "hostname": session.origin.hostname,
+    }, sort_keys=True).encode()
+    _put_immutable(client, config, index_key, index)
+    if session.state == "complete":
+        completion_key = f"{base}/completion.json"
+        completion = json.dumps({
+            "schema_version": 1,
+            "session_id": session.session_id,
+            "final_step": prepared.step,
+            "generation": generation,
+            "sha256": prepared.digest,
+        }, sort_keys=True).encode()
+        _put_immutable(client, config, completion_key, completion)
+    if update_local:
+        session.last_pushed_step = prepared.step
+        session.last_pushed_digest = prepared.digest
+        session.remote_object = generation
+        store.update_session(session)
+    return {"session_id": session.session_id, "step": prepared.step,
+            "digest": prepared.digest, "object": generation, "status": "pushed"}
+
+
 def push_session(store: SessionStore, session: DirectorySession, config: TransportConfig,
                  client: Any | None = None) -> dict[str, object]:
     manifest = store.head(session.session_id)
@@ -372,48 +514,11 @@ def push_session(store: SessionStore, session: DirectorySession, config: Transpo
     if session.last_pushed_step == manifest.step:
         return {"session_id": session.session_id, "step": manifest.step,
                 "digest": session.last_pushed_digest, "status": "skipped"}
-    client = client or config.client()
-    base = _key(config, _component(session.origin.username),
-                _component(session.origin.hostname), "sessions", session.session_id)
-    temporary = f"{base}/tmp/{uuid.uuid4().hex}.tar.zst"
-    digest, manifest = _multipart_package_history(store, session, config, client, temporary)
-    version = f"{base}/steps/{manifest.step}-{digest}.tar.zst"
-    checksum = f"{version}.sha256"
+    prepared = prepare_generation(store, session)
     try:
-        client.copy_object(Bucket=config.bucket, Key=version,
-                           CopySource={"Bucket": config.bucket, "Key": temporary})
-        client.put_object(Bucket=config.bucket, Key=checksum,
-                          Body=f"{digest}  {Path(version).name}\n".encode())
-    except BaseException:
-        try:
-            client.delete_object(Bucket=config.bucket, Key=temporary)
-        except BaseException:
-            pass
-        raise
-    client.delete_object(Bucket=config.bucket, Key=temporary)
-    pointer_value = {"schema_version": 3, "session_id": session.session_id,
-                          "origin": session.origin.to_dict(),
-                          "step": manifest.step, "digest": digest,
-                          "object": version, "checksum": checksum}
-    pointer = json.dumps(pointer_value, sort_keys=True).encode()
-    final_key = f"{base}/latest.json"
-    index_key = _key(config, "index", "sessions", f"{session.session_id}.json")
-    index = json.dumps({
-        "schema_version": 1,
-        "session_id": session.session_id,
-        "memo_version_id": session.origin.memo_version_id,
-        "username": session.origin.username,
-        "hostname": session.origin.hostname,
-        "latest": final_key,
-    }, sort_keys=True).encode()
-    client.put_object(Bucket=config.bucket, Key=index_key, Body=index)
-    client.put_object(Bucket=config.bucket, Key=final_key, Body=pointer)
-    session.last_pushed_step = manifest.step
-    session.last_pushed_digest = digest
-    session.remote_object = final_key
-    store.update_session(session)
-    return {"session_id": session.session_id, "step": manifest.step,
-            "digest": digest, "object": final_key, "status": "pushed"}
+        return publish_generation(store, session, prepared, config, client)
+    finally:
+        prepared.cleanup()
 
 
 def _bounded_body(response: dict[str, Any], limit: int = METADATA_SIZE_LIMIT) -> bytes:
@@ -439,43 +544,53 @@ def _bounded_body(response: dict[str, Any], limit: int = METADATA_SIZE_LIMIT) ->
             close()
 
 
-def _validate_pointer(pointer: object, session_id: str, pointer_key: str) -> dict[str, Any]:
-    if not isinstance(pointer, dict):
-        raise ValueError("remote pointer must be a JSON object")
-    if pointer.get("schema_version") != 3:
-        raise ValueError("unsupported remote pointer schema")
-    if pointer.get("session_id") != session_id:
-        raise ValueError("remote pointer session identity mismatch")
-    origin = pointer.get("origin")
-    step = pointer.get("step")
-    digest = pointer.get("digest")
-    object_key = pointer.get("object")
-    checksum_key = pointer.get("checksum")
-    if not isinstance(origin, dict) or any(
-        not isinstance(origin.get(key), str) or not origin.get(key)
-        for key in ("memo_version_id", "username", "hostname")
-    ):
-        raise ValueError("remote pointer has invalid origin")
-    if not isinstance(step, int) or isinstance(step, bool) or step < 0:
-        raise ValueError("remote pointer has invalid step")
-    if (not isinstance(digest, str) or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)):
-        raise ValueError("remote pointer has invalid digest")
-    if not isinstance(object_key, str) or not object_key.endswith(".tar.zst"):
-        raise ValueError("remote pointer object must be a .tar.zst package")
-    if not isinstance(checksum_key, str) or checksum_key != f"{object_key}.sha256":
-        raise ValueError("remote pointer has invalid checksum object")
-    base = pointer_key.removesuffix("/latest.json")
-    expected_suffix = "/".join((
-        _component(origin["username"]), _component(origin["hostname"]),
-        "sessions", session_id,
-    ))
-    if (base.strip("/") != expected_suffix
-            and not base.strip("/").endswith(f"/{expected_suffix}")):
-        raise ValueError("remote pointer object identity mismatch")
-    if not object_key.startswith(f"{base}/steps/"):
-        raise ValueError("remote pointer object identity mismatch")
-    return pointer
+def _validate_index(index: object, session_id: str) -> dict[str, str]:
+    if (not isinstance(index, dict) or index.get("schema_version") != 1
+            or index.get("session_id") != session_id):
+        raise ValueError("remote session index is invalid")
+    if any(not isinstance(index.get(key), str) or not index.get(key)
+           for key in ("memo_version_id", "username", "hostname")):
+        raise ValueError("remote session index has invalid origin")
+    return index  # type: ignore[return-value]
+
+
+def _list_generation_pairs(client: Any, config: TransportConfig,
+                           prefix: str) -> dict[int, tuple[str, str]]:
+    package_pattern = re.compile(rf"^{re.escape(prefix)}(\d{{8,}})\.tar\.zst$")
+    checksum_pattern = re.compile(rf"^{re.escape(prefix)}(\d{{8,}})\.sha256$")
+    packages: dict[int, str] = {}
+    checksums: dict[int, str] = {}
+    token: str | None = None
+    while True:
+        arguments: dict[str, object] = {"Bucket": config.bucket, "Prefix": prefix}
+        if token is not None:
+            arguments["ContinuationToken"] = token
+        response = client.list_objects_v2(**arguments)
+        for item in response.get("Contents", []):
+            if not isinstance(item, dict) or not isinstance(item.get("Key"), str):
+                continue
+            key = item["Key"]
+            package_match = package_pattern.fullmatch(key)
+            checksum_match = checksum_pattern.fullmatch(key)
+            if package_match:
+                packages[int(package_match.group(1))] = key
+            elif checksum_match:
+                checksums[int(checksum_match.group(1))] = key
+        if not response.get("IsTruncated"):
+            break
+        next_token = response.get("NextContinuationToken")
+        if not isinstance(next_token, str) or not next_token:
+            raise ValueError("remote generation listing is truncated without a token")
+        token = next_token
+    return {
+        step: (package, checksums[step])
+        for step, package in packages.items() if step in checksums
+    }
+
+
+def _valid_digest(value: object) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value))
 
 
 def pull_session(session_id: str, paths: Paths | None = None,
@@ -493,46 +608,59 @@ def pull_session(session_id: str, paths: Paths | None = None,
         ))
     except Exception as error:
         raise FileNotFoundError(f"remote session not found: {session_id}") from error
-    if (not isinstance(index, dict) or index.get("schema_version") != 1
-            or index.get("session_id") != session_id
-            or not isinstance(index.get("latest"), str)):
-        raise ValueError("remote session index is invalid")
-    latest_key = str(index["latest"])
-    pointer = _validate_pointer(
-        json.loads(_bounded_body(client.get_object(Bucket=config.bucket, Key=latest_key))),
-        session_id,
-        latest_key,
-    )
-    origin = pointer["origin"]
-    expected_latest = _key(
+    origin = _validate_index(index, session_id)
+    base = _key(
         config, _component(origin["username"]), _component(origin["hostname"]),
-        "sessions", session_id, "latest.json",
+        "sessions", session_id,
     )
-    if latest_key != expected_latest:
-        raise ValueError("remote index points outside the session origin hierarchy")
-    if any(index.get(key) != origin.get(key) for key in (
-        "memo_version_id", "username", "hostname"
-    )):
-        raise ValueError("remote index and session pointer origin disagree")
+    generation_prefix = f"{base}/generations/"
+    pairs = _list_generation_pairs(client, config, generation_prefix)
+    completion_key = f"{base}/completion.json"
+    completion_data = _get_optional(client, config, completion_key)
+    expected_digest: str | None = None
+    if completion_data is not None:
+        completion = json.loads(completion_data)
+        if (not isinstance(completion, dict) or completion.get("schema_version") != 1
+                or completion.get("session_id") != session_id
+                or not isinstance(completion.get("final_step"), int)
+                or isinstance(completion.get("final_step"), bool)
+                or completion.get("final_step") < 0
+                or not _valid_digest(completion.get("sha256"))):
+            raise ValueError("remote completion marker is invalid")
+        step = int(completion["final_step"])
+        pair = pairs.get(step)
+        expected_generation = f"{generation_prefix}{step:08d}.tar.zst"
+        if pair is None or completion.get("generation") != expected_generation:
+            raise ValueError("remote completion marker references an incomplete generation")
+        expected_digest = str(completion["sha256"])
+    else:
+        if not pairs:
+            raise FileNotFoundError(f"remote session has no complete generation: {session_id}")
+        step = max(pairs)
+        pair = pairs[step]
+    object_key, checksum_key = pair
     checksum = _bounded_body(
-        client.get_object(Bucket=config.bucket, Key=pointer["checksum"])
+        client.get_object(Bucket=config.bucket, Key=checksum_key)
     ).decode()
     sidecar_digest = checksum.split()[0] if checksum.split() else ""
-    if sidecar_digest != pointer["digest"]:
-        raise ValueError("remote pointer and checksum disagree")
+    if not _valid_digest(sidecar_digest):
+        raise ValueError("remote generation checksum is invalid")
+    if expected_digest is not None and sidecar_digest != expected_digest:
+        raise ValueError("remote completion marker and checksum disagree")
+    digest = sidecar_digest
     store = SessionStore(paths)
     destination = store.session_path(session_id)
     if destination.exists() and not force:
         local = store.head(session_id)
-        if local and local.step >= int(pointer["step"]):
+        if local and local.step >= step:
             raise FileExistsError(
-                f"local step {local.step} is not older than remote step {pointer['step']}"
+                f"local step {local.step} is not older than remote step {step}"
             )
         raise FileExistsError(f"local session exists: {session_id}; use --force to replace it")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{session_id}.pull-", dir=destination.parent))
     try:
-        response = client.get_object(Bucket=config.bucket, Key=pointer["object"])
+        response = client.get_object(Bucket=config.bucket, Key=object_key)
         body = response["Body"]
         try:
             actual_digest = safe_extract_tar_zst_stream(body, temporary)
@@ -547,9 +675,9 @@ def pull_session(session_id: str, paths: Paths | None = None,
         close = getattr(body, "close", None)
         if close is not None:
             close()
-        if actual_digest != pointer["digest"]:
+        if actual_digest != digest:
             raise ValueError(
-                f"checksum mismatch: expected {pointer['digest']}, got {actual_digest}"
+                f"checksum mismatch: expected {digest}, got {actual_digest}"
             )
         pulled = DirectorySession.load(temporary / "session.json")
         manifests = SessionStore._validate_history(temporary, session_id)
@@ -561,11 +689,11 @@ def pull_session(session_id: str, paths: Paths | None = None,
                 or pulled.origin.username != origin["username"]
                 or pulled.origin.hostname != origin["hostname"]
                 or manifest.session_id != session_id
-                or manifest.step != int(pointer["step"])):
-            raise ValueError("downloaded session does not match remote pointer")
+                or manifest.step != step):
+            raise ValueError("downloaded session does not match remote generation")
         pulled.last_pushed_step = manifest.step
-        pulled.last_pushed_digest = pointer["digest"]
-        pulled.remote_object = latest_key
+        pulled.last_pushed_digest = digest
+        pulled.remote_object = object_key
         atomic_write(temporary / "session.json",
                      (json.dumps(pulled.to_dict(), indent=2, sort_keys=True) + "\n").encode())
         atomic_install_directory(temporary, destination, force=force)

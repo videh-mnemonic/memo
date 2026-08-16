@@ -248,7 +248,31 @@ class MemoDaemon:
             if others and (not payload.get("confirmed") or expected is None):
                 return {"confirmation_required": True, "session_id": active.session_id,
                         "revision": active.revision, "other_terminals": len(others)}
-            return self._finish(active)
+            result = self._finish(active)
+        # Local completion is authoritative. Cloud publication starts only after
+        # lifecycle locks have been released and cannot delay or roll it back.
+        if TransportConfig.discover() is not None:
+            self._schedule_push(active.session_id)
+            result["cloud"] = "pending"
+        return result
+
+    def _schedule_push(self, session_id: str) -> None:
+        def upload() -> None:
+            try:
+                result = self._push({"session_id": session_id})
+                if result["failed"]:
+                    print(
+                        f"memo daemon: final cloud push pending for {session_id}: "
+                        f"{result['failed'][0][1]}",
+                        file=sys.stderr,
+                    )
+            except Exception as error:
+                print(
+                    f"memo daemon: final cloud push pending for {session_id}: {error}",
+                    file=sys.stderr,
+                )
+
+        threading.Thread(target=upload, daemon=True).start()
 
     def _finish(self, active: ActiveSession) -> dict[str, Any]:
         with self._session_lock(active.session_id):
@@ -351,7 +375,8 @@ class MemoDaemon:
         return {"launch_id": launch_id, "capture": "complete"}
 
     def _push(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from .transport import PushSummary, push_session
+        from .transport import (PushSummary, prepare_generation,
+                                publish_generation)
         config = TransportConfig.discover(required=True)
         assert config is not None
         selected = payload.get("session_id")
@@ -361,13 +386,38 @@ class MemoDaemon:
         if selected and not sessions:
             summary.failed.append((str(selected), "directory session not found"))
         for session in sessions:
+            prepared = None
             try:
                 with self._session_lock(session.session_id):
-                    result = push_session(self.store, session, config)
+                    session = self.store.load_session(session.session_id)
+                    manifest = self.store.head(session.session_id)
+                    if manifest is None:
+                        raise ValueError(
+                            f"session has no published step: {session.session_id}"
+                        )
+                    if session.last_pushed_step == manifest.step:
+                        result = {"status": "skipped"}
+                    else:
+                        prepared = prepare_generation(self.store, session)
+                if prepared is not None:
+                    result = publish_generation(
+                        self.store, session, prepared, config, update_local=False
+                    )
+                    with self._session_lock(session.session_id):
+                        current = self.store.load_session(session.session_id)
+                        if (current.last_pushed_step is None
+                                or current.last_pushed_step <= prepared.step):
+                            current.last_pushed_step = prepared.step
+                            current.last_pushed_digest = prepared.digest
+                            current.remote_object = str(result["object"])
+                            self.store.update_session(current)
                 target = summary.skipped if result["status"] == "skipped" else summary.pushed
                 target.append(session.session_id)
             except Exception as error:
                 summary.failed.append((session.session_id, str(error)))
+            finally:
+                if prepared is not None:
+                    prepared.cleanup()
         return {"pushed": summary.pushed, "skipped": summary.skipped,
                 "failed": summary.failed}
 

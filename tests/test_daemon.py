@@ -156,3 +156,43 @@ def test_end_rejects_stale_confirmation_after_attachment_change(tmp_path: Path) 
             request(str(paths.socket), "detach", {"terminal_id": allocation["terminal_id"]})
     finally:
         _stop(paths, thread)
+
+
+def test_end_starts_final_push_after_releasing_lifecycle_locks(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "memo.daemon.TransportConfig.discover",
+        classmethod(lambda cls, required=False: object()),
+    )
+    called = threading.Event()
+    lock_state: dict[str, bool] = {}
+
+    def fake_push(self: MemoDaemon, payload: dict[str, object]) -> dict[str, object]:
+        session_id = str(payload["session_id"])
+        session_lock = self._session_lock(session_id)
+        root_lock = self._root_lock(root)
+        lock_state["session"] = session_lock.acquire(blocking=False)
+        if lock_state["session"]:
+            session_lock.release()
+        lock_state["root"] = root_lock.acquire(blocking=False)
+        if lock_state["root"]:
+            root_lock.release()
+        lock_state["complete"] = SessionStore(paths).load_session(session_id).state == "complete"
+        called.set()
+        return {"pushed": [session_id], "skipped": [], "failed": []}
+
+    monkeypatch.setattr(MemoDaemon, "_push", fake_push)
+    paths, root, _, thread = _running(tmp_path)
+    try:
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        ended = request(str(paths.socket), "end", {
+            "session_id": attached["session_id"],
+            "terminal_id": attached["terminal_id"],
+        })
+        assert ended["state"] == "complete"
+        assert ended["cloud"] == "pending"
+        assert called.wait(3)
+        assert lock_state == {"session": True, "root": True, "complete": True}
+    finally:
+        _stop(paths, thread)

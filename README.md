@@ -267,15 +267,21 @@ Remote objects are organized by the recording's original identity:
 
 ```text
 s3://<bucket>/<prefix>/<username>/<hostname>/sessions/<session-id>/
-  latest.json
-  steps/
+  generations/
+    00000042.tar.zst
+    00000042.sha256
+  completion.json
 
 s3://<bucket>/<prefix>/index/sessions/<session-id>.json
 ```
 
-The direct index lets `memo pull <session-id>` locate a recording without listing the bucket. Username and hostname are encoded safely for object keys, but remain intentionally visible to anyone who can inspect the bucket.
+The direct index lets `memo pull <session-id>` locate a recording without listing the whole bucket. Each generation is an immutable recovery checkpoint keyed by its local step. The fixed completion marker binds a completed recording to its final generation. Memo creates all final objects conditionally and verifies an existing object on retry; it never replaces or deletes a completed remote object.
 
-When S3 is configured, the daemon also attempts an automatic push every 15 minutes.
+Pull uses the generation named by `completion.json` for a completed recording. While a recording is still active, it lists that recording's `generations/` prefix and selects the highest complete package/checksum pair. Username and hostname are encoded safely for object keys, but remain intentionally visible to anyone who can inspect the bucket.
+
+Memo's S3 credentials need `s3:GetObject`, prefix-limited `s3:ListBucket`, `s3:PutObject`, and optionally `s3:AbortMultipartUpload`. They do not need object deletion permissions. To enforce write-once storage rather than relying on client behavior alone, configure the bucket policy to require `If-None-Match: *` for completed object-creation operations while exempting the preliminary multipart operations.
+
+When S3 is configured, the daemon attempts an automatic push every 15 minutes and an immediate final push after `memo end`. Local completion remains successful if S3 is unavailable; the completed recording remains eligible for a later automatic or manual retry.
 
 ## Configuration
 
