@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..recording.paths import StoragePaths
-from ..recording.models import StepManifest
+from ..recording.metadata import StepManifest
 from ..recording.store import SessionStore
 from ..recording.streams import StreamEvent
 

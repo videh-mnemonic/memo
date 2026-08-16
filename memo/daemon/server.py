@@ -14,7 +14,7 @@ from typing import IO, Any
 from ..recording.snapshots import StepPublisher, utcnow
 from ..recording.paths import StoragePaths
 from ..transport.config import S3Config
-from ..recording.models import DirectorySession, SessionOrigin
+from ..recording.metadata import DirectorySession, SessionOrigin
 from .protocol import (
     DisconnectedError,
     ProtocolError,

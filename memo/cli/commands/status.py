@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ...recording.paths import StoragePaths
-from ...recording.models import DirectorySession
+from ...recording.metadata import DirectorySession
 from ...daemon.registry import Registry
 from ...recording.store import SessionStore
 from .common import require_local_session

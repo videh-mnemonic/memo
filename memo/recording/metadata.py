@@ -1,4 +1,4 @@
-"""Define serialized models for recording identity, sessions, snapshots, and steps."""
+"""Define serialized metadata for recording identity, sessions, snapshots, and steps."""
 
 from __future__ import annotations
 

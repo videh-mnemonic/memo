@@ -15,7 +15,7 @@ from typing import Any, BinaryIO, Iterable
 
 import zstandard
 
-from ..recording.models import DirectorySession, StepManifest
+from ..recording.metadata import DirectorySession, StepManifest
 from ..recording.store import SessionStore
 
 

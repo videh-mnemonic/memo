@@ -5,7 +5,7 @@ from pathlib import Path
 
 from memo.agents.ingestion import TraceIngester
 from memo.recording.paths import StoragePaths
-from memo.recording.models import DirectorySession, SessionOrigin
+from memo.recording.metadata import DirectorySession, SessionOrigin
 from memo.daemon.registry import AgentLaunch, Registry
 from memo.recording.store import SessionStore
 from memo.agents.shim import ensure_shims, run as run_shim

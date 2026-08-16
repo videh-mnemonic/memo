@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .paths import StoragePaths
 from .ignore import IgnorePolicy
-from .models import DirectorySession, SnapshotEntry, StepManifest
+from .metadata import DirectorySession, SnapshotEntry, StepManifest
 from .store import SessionStore
 
 

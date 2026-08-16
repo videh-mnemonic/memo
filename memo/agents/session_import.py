@@ -18,7 +18,7 @@ from .harnesses.base import AgentHarness, SourceRecord, model_context, source_re
 from .trace_files import files, snapshot_complete
 from ..recording.paths import StoragePaths
 from ..transport.config import S3Config
-from ..recording.models import DirectorySession, SessionOrigin, StepManifest
+from ..recording.metadata import DirectorySession, SessionOrigin, StepManifest
 from ..recording.store import SessionStore, atomic_write, validate_session_id
 from ..recording.snapshots import utcnow
 

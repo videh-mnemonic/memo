@@ -18,7 +18,7 @@ import zstandard
 from memo.recording.paths import StoragePaths
 from memo.transport.config import S3Config
 from memo.export import replay_session
-from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
+from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.recording.store import SessionStore, atomic_write
 from memo.recording.streams import StreamEvent
 from memo.transport import (ensure_local_session, inspect_archived_agent_runs,

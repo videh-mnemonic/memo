@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 import zstandard
 
-from ..recording.models import DirectorySession, SessionOrigin
+from ..recording.metadata import DirectorySession, SessionOrigin
 from ..recording.paths import StoragePaths
 from ..recording.store import (SessionNotFoundError, SessionStore, atomic_write,
                                validate_session_id)

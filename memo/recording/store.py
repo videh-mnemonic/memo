@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
 from .paths import StoragePaths
-from .models import DirectorySession, StepManifest
+from .metadata import DirectorySession, StepManifest
 
 if TYPE_CHECKING:
     from .streams import StreamEvent

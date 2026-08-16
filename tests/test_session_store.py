@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from memo.recording.paths import StoragePaths
-from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
+from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.recording.store import SessionNotFoundError, SessionStore
 
 

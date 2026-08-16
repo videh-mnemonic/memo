@@ -4,7 +4,7 @@ import struct
 from pathlib import Path
 
 from memo.recording.paths import StoragePaths
-from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
+from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.daemon.registry import Registry
 from memo.recording.store import SessionStore
 from memo.recording.streams import StreamStore
