@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Provider harness contracts and normalized trace event helpers."""
+
+from __future__ import annotations
 
 import json
 import os

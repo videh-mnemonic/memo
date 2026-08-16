@@ -1,13 +1,51 @@
+"""Render human-readable summaries of local and archived Memo sessions."""
+
 from __future__ import annotations
 
+import argparse
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from ...recording.paths import StoragePaths
 from ...recording.models import DirectorySession
 from ...daemon.registry import Registry
 from ...recording.store import SessionStore
+from .common import require_local_session
+
+
+NAME = "status"
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
+
+
+def configure(subparsers: Any) -> None:
+    command = subparsers.add_parser(NAME, help="list recordings")
+    command.add_argument("session_id", nargs="?", help="show one recording")
+    command.add_argument("--include-archive", action="store_true",
+                         help="include remote-only archived recordings")
+    command.add_argument("--limit", type=_positive_int,
+                         help="maximum number of recordings to display")
+    command.set_defaults(handler=run)
+
+
+def run(args: Any) -> int:
+    if args.session_id is not None:
+        if args.include_archive or args.limit is not None:
+            raise ValueError("single-session status cannot use --include-archive or --limit")
+        require_local_session(args.session_id)
+    print(render_status(
+        include_archive=args.include_archive,
+        limit=args.limit,
+        session_id=args.session_id,
+    ), end="")
+    return 0
 
 
 def _parse_utc(value: str) -> datetime | None:

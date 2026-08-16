@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Claude native trace integration."""
+
+from __future__ import annotations
 
 import re
 from pathlib import Path

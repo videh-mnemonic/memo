@@ -1,3 +1,5 @@
+"""Capture stable filesystem snapshots and publish numbered recording steps."""
+
 from __future__ import annotations
 
 import os

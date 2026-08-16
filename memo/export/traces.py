@@ -1,3 +1,5 @@
+"""Export terminal and agent traces from recorded sessions."""
+
 from __future__ import annotations
 
 import json

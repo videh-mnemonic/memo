@@ -1,3 +1,5 @@
+"""Coordinate recording, trace collection, publication, and transport in the Memo daemon."""
+
 from __future__ import annotations
 
 import fcntl
@@ -23,9 +25,9 @@ from .protocol import (
 )
 from .registry import ActiveSession, AgentLaunch, Registry
 from ..recording.store import SessionStore
-from ..agents.collector import TraceCollector
+from ..agents.ingestion import TraceIngester
 from ..agents.harnesses import get_harness
-from ..agents.tracewatch import capture
+from ..agents.trace_files import capture
 
 
 STEP_INTERVAL_SECONDS = 15.0
@@ -51,7 +53,7 @@ class MemoDaemon:
             self.store,
             lambda session: self.streams.seal_session(session.session_id),
         )
-        self.collector = TraceCollector(self.store, self.registry)
+        self.trace_ingester = TraceIngester(self.store, self.registry)
         self.interval = STEP_INTERVAL_SECONDS if interval is None else interval
         self.socket_path = self.paths.socket
         self._stop = threading.Event()
@@ -90,7 +92,7 @@ class MemoDaemon:
 
     def _publish(self, session: DirectorySession):
         with self._session_lock(session.session_id):
-            self.collector.collect(session.session_id)
+            self.trace_ingester.ingest(session.session_id)
             return self.publisher.publish(session)
 
     def _ensure_worker(self, active: ActiveSession) -> None:

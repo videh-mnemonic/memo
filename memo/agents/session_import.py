@@ -1,3 +1,5 @@
+"""Discover native agent sessions and create or refresh standalone Memo recordings."""
+
 from __future__ import annotations
 
 import hashlib
@@ -13,7 +15,7 @@ from typing import Any
 
 from .harnesses import registered_harnesses
 from .harnesses.base import AgentHarness, SourceRecord, model_context, source_records
-from .tracewatch import files, snapshot_complete
+from .trace_files import files, snapshot_complete
 from ..recording.paths import StoragePaths
 from ..transport.config import S3Config
 from ..recording.models import DirectorySession, SessionOrigin, StepManifest

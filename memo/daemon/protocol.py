@@ -1,3 +1,5 @@
+"""Define and transport validated request and response messages over daemon IPC."""
+
 from __future__ import annotations
 
 import json

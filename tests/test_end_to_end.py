@@ -18,7 +18,7 @@ def test_removed_public_commands_are_not_registered() -> None:
 
 def test_default_and_path_invocations_launch_generic_relay(monkeypatch, tmp_path: Path) -> None:
     calls: list[Path] = []
-    monkeypatch.setattr("memo.cli.run_relay", lambda path: calls.append(path) or 7)
+    monkeypatch.setattr("memo.cli.app.run_relay", lambda path: calls.append(path) or 7)
     monkeypatch.chdir(tmp_path)
 
     assert main([]) == 7
@@ -35,7 +35,7 @@ def test_end_prefers_shell_session_identity(monkeypatch, tmp_path: Path, capsys)
         captured.update({"path": path, **values})
         return {"session_id": "session", "step": 2, "already_complete": False}
 
-    monkeypatch.setattr("memo.cli.end", fake_end)
+    monkeypatch.setattr("memo.cli.commands.end.end", fake_end)
     assert main(["end"]) == 0
     assert captured["path"] is None
     assert captured["session_id"] == "session"
@@ -45,7 +45,7 @@ def test_end_prefers_shell_session_identity(monkeypatch, tmp_path: Path, capsys)
 
 def test_end_decline_leaves_recording_unchanged(monkeypatch, capsys) -> None:
     calls = []
-    monkeypatch.setattr("memo.cli.end", lambda *args, **kwargs: calls.append(kwargs) or {
+    monkeypatch.setattr("memo.cli.commands.end.end", lambda *args, **kwargs: calls.append(kwargs) or {
         "confirmation_required": True, "session_id": "session",
         "revision": 4, "other_terminals": 2,
     })
@@ -57,16 +57,16 @@ def test_end_decline_leaves_recording_unchanged(monkeypatch, capsys) -> None:
 
 
 def test_public_push_and_pull_subcommands_route_results(tmp_path: Path, monkeypatch, capsys) -> None:
-    from memo import cli, transport
+    from memo.cli.commands import pull, push
 
-    monkeypatch.setattr(cli, "push", lambda session_id: {
+    monkeypatch.setattr(push, "push", lambda session_id: {
         "pushed": [session_id], "skipped": [], "failed": [],
     })
     assert main(["push", "session"]) == 0
     assert capsys.readouterr().out == "pushed: session\n"
 
     destination = StoragePaths(tmp_path / "home").archive / "session"
-    monkeypatch.setattr(transport, "pull_session", lambda session_id, force=False: destination)
+    monkeypatch.setattr(pull, "pull_session", lambda session_id, force=False: destination)
     assert main(["pull", "session", "--force"]) == 0
     assert capsys.readouterr().out == f"pulled: session path={destination}\n"
 
@@ -95,9 +95,9 @@ def test_tidy_imports_pushes_then_removes_archived(monkeypatch, capsys) -> None:
             "failed": [],
         }
 
-    monkeypatch.setattr("memo.agents.importer.import_native_sessions", fake_import)
-    monkeypatch.setattr("memo.cli.push", fake_push)
-    monkeypatch.setattr("memo.cli.remove_archived", fake_remove)
+    monkeypatch.setattr("memo.cli.commands.tidy.import_native_sessions", fake_import)
+    monkeypatch.setattr("memo.cli.commands.tidy.push", fake_push)
+    monkeypatch.setattr("memo.cli.commands.tidy.remove_archived", fake_remove)
 
     assert main(["tidy"]) == 1
     assert calls == ["import", ("push", None), ("remove", ["failed"])]
@@ -109,13 +109,15 @@ def test_tidy_imports_pushes_then_removes_archived(monkeypatch, capsys) -> None:
 
 def test_read_commands_ensure_session_is_local(monkeypatch, tmp_path: Path, capsys) -> None:
     calls: list[str] = []
-    monkeypatch.setattr("memo.cli._ensure_local_session", calls.append)
+    monkeypatch.setattr("memo.cli.commands.status.require_local_session", calls.append)
+    monkeypatch.setattr("memo.cli.commands.traces.require_local_session", calls.append)
+    monkeypatch.setattr("memo.cli.commands.replay.require_local_session", calls.append)
     monkeypatch.setattr(
-        "memo.cli.render_status",
+        "memo.cli.commands.status.render_status",
         lambda **kwargs: f"{kwargs['session_id']}\n",
     )
-    monkeypatch.setattr("memo.cli.trace_json", lambda session_id, *args, **kwargs: "[]\n")
-    monkeypatch.setattr("memo.cli.replay_session", lambda *args, **kwargs: tmp_path / "out")
+    monkeypatch.setattr("memo.cli.commands.traces.trace_json", lambda session_id, *args, **kwargs: "[]\n")
+    monkeypatch.setattr("memo.cli.commands.replay.replay_session", lambda *args, **kwargs: tmp_path / "out")
 
     assert main(["status", "one"]) == 0
     assert main(["traces", "two"]) == 0
@@ -127,7 +129,7 @@ def test_read_commands_ensure_session_is_local(monkeypatch, tmp_path: Path, caps
 def test_status_options_route_to_renderer(monkeypatch, capsys) -> None:
     captured = {}
     monkeypatch.setattr(
-        "memo.cli.render_status",
+        "memo.cli.commands.status.render_status",
         lambda **kwargs: captured.update(kwargs) or "status\n",
     )
 
@@ -138,7 +140,7 @@ def test_status_options_route_to_renderer(monkeypatch, capsys) -> None:
 
 def test_single_status_rejects_list_options_before_pull(monkeypatch, capsys) -> None:
     calls: list[str] = []
-    monkeypatch.setattr("memo.cli._ensure_local_session", calls.append)
+    monkeypatch.setattr("memo.cli.commands.status.require_local_session", calls.append)
 
     assert main(["status", "session", "--limit", "1"]) == 1
     assert calls == []
@@ -146,15 +148,15 @@ def test_single_status_rejects_list_options_before_pull(monkeypatch, capsys) -> 
 
 
 def test_traces_lists_terminal_ids(monkeypatch, capsys) -> None:
-    monkeypatch.setattr("memo.cli._ensure_local_session", lambda _session_id: None)
-    monkeypatch.setattr("memo.cli.terminal_ids", lambda _session_id: ["a", "z"])
+    monkeypatch.setattr("memo.cli.commands.traces.require_local_session", lambda _session_id: None)
+    monkeypatch.setattr("memo.cli.commands.traces.terminal_ids", lambda _session_id: ["a", "z"])
 
     assert main(["traces", "session", "--list-terminals"]) == 0
     assert capsys.readouterr().out == "a\nz\n"
 
 
 def test_terminal_listing_rejects_export_options(monkeypatch, capsys) -> None:
-    monkeypatch.setattr("memo.cli._ensure_local_session", lambda _session_id: None)
+    monkeypatch.setattr("memo.cli.commands.traces.require_local_session", lambda _session_id: None)
 
     assert main(["traces", "session", "--list-terminals", "--raw"]) == 1
     assert "cannot be combined" in capsys.readouterr().err
@@ -170,9 +172,9 @@ def test_end_prompts_for_scope_when_daemon_requests_it(monkeypatch, capsys) -> N
                     "other_terminals": 0}
         return {"session_id": "session", "step": 2, "already_complete": False}
 
-    monkeypatch.setattr("memo.cli.end", fake_end)
+    monkeypatch.setattr("memo.cli.commands.end.end", fake_end)
     monkeypatch.setattr("builtins.input", lambda _: "yes")
-    monkeypatch.setattr("memo.cli.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("memo.cli.commands.end.sys.stdin.isatty", lambda: True)
 
     assert main(["end", "."]) == 0
     assert calls[0]["prompt_scope"] is True

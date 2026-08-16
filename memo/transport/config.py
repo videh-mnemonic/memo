@@ -1,3 +1,5 @@
+"""Discover typed S3 transport settings from the environment."""
+
 from __future__ import annotations
 
 import os

@@ -1,3 +1,5 @@
+"""Apply Git-compatible ignore rules and Memo exclusions during snapshots."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

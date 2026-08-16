@@ -1,6 +1,6 @@
-from __future__ import annotations
+"""Discover, checkpoint, and safely snapshot native agent trace files."""
 
-"""Discover and safely snapshot growing native agent trace files."""
+from __future__ import annotations
 
 import json
 import os

@@ -1,3 +1,5 @@
+"""Persist active sessions, terminal attachments, capture windows, and agent launches."""
+
 from __future__ import annotations
 
 import sqlite3

@@ -1,3 +1,5 @@
+"""Restore recorded snapshots and optionally render captured prompts."""
+
 from __future__ import annotations
 
 import re

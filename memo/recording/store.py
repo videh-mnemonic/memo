@@ -1,3 +1,5 @@
+"""Persist session metadata, manifests, snapshots, and archived agent traces."""
+
 from __future__ import annotations
 
 import json

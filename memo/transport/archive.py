@@ -1,3 +1,5 @@
+"""Create, verify, and safely extract deterministic in-memory archives."""
+
 from __future__ import annotations
 
 import gzip

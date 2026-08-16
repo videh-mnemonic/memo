@@ -1,3 +1,5 @@
+"""Resolve and create filesystem locations for Memo archives and runtime state."""
+
 from __future__ import annotations
 
 import os

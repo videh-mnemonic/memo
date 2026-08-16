@@ -1,3 +1,5 @@
+"""Run a shell through a PTY while streaming its terminal activity to Memo."""
+
 from __future__ import annotations
 
 import base64

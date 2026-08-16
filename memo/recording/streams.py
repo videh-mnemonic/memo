@@ -1,3 +1,5 @@
+"""Durably spool, seal, recover, and merge captured terminal stream events."""
+
 from __future__ import annotations
 
 import base64

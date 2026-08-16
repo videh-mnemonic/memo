@@ -1,1 +1,1 @@
-"""Command handlers and presentation helpers."""
+"""Define arguments and execution handlers for Memo subcommands."""

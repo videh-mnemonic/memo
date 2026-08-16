@@ -6,7 +6,7 @@ from pathlib import Path
 from memo.recording.paths import StoragePaths
 from memo.agents.harnesses.claude import ClaudeHarness
 from memo.agents.harnesses.codex import CodexHarness
-from memo.agents.importer import import_native_sessions
+from memo.agents.session_import import import_native_sessions
 from memo.export import trace_json
 from memo.recording.store import SessionStore
 

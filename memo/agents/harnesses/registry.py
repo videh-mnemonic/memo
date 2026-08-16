@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Registered provider-specific agent trace harnesses."""
+
+from __future__ import annotations
 
 from .claude import ClaudeHarness
 from .codex import CodexHarness

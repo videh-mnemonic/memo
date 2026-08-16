@@ -1,3 +1,5 @@
+"""Intercept supported agent invocations and link their lifecycles to Memo sessions."""
+
 from __future__ import annotations
 
 import os

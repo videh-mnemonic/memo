@@ -1,3 +1,5 @@
+"""Package, publish, inspect, and restore Memo recordings through S3 storage."""
+
 from __future__ import annotations
 
 import hashlib

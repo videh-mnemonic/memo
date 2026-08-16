@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from memo.agents.collector import TraceCollector
+from memo.agents.ingestion import TraceIngester
 from memo.recording.paths import StoragePaths
 from memo.recording.models import DirectorySession, SessionOrigin
 from memo.daemon.registry import AgentLaunch, Registry
 from memo.recording.store import SessionStore
 from memo.agents.shim import ensure_shims, run as run_shim
-from memo.agents.tracewatch import TraceCheckpoint, capture, changed, snapshot_complete
+from memo.agents.trace_files import TraceCheckpoint, capture, changed, snapshot_complete
 
 
 def _record(session_id: str, cwd: Path, content: str) -> str:
@@ -47,7 +47,7 @@ def test_snapshot_stops_at_observed_complete_newline(tmp_path: Path) -> None:
     assert destination.read_bytes() == b'{"complete":true}\n'
 
 
-def test_collector_archives_all_matching_sessions_and_updates_resume(
+def test_ingester_archives_all_matching_sessions_and_updates_resume(
     tmp_path: Path, monkeypatch
 ) -> None:
     trace_root = tmp_path / "native"
@@ -88,8 +88,8 @@ def test_collector_archives_all_matching_sessions_and_updates_resume(
     second.write_text(_record("native-two", project, "second"))
     unrelated.write_text(_record("native-other", other, "ignore"))
 
-    collector = TraceCollector(store, registry)
-    assert len(collector.collect("memo-session")) == 2
+    ingester = TraceIngester(store, registry)
+    assert len(ingester.ingest("memo-session")) == 2
     run_files = sorted((store.session_path("memo-session") / "agents/runs").glob("*.json"))
     assert len(run_files) == 2
     assert {json.loads(path.read_text())["agent_session_id"] for path in run_files} == {
@@ -101,10 +101,10 @@ def test_collector_archives_all_matching_sessions_and_updates_resume(
 
     registry.finish_launch("one", "two", 0)
     registry.finish_launch("two", "two", 0)
-    collector.collect("memo-session")
+    ingester.ingest("memo-session")
     assert registry.windows("memo-session")
     first.write_text(first.read_text() + "}\n")
-    collector.collect("memo-session")
+    ingester.ingest("memo-session")
     assert registry.windows("memo-session") == []
     registry.create_window(
         "memo-session", "claude", str(project.resolve()), capture((trace_root,)).to_json()
@@ -114,7 +114,7 @@ def test_collector_archives_all_matching_sessions_and_updates_resume(
         ["claude", "--resume", "native-one"], "three",
     ))
     first.write_text(first.read_text() + _record("native-one", project, "resumed"))
-    collector.collect("memo-session")
+    ingester.ingest("memo-session")
     assert len(list((store.session_path("memo-session") / "agents/runs").glob("*.json"))) == 2
     metadata = next(
         json.loads(path.read_text()) for path in run_files

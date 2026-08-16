@@ -1,3 +1,5 @@
+"""Start the Memo daemon and expose request helpers for its operations."""
+
 from __future__ import annotations
 
 import os

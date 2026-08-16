@@ -1,3 +1,5 @@
+"""Ingest provider-native traces into active Memo recording windows."""
+
 from __future__ import annotations
 
 import json
@@ -7,7 +9,7 @@ from typing import Any
 
 from .harnesses import get_harness
 from .harnesses.base import model_context, source_records
-from .tracewatch import TraceCheckpoint, changed, snapshot_complete
+from .trace_files import TraceCheckpoint, changed, snapshot_complete
 from ..daemon.registry import CaptureWindow, Registry
 from ..recording.store import SessionStore, atomic_write
 
@@ -16,12 +18,12 @@ def _json_bytes(value: dict[str, object]) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
 
 
-class TraceCollector:
+class TraceIngester:
     def __init__(self, store: SessionStore, registry: Registry):
         self.store = store
         self.registry = registry
 
-    def collect(self, session_id: str) -> list[str]:
+    def ingest(self, session_id: str) -> list[str]:
         archived: list[str] = []
         for window in self.registry.windows(session_id):
             collected, pending = self._collect_window(window)

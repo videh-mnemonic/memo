@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Codex native trace integration."""
+
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Iterable, Sequence
