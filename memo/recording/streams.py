@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from ..config import StoragePaths
+from .paths import StoragePaths
 from .store import atomic_write
 
 if TYPE_CHECKING:

@@ -14,7 +14,8 @@ from typing import Any
 from .harnesses import registered_harnesses
 from .harnesses.base import AgentHarness, SourceRecord, model_context, source_records
 from .tracewatch import files, snapshot_complete
-from ..config import StoragePaths, TransportConfig
+from ..recording.paths import StoragePaths
+from ..transport.config import S3Config
 from ..recording.models import DirectorySession, SessionOrigin, StepManifest
 from ..recording.store import SessionStore, atomic_write, validate_session_id
 from ..recording.snapshots import utcnow
@@ -277,14 +278,14 @@ def _refresh(store: SessionStore, session_id: str, candidate: Candidate,
 
 
 def import_native_sessions(paths: StoragePaths | None = None, *,
-                           config: TransportConfig | None = None,
+                           config: S3Config | None = None,
                            client: Any | None = None) -> ImportSummary:
     paths = paths or StoragePaths.discover()
     store = SessionStore(paths)
     summary = ImportSummary()
     discovered = _discover(summary)
     known, session_ids = _local_runs(store)
-    config = config if config is not None else TransportConfig.discover()
+    config = config if config is not None else S3Config.discover()
     if config is not None:
         from ..transport import inspect_archived_agent_runs
 

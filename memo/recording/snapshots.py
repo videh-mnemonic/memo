@@ -7,10 +7,13 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..config import MAX_FILE_SIZE_BYTES, StoragePaths
+from .paths import StoragePaths
 from .ignore import IgnorePolicy
 from .models import DirectorySession, SnapshotEntry, StepManifest
 from .store import SessionStore
+
+
+MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
 
 
 def utcnow() -> str:

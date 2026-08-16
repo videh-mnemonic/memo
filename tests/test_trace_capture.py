@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from memo.agents.collector import TraceCollector
-from memo.config import StoragePaths
+from memo.recording.paths import StoragePaths
 from memo.recording.models import DirectorySession, SessionOrigin
 from memo.daemon.registry import AgentLaunch, Registry
 from memo.recording.store import SessionStore

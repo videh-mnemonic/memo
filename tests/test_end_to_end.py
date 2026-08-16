@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from memo.cli import main, parser
-from memo.config import StoragePaths
+from memo.recording.paths import StoragePaths
 
 
 def test_removed_public_commands_are_not_registered() -> None:

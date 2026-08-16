@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from ..config import StoragePaths
+from .paths import StoragePaths
 from .models import DirectorySession, StepManifest
 
 if TYPE_CHECKING:

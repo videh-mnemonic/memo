@@ -12,7 +12,7 @@ import tty
 from pathlib import Path
 from types import FrameType
 
-from ..config import StoragePaths
+from .paths import StoragePaths
 from ..daemon.client import attach
 from ..daemon.protocol import request
 from ..agents.shim import ensure_shims

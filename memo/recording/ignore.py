@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pathspec.gitignore import GitIgnoreSpec
 
-from ..config import StoragePaths
+from .paths import StoragePaths
 
 
 @dataclass(frozen=True)

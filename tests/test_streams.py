@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from memo.config import StoragePaths
+from memo.recording.paths import StoragePaths
 from memo.daemon.registry import Registry
 from memo.recording.streams import StreamStore, merged_timeline
 

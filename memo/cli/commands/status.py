@@ -4,7 +4,7 @@ import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ...config import StoragePaths
+from ...recording.paths import StoragePaths
 from ...recording.models import DirectorySession
 from ...daemon.registry import Registry
 from ...recording.store import SessionStore

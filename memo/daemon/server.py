@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import IO, Any
 
 from ..recording.snapshots import StepPublisher, utcnow
-from ..config import (PUSH_INTERVAL_SECONDS, STEP_INTERVAL_SECONDS,
-                      WATCHER_DEBOUNCE_SECONDS, StoragePaths, TransportConfig)
+from ..recording.paths import StoragePaths
+from ..transport.config import S3Config
 from ..recording.models import DirectorySession, SessionOrigin
 from .protocol import (
     DisconnectedError,
@@ -26,6 +26,11 @@ from ..recording.store import SessionStore
 from ..agents.collector import TraceCollector
 from ..agents.harnesses import get_harness
 from ..agents.tracewatch import capture
+
+
+STEP_INTERVAL_SECONDS = 15.0
+WATCHER_DEBOUNCE_SECONDS = 0.25
+PUSH_INTERVAL_SECONDS = 15 * 60.0
 
 
 class DaemonAlreadyRunning(RuntimeError):
@@ -261,7 +266,7 @@ class MemoDaemon:
             result = self._finish(active, capture_scope=selected_scope)
         # Local completion is authoritative. Cloud publication starts only after
         # lifecycle locks have been released and cannot delay or roll it back.
-        if TransportConfig.discover() is not None:
+        if S3Config.discover() is not None:
             self._schedule_push(active.session_id)
             result["cloud"] = "pending"
         return result
@@ -391,7 +396,7 @@ class MemoDaemon:
     def _push(self, payload: dict[str, Any]) -> dict[str, Any]:
         from ..transport import (PushSummary, prepare_generation,
                                  publish_generation)
-        config = TransportConfig.discover(required=True)
+        config = S3Config.discover(required=True)
         assert config is not None
         selected = payload.get("session_id")
         summary = PushSummary()
@@ -552,7 +557,7 @@ class MemoDaemon:
             os.chmod(self.socket_path, 0o600)
             for active in self.registry.list_active():
                 self._ensure_worker(active)
-            if TransportConfig.discover() is not None:
+            if S3Config.discover() is not None:
                 self._push_thread = threading.Thread(target=self._automatic_push_loop, daemon=True)
                 self._push_thread.start()
             while not self._stop.is_set():

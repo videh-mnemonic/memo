@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..config import StoragePaths
+from ..recording.paths import StoragePaths
 from .protocol import ProtocolError, request
 
 

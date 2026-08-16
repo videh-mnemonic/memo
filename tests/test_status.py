@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from memo.config import StoragePaths
+from memo.recording.paths import StoragePaths
 from memo.recording.models import DirectorySession, SessionOrigin
 from memo.daemon.registry import Registry
 from memo.recording.store import SessionStore, atomic_write

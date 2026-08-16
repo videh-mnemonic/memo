@@ -9,7 +9,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from ..config import StoragePaths
+from ..recording.paths import StoragePaths
 from ..daemon.client import ensure_daemon
 from .harnesses import get_harness, registered_harnesses
 from ..daemon.protocol import request

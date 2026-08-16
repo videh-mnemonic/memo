@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from memo.config import StoragePaths
+from memo.recording.paths import StoragePaths
 from memo.agents.harnesses.claude import ClaudeHarness
 from memo.agents.harnesses.codex import CodexHarness
 from memo.agents.importer import import_native_sessions

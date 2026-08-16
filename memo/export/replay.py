@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..config import StoragePaths
+from ..recording.paths import StoragePaths
 from ..recording.models import StepManifest
 from ..recording.store import SessionStore
 from ..recording.streams import StreamEvent

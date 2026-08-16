@@ -9,7 +9,7 @@ import termios
 import time
 from pathlib import Path
 
-from memo.config import StoragePaths
+from memo.recording.paths import StoragePaths
 from memo.daemon.protocol import request
 
 

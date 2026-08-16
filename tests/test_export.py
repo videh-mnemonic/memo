@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from memo.config import StoragePaths
+from memo.recording.paths import StoragePaths
 from memo.export import replay_session, terminal_ids, trace_json, write_traces
 from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.recording.store import SessionStore, atomic_write

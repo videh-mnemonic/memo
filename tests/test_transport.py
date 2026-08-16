@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 import zstandard
 
-from memo.config import StoragePaths, TransportConfig
+from memo.recording.paths import StoragePaths
+from memo.transport.config import S3Config
 from memo.export import replay_session
 from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.recording.store import SessionStore, atomic_write
@@ -149,7 +150,7 @@ def test_list_archived_session_ids_uses_index_and_filters_invalid_keys() -> None
     })
 
     assert list_archived_session_ids(
-        TransportConfig("bucket", "prefix"), client
+        S3Config("bucket", "prefix"), client
     ) == ["a", "b"]
 
 
@@ -164,7 +165,7 @@ def test_ensure_local_session_does_not_contact_archive_when_local(tmp_path: Path
     ))
 
     assert ensure_local_session(
-        "session", paths, TransportConfig("bucket", "prefix"), client=object()
+        "session", paths, S3Config("bucket", "prefix"), client=object()
     ) == local
 
 
@@ -173,7 +174,7 @@ def test_ensure_local_session_pulls_when_missing(tmp_path: Path) -> None:
     root.mkdir()
     source_store, session = _published(_paths(tmp_path / "source-home"), root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(source_store, session, config, client)
     destination_paths = _paths(tmp_path / "destination-home")
 
@@ -202,7 +203,7 @@ def test_remote_agent_inspection_streams_metadata_without_snapshot(tmp_path: Pat
     })
     atomic_write(metadata_path, (json.dumps(metadata) + "\n").encode())
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
 
     runs, session_ids = inspect_archived_agent_runs(session.origin, config, client)
@@ -227,7 +228,7 @@ def test_remote_agent_inspection_hashes_legacy_trace_without_snapshot(tmp_path: 
     metadata["agent_session_id"] = "legacy-native"
     atomic_write(metadata_path, (json.dumps(metadata) + "\n").encode())
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
 
     runs, _ = inspect_archived_agent_runs(session.origin, config, client)
@@ -345,7 +346,7 @@ def test_push_publishes_immutable_generation_index_and_completion_and_skips_unch
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     result = push_session(store, session, config, client)
     assert result["status"] == "pushed"
     generation = "prefix/user/host/sessions/session/generations/00000001.tar.zst"
@@ -411,7 +412,7 @@ def test_push_uses_multiple_fixed_size_multipart_parts(tmp_path: Path) -> None:
         _paths(tmp_path / "home"), root, content=os.urandom(MULTIPART_PART_SIZE + 1024)
     )
     client = FakeS3()
-    push_session(store, session, TransportConfig("bucket", "prefix"), client)
+    push_session(store, session, S3Config("bucket", "prefix"), client)
     upload = next(iter(client.uploads.values()))
     parts = upload["parts"]
     assert isinstance(parts, dict)
@@ -434,7 +435,7 @@ def test_multipart_failure_aborts_without_publication(
     client.fail_operation = failure
 
     with pytest.raises(OSError, match=message):
-        push_session(store, session, TransportConfig("bucket", "prefix"), client)
+        push_session(store, session, S3Config("bucket", "prefix"), client)
 
     assert client.aborted == {"upload-1"}
     assert not client.objects
@@ -448,7 +449,7 @@ def test_failed_completion_marker_does_not_advance_local_state(
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     completion = "prefix/user/host/sessions/session/completion.json"
     client.fail_key = completion
 
@@ -481,7 +482,7 @@ def test_push_failure_boundaries_preserve_local_state(
     client.fail_operation = failure
 
     with pytest.raises(OSError, match="injected"):
-        push_session(store, session, TransportConfig("bucket", "prefix"), client)
+        push_session(store, session, S3Config("bucket", "prefix"), client)
 
     assert store.load_session("session").last_pushed_step is None
     assert bool(client.aborted) is abort_expected
@@ -501,7 +502,7 @@ def test_abort_failure_preserves_part_upload_failure(tmp_path: Path) -> None:
 
     client.upload_part = fail_part_and_abort  # type: ignore[method-assign]
     with pytest.raises(OSError, match="part upload"):
-        push_session(store, session, TransportConfig("bucket", "prefix"), client)
+        push_session(store, session, S3Config("bucket", "prefix"), client)
     assert any(operation == "abort_multipart" for operation, _ in client.operations)
 
 
@@ -514,7 +515,7 @@ def test_index_failure_leaves_generation_but_not_local_state(tmp_path: Path) -> 
     client.fail_key = index
 
     with pytest.raises(OSError, match="injected"):
-        push_session(store, session, TransportConfig("bucket", "prefix"), client)
+        push_session(store, session, S3Config("bucket", "prefix"), client)
 
     assert any(key.endswith(".tar.zst") for key in client.objects)
     assert any(key.endswith(".sha256") for key in client.objects)
@@ -527,7 +528,7 @@ def test_retry_verifies_existing_objects_and_finishes_publication(tmp_path: Path
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     completion = "prefix/user/host/sessions/session/completion.json"
     client.fail_key = completion
     with pytest.raises(OSError, match="injected"):
@@ -548,7 +549,7 @@ def test_retry_recovers_generation_without_checksum(tmp_path: Path) -> None:
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     client.fail_operation = ("put_checksum", None)
     with pytest.raises(OSError, match="injected"):
         push_session(store, session, config, client)
@@ -571,7 +572,7 @@ def test_retry_rejects_existing_generation_with_different_content(tmp_path: Path
     client.objects[generation] = b"poisoned"
 
     with pytest.raises(ValueError, match="integrity conflict"):
-        push_session(store, session, TransportConfig("bucket", "prefix"), client)
+        push_session(store, session, S3Config("bucket", "prefix"), client)
 
     assert client.objects[generation] == b"poisoned"
     assert store.load_session("session").last_pushed_step is None
@@ -586,7 +587,7 @@ def test_retry_rejects_conflicting_write_once_index(tmp_path: Path) -> None:
     client.objects[index] = b'{"session_id":"someone-else"}'
 
     with pytest.raises(ValueError, match="integrity conflict"):
-        push_session(store, session, TransportConfig("bucket", "prefix"), client)
+        push_session(store, session, S3Config("bucket", "prefix"), client)
 
     assert client.objects[index] == b'{"session_id":"someone-else"}'
 
@@ -605,7 +606,7 @@ def test_retry_rejects_conflicting_checksum_or_completion(
     client.objects[conflict_key] = b"poisoned"
 
     with pytest.raises(ValueError, match="integrity conflict"):
-        push_session(store, session, TransportConfig("bucket", "prefix"), client)
+        push_session(store, session, S3Config("bucket", "prefix"), client)
 
     assert client.objects[conflict_key] == b"poisoned"
     assert store.load_session("session").last_pushed_step is None
@@ -616,7 +617,7 @@ def test_pull_preserves_historical_replay_and_manifest_bounded_prompts(tmp_path:
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
 
     clean_paths = _paths(tmp_path / "clean-home")
@@ -650,7 +651,7 @@ def test_active_session_pull_uses_highest_complete_generation(tmp_path: Path) ->
     session.capture_scope = "agent-only"
     store.update_session(session)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
 
     assert "prefix/user/host/sessions/session/completion.json" not in client.objects
@@ -665,7 +666,7 @@ def test_completion_marker_pins_pull_to_final_generation(tmp_path: Path) -> None
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
     base = "prefix/user/host/sessions/session/generations/"
     client.objects[f"{base}00000099.tar.zst"] = client.objects[f"{base}00000001.tar.zst"]
@@ -685,7 +686,7 @@ def test_pull_paginates_generation_listing(tmp_path: Path) -> None:
     session.state = "active"
     store.update_session(session)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
     original_list = client.list_objects_v2
 
@@ -709,7 +710,7 @@ def test_pull_verifies_checksum_and_remote_history_before_install(tmp_path: Path
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
     completion_key = "prefix/user/host/sessions/session/completion.json"
     completion = json.loads(client.objects[completion_key])
@@ -751,7 +752,7 @@ def test_atomic_install_failure_restores_existing_session(tmp_path: Path, monkey
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
     paths = _paths(tmp_path / "home")
     destination = paths.archive / "session"
@@ -778,7 +779,7 @@ def test_pull_streams_bounded_reads_and_closes_all_response_bodies(tmp_path: Pat
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
 
     pull_session("session", _paths(tmp_path / "clean-home"), config, client=client)
@@ -802,7 +803,7 @@ def test_pull_closes_metadata_body_when_sidecar_disagrees(tmp_path: Path) -> Non
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
     completion = json.loads(
         client.objects["prefix/user/host/sessions/session/completion.json"]
@@ -835,7 +836,7 @@ def test_pull_rejects_invalid_index_before_package_request(
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
     index_key = "prefix/index/sessions/session.json"
     index = json.loads(client.objects[index_key])
@@ -854,7 +855,7 @@ def test_pull_malformed_package_closes_body_and_removes_staging(tmp_path: Path) 
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
     completion_key = "prefix/user/host/sessions/session/completion.json"
     completion = json.loads(client.objects[completion_key])
@@ -922,7 +923,7 @@ def test_pull_rejects_malicious_members_and_removes_staging(
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
     _replace_remote_package(client, _tar_zst(members))
     destination_paths = _paths(tmp_path / "clean-home")
@@ -942,7 +943,7 @@ def test_large_package_has_bounded_parts_reads_and_memory(tmp_path: Path) -> Non
     content = os.urandom(MULTIPART_PART_SIZE * 2 + 1024 * 1024)
     store, session = _published(_paths(tmp_path / "source-home"), root, content=content)
     client = FakeS3()
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
 
     tracemalloc.start()
     push_session(store, session, config, client)
@@ -974,7 +975,7 @@ def test_origin_values_are_encoded_and_preserved_across_pull_and_repush(tmp_path
     store, session = _published(source_paths, root)
     session.origin = SessionOrigin("1.0.0", "user/name", "host name")
     store.update_session(session)
-    config = TransportConfig("bucket", "prefix")
+    config = S3Config("bucket", "prefix")
     client = FakeS3()
 
     push_session(store, session, config, client)

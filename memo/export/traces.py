@@ -5,7 +5,7 @@ from pathlib import Path
 
 from ..agents.harnesses import get_harness
 from ..agents.harnesses.base import source_records, trace_events
-from ..config import StoragePaths
+from ..recording.paths import StoragePaths
 from ..recording.store import SessionStore
 from ..recording.streams import StreamEvent
 

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from memo.config import StoragePaths
+from memo.recording.paths import StoragePaths
 from memo.recording.ignore import IgnorePolicy
 
 

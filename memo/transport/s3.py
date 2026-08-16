@@ -15,16 +15,24 @@ from urllib.parse import quote
 
 import zstandard
 
-from ..config import StoragePaths, TransportConfig
+from ..recording.paths import StoragePaths
 from ..recording.models import DirectorySession, SessionOrigin, StepManifest
 from ..recording.store import (SessionNotFoundError, SessionStore, atomic_write,
                                validate_session_id)
 from .archive import deterministic_archive, digest_bytes
+from .config import S3Config
 
 
 MULTIPART_PART_SIZE = 8 * 1024 * 1024
 METADATA_SIZE_LIMIT = 1024 * 1024
 STREAM_READ_SIZE = 64 * 1024
+
+
+def _s3_client(config: S3Config) -> Any:
+    import boto3
+
+    session = boto3.Session(profile_name=config.profile, region_name=config.region)
+    return session.client("s3", endpoint_url=config.endpoint_url)
 
 
 class HashingWriter:
@@ -328,7 +336,7 @@ def _is_not_found(error: BaseException) -> bool:
     }
 
 
-def _get_optional(client: Any, config: TransportConfig, key: str) -> bytes | None:
+def _get_optional(client: Any, config: S3Config, key: str) -> bytes | None:
     try:
         return _bounded_body(client.get_object(Bucket=config.bucket, Key=key))
     except Exception as error:
@@ -337,7 +345,7 @@ def _get_optional(client: Any, config: TransportConfig, key: str) -> bytes | Non
         raise
 
 
-def _put_immutable(client: Any, config: TransportConfig, key: str, value: bytes) -> None:
+def _put_immutable(client: Any, config: S3Config, key: str, value: bytes) -> None:
     try:
         client.put_object(
             Bucket=config.bucket, Key=key, Body=value, IfNoneMatch="*"
@@ -350,7 +358,7 @@ def _put_immutable(client: Any, config: TransportConfig, key: str, value: bytes)
             raise ValueError(f"remote integrity conflict for {key}") from error
 
 
-def _remote_digest(client: Any, config: TransportConfig, key: str) -> str:
+def _remote_digest(client: Any, config: S3Config, key: str) -> str:
     response = client.get_object(Bucket=config.bucket, Key=key)
     body = response["Body"]
     hashing = hashlib.sha256()
@@ -367,7 +375,7 @@ def _remote_digest(client: Any, config: TransportConfig, key: str) -> str:
     return hashing.hexdigest()
 
 
-def _upload_generation(client: Any, config: TransportConfig,
+def _upload_generation(client: Any, config: S3Config,
                        prepared: PreparedGeneration, key: str) -> None:
     response = client.create_multipart_upload(Bucket=config.bucket, Key=key)
     upload_id = response["UploadId"]
@@ -408,7 +416,7 @@ class PushSummary:
     failed: list[tuple[str, str]] = field(default_factory=list)
 
 
-def _key(config: TransportConfig, *parts: object) -> str:
+def _key(config: S3Config, *parts: object) -> str:
     suffix = "/".join(str(part).strip("/") for part in parts)
     return f"{config.prefix}/{suffix}" if config.prefix else suffix
 
@@ -418,9 +426,9 @@ def _component(value: str) -> str:
 
 
 def publish_generation(store: SessionStore, session: DirectorySession,
-                       prepared: PreparedGeneration, config: TransportConfig,
+                       prepared: PreparedGeneration, config: S3Config,
                        client: Any | None = None, *, update_local: bool = True) -> dict[str, object]:
-    client = client or config.client()
+    client = client or _s3_client(config)
     base = _key(config, _component(session.origin.username),
                 _component(session.origin.hostname), "sessions", session.session_id)
     generation = f"{base}/generations/{prepared.step:08d}.tar.zst"
@@ -456,7 +464,7 @@ def publish_generation(store: SessionStore, session: DirectorySession,
             "digest": prepared.digest, "object": generation, "status": "pushed"}
 
 
-def push_session(store: SessionStore, session: DirectorySession, config: TransportConfig,
+def push_session(store: SessionStore, session: DirectorySession, config: S3Config,
                  client: Any | None = None) -> dict[str, object]:
     manifest = store.head(session.session_id)
     if manifest is None:
@@ -504,7 +512,7 @@ def _validate_index(index: object, session_id: str) -> dict[str, str]:
     return index  # type: ignore[return-value]
 
 
-def _list_generation_pairs(client: Any, config: TransportConfig,
+def _list_generation_pairs(client: Any, config: S3Config,
                            prefix: str) -> dict[int, tuple[str, str]]:
     package_pattern = re.compile(rf"^{re.escape(prefix)}(\d{{8,}})\.tar\.zst$")
     checksum_pattern = re.compile(rf"^{re.escape(prefix)}(\d{{8,}})\.sha256$")
@@ -543,12 +551,12 @@ def _valid_digest(value: object) -> bool:
             and all(character in "0123456789abcdef" for character in value))
 
 
-def list_archived_session_ids(config: TransportConfig | None = None,
+def list_archived_session_ids(config: S3Config | None = None,
                               client: Any | None = None) -> list[str]:
     """List session IDs advertised by the remote archive index."""
-    config = config or TransportConfig.discover(required=True)
+    config = config or S3Config.discover(required=True)
     assert config is not None
-    client = client or config.client()
+    client = client or _s3_client(config)
     prefix = _key(config, "index", "sessions") + "/"
     suffix = ".json"
     session_ids: set[str] = set()
@@ -578,7 +586,7 @@ def list_archived_session_ids(config: TransportConfig | None = None,
     return sorted(session_ids)
 
 
-def _same_origin_remote_session_ids(origin: SessionOrigin, config: TransportConfig,
+def _same_origin_remote_session_ids(origin: SessionOrigin, config: S3Config,
                                     client: Any) -> list[str]:
     prefix = _key(
         config, _component(origin.username), _component(origin.hostname), "sessions",
@@ -608,7 +616,7 @@ def _same_origin_remote_session_ids(origin: SessionOrigin, config: TransportConf
     return sorted(session_ids)
 
 
-def _stream_agent_run_metadata(client: Any, config: TransportConfig,
+def _stream_agent_run_metadata(client: Any, config: S3Config,
                                generation: str) -> list[dict[str, Any]]:
     """Read run metadata, and legacy trace digests when needed, from an archive prefix."""
     response = client.get_object(Bucket=config.bucket, Key=generation)
@@ -666,13 +674,13 @@ def _stream_agent_run_metadata(client: Any, config: TransportConfig,
     return result
 
 
-def inspect_archived_agent_runs(origin: SessionOrigin, config: TransportConfig | None = None,
+def inspect_archived_agent_runs(origin: SessionOrigin, config: S3Config | None = None,
                                 client: Any | None = None
                                 ) -> tuple[list[dict[str, object]], set[str]]:
     """Inspect same-origin agent metadata without downloading filesystem snapshots."""
-    config = config or TransportConfig.discover(required=True)
+    config = config or S3Config.discover(required=True)
     assert config is not None
-    client = client or config.client()
+    client = client or _s3_client(config)
     session_ids = set(_same_origin_remote_session_ids(origin, config, client))
     runs: list[dict[str, object]] = []
     for session_id in sorted(session_ids):
@@ -720,7 +728,7 @@ def inspect_archived_agent_runs(origin: SessionOrigin, config: TransportConfig |
 
 
 def ensure_local_session(session_id: str, paths: StoragePaths | None = None,
-                         config: TransportConfig | None = None,
+                         config: S3Config | None = None,
                          client: Any | None = None) -> Path:
     """Return a local session, pulling it from the archive when absent."""
     session_id = validate_session_id(session_id)
@@ -734,13 +742,13 @@ def ensure_local_session(session_id: str, paths: StoragePaths | None = None,
 
 
 def pull_session(session_id: str, paths: StoragePaths | None = None,
-                 config: TransportConfig | None = None, force: bool = False,
+                 config: S3Config | None = None, force: bool = False,
                  client: Any | None = None) -> Path:
     session_id = validate_session_id(session_id)
     paths = paths or StoragePaths.discover()
-    config = config or TransportConfig.discover(required=True)
+    config = config or S3Config.discover(required=True)
     assert config is not None
-    client = client or config.client()
+    client = client or _s3_client(config)
     index_key = _key(config, "index", "sessions", f"{session_id}.json")
     try:
         index_data = _bounded_body(client.get_object(Bucket=config.bucket, Key=index_key))

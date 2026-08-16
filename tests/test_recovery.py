@@ -3,7 +3,7 @@ import json
 import struct
 from pathlib import Path
 
-from memo.config import StoragePaths
+from memo.recording.paths import StoragePaths
 from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.daemon.registry import Registry
 from memo.recording.store import SessionStore

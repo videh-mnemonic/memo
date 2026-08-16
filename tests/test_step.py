@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from memo.config import StoragePaths
+from memo.recording.paths import StoragePaths
 from memo.recording.snapshots import scan_tree
 
 

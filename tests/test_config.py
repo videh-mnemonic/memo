@@ -1,8 +1,10 @@
 from pathlib import Path
 
-from memo.config import (MAX_FILE_SIZE_BYTES, PUSH_INTERVAL_SECONDS,
-                         STEP_INTERVAL_SECONDS, WATCHER_DEBOUNCE_SECONDS,
-                         StoragePaths, TransportConfig)
+from memo.daemon.server import (PUSH_INTERVAL_SECONDS, STEP_INTERVAL_SECONDS,
+                                WATCHER_DEBOUNCE_SECONDS)
+from memo.recording.paths import StoragePaths
+from memo.recording.snapshots import MAX_FILE_SIZE_BYTES
+from memo.transport.config import S3Config
 
 
 def test_paths_discovery_uses_only_memo_home(monkeypatch, tmp_path: Path) -> None:
@@ -24,7 +26,7 @@ def test_transport_discovery_uses_retained_environment_surface(monkeypatch) -> N
     monkeypatch.setenv("MEMO_S3_REGION", "region")
     monkeypatch.setenv("MEMO_S3_PROFILE", "profile")
 
-    assert TransportConfig.discover() == TransportConfig(
+    assert S3Config.discover() == S3Config(
         "bucket", "prefix", "http://localhost:9000", "region", "profile"
     )
 
