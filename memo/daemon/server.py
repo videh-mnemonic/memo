@@ -141,7 +141,15 @@ class MemoDaemon:
                     return
                 request_event.clear()
             try:
-                self._publish(self._session_model(active))
+                # The session can begin (and finish) ending after the lookup above.
+                # Recheck it while holding the same lock used by finalization so a
+                # worker that was already queued cannot publish a stale step after
+                # the recording has been completed and removed from the registry.
+                with self._session_lock(active.session_id):
+                    current = self.registry.lookup_session(active.session_id)
+                    if current is None or current.state != "active":
+                        return
+                    self._publish(self._session_model(current))
             except Exception as error:
                 print(f"memo daemon: step failed for {active.session_id}: {error}", file=sys.stderr)
             deadline = time.monotonic() + self.interval

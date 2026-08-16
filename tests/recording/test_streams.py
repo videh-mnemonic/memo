@@ -58,6 +58,50 @@ def test_sealing_is_immutable_and_reports_high_water(tmp_path: Path) -> None:
         registry.close()
 
 
+def test_sealing_refreshes_sequence_after_concurrent_append(tmp_path: Path, monkeypatch) -> None:
+    store, registry, terminal_id = _store(tmp_path)
+    try:
+        session = tmp_path / "home" / "archive" / "session"
+        (session / "streams" / "terminals").mkdir(parents=True)
+        store.append("session", terminal_id, [_event(1, b"one")], 10)
+
+        listed = threading.Event()
+        continue_sealing = threading.Event()
+        original = registry.list_attachments
+
+        def paused_list(session_id: str):
+            attachments = original(session_id)
+            listed.set()
+            assert continue_sealing.wait(2)
+            return attachments
+
+        monkeypatch.setattr(registry, "list_attachments", paused_list)
+        result: dict[str, int] = {}
+
+        def seal() -> None:
+            result.update(store.seal_session("session"))
+
+        sealing = threading.Thread(target=seal)
+        sealing.start()
+        assert listed.wait(2)
+        store.append("session", terminal_id, [_event(2, b"two")], 20)
+        continue_sealing.set()
+        sealing.join(2)
+        assert not sealing.is_alive()
+
+        assert result == {terminal_id: 2}
+        metadata_path = session / "streams" / "terminals" / terminal_id / "stream.json"
+        metadata = json.loads(metadata_path.read_text())
+        assert metadata["highest_sequence"] == 2
+        assert metadata["chunks"] == ["chunks/00000001-00000002.jsonl.gz"]
+        assert [
+            event.sequence
+            for event in merged_timeline(metadata_path.parent / item for item in metadata["chunks"])
+        ] == [1, 2]
+    finally:
+        registry.close()
+
+
 def test_merged_timeline_has_stable_tie_breakers(tmp_path: Path) -> None:
     store, registry, terminal_id = _store(tmp_path)
     try:

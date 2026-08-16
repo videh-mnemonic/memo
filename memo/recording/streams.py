@@ -193,6 +193,12 @@ class StreamStore:
         high_water: dict[str, int] = {}
         for attachment in self.registry.list_attachments(session_id):
             with self._lock(attachment.terminal_id):
+                # list_attachments() runs before the stream lock is acquired. An
+                # append may advance the accepted sequence in between, so refresh
+                # the row under the lock before deciding the chunk boundary.
+                current = self.registry.attachment(attachment.terminal_id)
+                if current is None or current.session_id != session_id:
+                    continue
                 events = self.events(session_id, attachment.terminal_id)
                 if not events:
                     high_water[attachment.terminal_id] = 0
@@ -212,12 +218,12 @@ class StreamStore:
                     }
                 )
                 previous = int(metadata["highest_sequence"])
-                if previous > attachment.accepted_sequence:
+                if previous > current.accepted_sequence:
                     raise ValueError(
                         f"stream metadata exceeds durable spool: {attachment.terminal_id}"
                     )
                 new_events = [event for event in events if event.sequence > previous]
-                end = attachment.accepted_sequence
+                end = current.accepted_sequence
                 if new_events:
                     chunk_id = f"{new_events[0].sequence:08d}-{end:08d}"
                     chunk = chunks / f"{chunk_id}.jsonl.gz"

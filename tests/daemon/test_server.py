@@ -145,6 +145,75 @@ def test_concurrent_streams_are_drained_by_end(tmp_path: Path) -> None:
         _stop(paths, thread)
 
 
+def test_queued_worker_cannot_publish_after_end(tmp_path: Path, monkeypatch) -> None:
+    paths, root, daemon, thread = _running(tmp_path, interval=60)
+    try:
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        request(
+            str(paths.socket),
+            "events",
+            {
+                "terminal_id": attached["terminal_id"],
+                "events": [
+                    {
+                        "sequence": 1,
+                        "direction": "output",
+                        "data": base64.b64encode(b"kept").decode(),
+                    }
+                ],
+            },
+        )
+
+        worker = daemon._workers[str(attached["session_id"])]
+        worker_paused = threading.Event()
+        release_worker = threading.Event()
+        worker_done = threading.Event()
+        original_publish = daemon._publish
+
+        def pause_worker_publish(session):
+            if threading.current_thread() is worker:
+                worker_paused.set()
+                assert release_worker.wait(2)
+            try:
+                return original_publish(session)
+            finally:
+                if threading.current_thread() is worker:
+                    worker_done.set()
+
+        monkeypatch.setattr(daemon, "_publish", pause_worker_publish)
+        daemon._step_requests[str(attached["session_id"])].set()
+        assert worker_paused.wait(2)
+
+        result: dict[str, object] = {}
+
+        def end() -> None:
+            result.update(
+                request(
+                    str(paths.socket),
+                    "end",
+                    {
+                        "session_id": attached["session_id"],
+                        "terminal_id": attached["terminal_id"],
+                    },
+                )
+            )
+
+        ending = threading.Thread(target=end)
+        ending.start()
+        time.sleep(0.05)
+        release_worker.set()
+        ending.join(3)
+        assert not ending.is_alive()
+        assert worker_done.wait(2)
+        assert result["state"] == "complete"
+
+        manifest = SessionStore(paths).head(str(attached["session_id"]))
+        assert manifest is not None
+        assert manifest.stream_high_water == {attached["terminal_id"]: 1}
+    finally:
+        _stop(paths, thread)
+
+
 def test_end_scope_is_selected_before_completion(tmp_path: Path) -> None:
     paths, root, _, thread = _running(tmp_path)
     try:
