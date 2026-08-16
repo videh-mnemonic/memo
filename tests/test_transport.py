@@ -20,6 +20,8 @@ from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepMani
 from memo.session_store import SessionStore, atomic_write
 from memo.streams import StreamEvent
 from memo.transport import (MULTIPART_PART_SIZE, MultipartUploadWriter,
+                            ensure_local_session, inspect_archived_agent_runs,
+                            list_archived_session_ids,
                             package_history, pull_session, push_session,
                             safe_extract_bytes)
 
@@ -30,12 +32,15 @@ class TrackingBody(io.BytesIO):
         self.max_chunk = max_chunk
         self.read_sizes: list[int] = []
         self.was_closed = False
+        self.bytes_read = 0
 
     def read(self, size: int = -1) -> bytes:
         if size < 0:
             raise AssertionError("unbounded response body read")
         self.read_sizes.append(size)
-        return super().read(min(size, self.max_chunk))
+        value = super().read(min(size, self.max_chunk))
+        self.bytes_read += len(value)
+        return value
 
     def close(self) -> None:
         self.was_closed = True
@@ -131,6 +136,108 @@ class FakeS3:
 
 def _paths(root: Path) -> Paths:
     return Paths(root)
+
+
+def test_list_archived_session_ids_uses_index_and_filters_invalid_keys() -> None:
+    client = FakeS3()
+    client.objects.update({
+        "prefix/index/sessions/b.json": b"{}",
+        "prefix/index/sessions/a.json": b"{}",
+        "prefix/index/sessions/nested/session.json": b"{}",
+        "prefix/index/sessions/readme.txt": b"",
+        "prefix/unrelated.json": b"{}",
+    })
+
+    assert list_archived_session_ids(
+        TransportConfig("bucket", "prefix"), client
+    ) == ["a", "b"]
+
+
+def test_ensure_local_session_does_not_contact_archive_when_local(tmp_path: Path) -> None:
+    paths = _paths(tmp_path / "home")
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(paths)
+    local = store.create(DirectorySession(
+        "session", str(root.resolve()), "now", "now",
+        SessionOrigin("1.0.0", "user", "host"), "complete",
+    ))
+
+    assert ensure_local_session(
+        "session", paths, TransportConfig("bucket", "prefix"), client=object()
+    ) == local
+
+
+def test_ensure_local_session_pulls_when_missing(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    source_store, session = _published(_paths(tmp_path / "source-home"), root)
+    client = FakeS3()
+    config = TransportConfig("bucket", "prefix")
+    push_session(source_store, session, config, client)
+    destination_paths = _paths(tmp_path / "destination-home")
+
+    destination = ensure_local_session(
+        "session", destination_paths, config, client=client
+    )
+
+    assert destination == destination_paths.archive / "session"
+    assert SessionStore(destination_paths).load_session("session").session_id == "session"
+
+
+def test_remote_agent_inspection_streams_metadata_without_snapshot(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    store, session = _published(
+        _paths(tmp_path / "source-home"), root, content=os.urandom(2 * 1024 * 1024),
+    )
+    session_path = store.session_path("session")
+    trace = session_path / "agents/traces/run.jsonl"
+    metadata_path = session_path / "agents/runs/run.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update({
+        "agent_session_id": "native-session",
+        "trace_complete_size": trace.stat().st_size,
+        "trace_digest": hashlib.sha256(trace.read_bytes()).hexdigest(),
+    })
+    atomic_write(metadata_path, (json.dumps(metadata) + "\n").encode())
+    client = FakeS3()
+    config = TransportConfig("bucket", "prefix")
+    push_session(store, session, config, client)
+
+    runs, session_ids = inspect_archived_agent_runs(session.origin, config, client)
+
+    assert session_ids == {"session"}
+    assert runs[0]["native_id"] == "native-session"
+    generation, body = next(
+        item for item in client.response_bodies if item[0].endswith(".tar.zst")
+    )
+    assert body.was_closed
+    assert body.bytes_read < len(client.objects[generation])
+
+
+def test_remote_agent_inspection_hashes_legacy_trace_without_snapshot(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    store, session = _published(
+        _paths(tmp_path / "source-home"), root, content=os.urandom(2 * 1024 * 1024),
+    )
+    metadata_path = store.session_path("session") / "agents/runs/run.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["agent_session_id"] = "legacy-native"
+    atomic_write(metadata_path, (json.dumps(metadata) + "\n").encode())
+    client = FakeS3()
+    config = TransportConfig("bucket", "prefix")
+    push_session(store, session, config, client)
+
+    runs, _ = inspect_archived_agent_runs(session.origin, config, client)
+
+    assert runs[0]["native_id"] == "legacy-native"
+    assert runs[0]["complete_size"] > 0
+    generation, body = next(
+        item for item in client.response_bodies if item[0].endswith(".tar.zst")
+    )
+    assert body.bytes_read < len(client.objects[generation])
 
 
 def _write_stream(session_path: Path) -> None:
@@ -540,6 +647,7 @@ def test_active_session_pull_uses_highest_complete_generation(tmp_path: Path) ->
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     session.state = "active"
+    session.capture_scope = "agent-only"
     store.update_session(session)
     client = FakeS3()
     config = TransportConfig("bucket", "prefix")

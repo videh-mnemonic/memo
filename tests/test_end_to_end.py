@@ -67,3 +67,49 @@ def test_public_push_and_pull_subcommands_route_results(tmp_path: Path, monkeypa
     monkeypatch.setattr(transport, "pull_session", lambda session_id, force=False: destination)
     assert main(["pull", "session", "--force"]) == 0
     assert capsys.readouterr().out == f"pulled: session path={destination}\n"
+
+
+def test_read_commands_ensure_session_is_local(monkeypatch, tmp_path: Path, capsys) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr("memo.cli._ensure_local_session", calls.append)
+    monkeypatch.setattr("memo.cli.inspect_session", lambda session_id: f"{session_id}\n")
+    monkeypatch.setattr("memo.cli.trace_json", lambda session_id, *args, **kwargs: "[]\n")
+    monkeypatch.setattr("memo.cli.replay_session", lambda *args, **kwargs: tmp_path / "out")
+
+    assert main(["inspect", "one"]) == 0
+    assert main(["traces", "two"]) == 0
+    assert main(["replay", "three", "-1", str(tmp_path / "out")]) == 0
+    assert calls == ["one", "two", "three"]
+    capsys.readouterr()
+
+
+def test_status_options_route_to_renderer(monkeypatch, capsys) -> None:
+    captured = {}
+    monkeypatch.setattr(
+        "memo.cli.render_status",
+        lambda **kwargs: captured.update(kwargs) or "status\n",
+    )
+
+    assert main(["status", "--include-archive", "--limit", "7"]) == 0
+    assert captured == {"include_archive": True, "limit": 7}
+    assert capsys.readouterr().out == "status\n"
+
+
+def test_end_prompts_for_scope_when_daemon_requests_it(monkeypatch, capsys) -> None:
+    calls = []
+
+    def fake_end(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"scope_confirmation_required": True, "revision": 1,
+                    "other_terminals": 0}
+        return {"session_id": "session", "step": 2, "already_complete": False}
+
+    monkeypatch.setattr("memo.cli.end", fake_end)
+    monkeypatch.setattr("builtins.input", lambda _: "yes")
+    monkeypatch.setattr("memo.cli.sys.stdin.isatty", lambda: True)
+
+    assert main(["end", "."]) == 0
+    assert calls[0]["prompt_scope"] is True
+    assert calls[1]["capture_scope"] == "full"
+    assert "completed: session" in capsys.readouterr().out

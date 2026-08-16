@@ -99,6 +99,8 @@ When another terminal ends a recording, affected Memo shells terminate cleanly w
 
 A recording ends only through `memo end` or by choosing Start new when it has no attached terminals. Exiting every shell is not enough.
 
+New recordings have a `partial` capture scope. Interactive `memo end` asks whether Memo captured all intended work; confirming marks the completed recording `full`, while declining keeps it `partial`. Scripts can choose explicitly with `memo end --scope full` or `memo end --scope partial`. Memo never infers full coverage from terminal count or other activity.
+
 ## What a step means
 
 Memo periodically publishes numbered steps, beginning with step `0`. A step is a consistent, durable boundary containing:
@@ -158,7 +160,13 @@ List local recordings:
 
 ```console
 memo status
+memo status --limit 10
+memo status --include-archive --limit 25
 ```
+
+Status shows each recording's root, lifecycle state, capture scope, age, latest local activity, attached terminal count, local step count, local archive size, and cloud archive progress. Times are compact and relative; `STEPS` is a human-oriented count even though replay selectors remain zero-based. `ARCHIVED` is also count-based: `13/15` means the cloud contains history through 13 of 15 local steps, while `—` means the recording has never been uploaded.
+
+By default, status lists local recordings. `--include-archive` appends remote-only recordings after the local recordings and avoids duplicate session IDs. `--limit` caps the combined number of rows. Metadata unavailable without downloading an archive is shown as `—`.
 
 Inspect the latest published state and discover its terminal IDs:
 
@@ -184,6 +192,18 @@ $MEMO_HOME/archive/<session-id>/
 
 Each `session.json` records the Memo version, username, and hostname from the computer that originally created the recording. That origin does not change when another computer pulls or re-uploads it.
 
+## Recover native agent sessions
+
+Recover Claude and Codex logs that Memo did not capture:
+
+```console
+memo import
+```
+
+The command scans both providers, checks local recordings and same-origin cloud recordings, and imports every uncovered native session. Imported sessions use the native ID as their Memo ID and have `agent-only` scope. They contain the native trace but no terminal or filesystem history, so `memo traces` works while `memo replay` refuses them.
+
+Claude and Codex sessions may be resumed later, so agent-only sessions remain active and refreshable. Running `memo import` again skips unchanged traces and adds a step when a native log has grown. Divergent or ambiguous logs are reported without overwriting archived data.
+
 ## Export traces
 
 Export traces from the latest published step to standard output:
@@ -191,6 +211,8 @@ Export traces from the latest published step to standard output:
 ```console
 memo traces <session-id>
 ```
+
+`inspect`, `traces`, and `replay` automatically pull a session from the configured cloud archive when it is not already available locally.
 
 Write them to a file:
 

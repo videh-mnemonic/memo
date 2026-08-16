@@ -248,7 +248,19 @@ class MemoDaemon:
             if others and (not payload.get("confirmed") or expected is None):
                 return {"confirmation_required": True, "session_id": active.session_id,
                         "revision": active.revision, "other_terminals": len(others)}
-            result = self._finish(active)
+            session = self.store.load_session(active.session_id)
+            selected_scope = payload.get("capture_scope")
+            if selected_scope is not None and selected_scope not in {"partial", "full"}:
+                raise ProtocolError("end capture scope must be partial or full")
+            if (session.capture_scope == "partial" and selected_scope is None
+                    and payload.get("prompt_scope")):
+                return {
+                    "scope_confirmation_required": True,
+                    "session_id": active.session_id,
+                    "revision": active.revision,
+                    "other_terminals": len(others),
+                }
+            result = self._finish(active, capture_scope=selected_scope)
         # Local completion is authoritative. Cloud publication starts only after
         # lifecycle locks have been released and cannot delay or roll it back.
         if TransportConfig.discover() is not None:
@@ -274,11 +286,13 @@ class MemoDaemon:
 
         threading.Thread(target=upload, daemon=True).start()
 
-    def _finish(self, active: ActiveSession) -> dict[str, Any]:
+    def _finish(self, active: ActiveSession,
+                capture_scope: str | None = None) -> dict[str, Any]:
         with self._session_lock(active.session_id):
-            return self._finish_locked(active)
+            return self._finish_locked(active, capture_scope)
 
-    def _finish_locked(self, active: ActiveSession) -> dict[str, Any]:
+    def _finish_locked(self, active: ActiveSession,
+                       capture_scope: str | None = None) -> dict[str, Any]:
         session = self._session_model(active)
         if session.state == "complete":
             if active.state == "ending":
@@ -294,6 +308,8 @@ class MemoDaemon:
             }
         if active.state == "active":
             active = self.registry.transition(active.session_id, "active", "ending")
+        if capture_scope is not None:
+            session.capture_scope = capture_scope
         if session.state != "ending":
             session.state = "ending"
             session.updated_utc = utcnow()
@@ -575,7 +591,8 @@ def attach(path: Path, paths: Paths | None = None, *, decision: str | None = Non
 
 def end(path: Path | None = None, paths: Paths | None = None, *,
         session_id: str | None = None, terminal_id: str | None = None,
-        confirmed: bool = False, expected_revision: int | None = None) -> dict[str, Any]:
+        confirmed: bool = False, expected_revision: int | None = None,
+        capture_scope: str | None = None, prompt_scope: bool = False) -> dict[str, Any]:
     paths = paths or Paths.discover()
     ensure_daemon(paths)
     assert paths.socket is not None
@@ -590,6 +607,10 @@ def end(path: Path | None = None, paths: Paths | None = None, *,
         payload["confirmed"] = True
     if expected_revision is not None:
         payload["expected_revision"] = expected_revision
+    if capture_scope is not None:
+        payload["capture_scope"] = capture_scope
+    if prompt_scope:
+        payload["prompt_scope"] = True
     return request(str(paths.socket), "end", payload, timeout=60.0)
 
 

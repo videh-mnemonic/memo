@@ -70,7 +70,18 @@ def test_inspect_reports_latest_step(tmp_path: Path) -> None:
     output = inspect_session("session", paths)
     assert "Format: directory" in output
     assert "State: complete" in output
+    assert "Capture scope: partial" in output
+    assert "Filesystem: captured" in output
     assert "Step: 1" in output
+
+
+def test_agent_only_session_cannot_replay(tmp_path: Path) -> None:
+    paths, store, session = _fixture(tmp_path)
+    session.capture_scope = "agent-only"
+    store.update_session(session)
+
+    with pytest.raises(ValueError, match="filesystem replay is unavailable"):
+        replay_session("session", -1, tmp_path / "replay", paths=paths)
 
 
 def test_trace_export_defaults_to_all_terminals_and_matches_file(tmp_path: Path) -> None:

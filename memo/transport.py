@@ -18,8 +18,9 @@ from urllib.parse import quote
 import zstandard
 
 from .config import Paths, TransportConfig
-from .models import DirectorySession, StepManifest
-from .session_store import SessionStore, atomic_write, validate_session_id
+from .models import DirectorySession, SessionOrigin, StepManifest
+from .session_store import (SessionNotFoundError, SessionStore, atomic_write,
+                            validate_session_id)
 
 
 MULTIPART_PART_SIZE = 8 * 1024 * 1024
@@ -593,6 +594,196 @@ def _valid_digest(value: object) -> bool:
             and all(character in "0123456789abcdef" for character in value))
 
 
+def list_archived_session_ids(config: TransportConfig | None = None,
+                              client: Any | None = None) -> list[str]:
+    """List session IDs advertised by the remote archive index."""
+    config = config or TransportConfig.discover(required=True)
+    assert config is not None
+    client = client or config.client()
+    prefix = _key(config, "index", "sessions") + "/"
+    suffix = ".json"
+    session_ids: set[str] = set()
+    token: str | None = None
+    while True:
+        arguments: dict[str, object] = {"Bucket": config.bucket, "Prefix": prefix}
+        if token is not None:
+            arguments["ContinuationToken"] = token
+        response = client.list_objects_v2(**arguments)
+        for item in response.get("Contents", []):
+            if not isinstance(item, dict) or not isinstance(item.get("Key"), str):
+                continue
+            key = item["Key"]
+            if not key.startswith(prefix) or not key.endswith(suffix):
+                continue
+            session_id = key[len(prefix):-len(suffix)]
+            try:
+                session_ids.add(validate_session_id(session_id))
+            except ValueError:
+                continue
+        if not response.get("IsTruncated"):
+            break
+        next_token = response.get("NextContinuationToken")
+        if not isinstance(next_token, str) or not next_token:
+            raise ValueError("remote session listing is truncated without a token")
+        token = next_token
+    return sorted(session_ids)
+
+
+def _same_origin_remote_session_ids(origin: SessionOrigin, config: TransportConfig,
+                                    client: Any) -> list[str]:
+    prefix = _key(
+        config, _component(origin.username), _component(origin.hostname), "sessions",
+    ) + "/"
+    session_ids: set[str] = set()
+    token: str | None = None
+    while True:
+        arguments: dict[str, object] = {"Bucket": config.bucket, "Prefix": prefix}
+        if token is not None:
+            arguments["ContinuationToken"] = token
+        response = client.list_objects_v2(**arguments)
+        for item in response.get("Contents", []):
+            if not isinstance(item, dict) or not isinstance(item.get("Key"), str):
+                continue
+            remainder = item["Key"][len(prefix):]
+            session_id = remainder.split("/", 1)[0]
+            try:
+                session_ids.add(validate_session_id(session_id))
+            except ValueError:
+                continue
+        if not response.get("IsTruncated"):
+            break
+        next_token = response.get("NextContinuationToken")
+        if not isinstance(next_token, str) or not next_token:
+            raise ValueError("remote session listing is truncated without a token")
+        token = next_token
+    return sorted(session_ids)
+
+
+def _stream_agent_run_metadata(client: Any, config: TransportConfig,
+                               generation: str) -> list[dict[str, Any]]:
+    """Read run metadata, and legacy trace digests when needed, from an archive prefix."""
+    response = client.get_object(Bucket=config.bucket, Key=generation)
+    body = response["Body"]
+    reader = zstandard.ZstdDecompressor().stream_reader(body, closefd=False)
+    result: list[dict[str, Any]] = []
+    legacy: dict[str, dict[str, Any]] = {}
+    try:
+        with tarfile.open(fileobj=reader, mode="r|") as archive:
+            for member in archive:
+                name = member.name.lstrip("./")
+                if member.isfile() and name.startswith("agents/runs/") and name.endswith(".json"):
+                    extracted = archive.extractfile(member)
+                    if extracted is None or member.size > METADATA_SIZE_LIMIT:
+                        raise ValueError("remote agent metadata is invalid")
+                    value = json.loads(extracted.read(METADATA_SIZE_LIMIT + 1))
+                    if not isinstance(value, dict):
+                        raise ValueError("remote agent metadata is invalid")
+                    result.append(value)
+                    trace_file = value.get("trace_file")
+                    if (not isinstance(value.get("trace_complete_size"), int)
+                            or not _valid_digest(value.get("trace_digest"))):
+                        if isinstance(trace_file, str) and Path(trace_file).name == trace_file:
+                            legacy[trace_file] = value
+                elif name.startswith("agents/traces/"):
+                    if not legacy:
+                        break
+                    trace_name = Path(name).name
+                    value = legacy.get(trace_name)
+                    if value is None or not member.isfile():
+                        continue
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        raise ValueError("remote agent trace is invalid")
+                    hashing = hashlib.sha256()
+                    size = 0
+                    while True:
+                        chunk = extracted.read(STREAM_READ_SIZE)
+                        if not chunk:
+                            break
+                        hashing.update(chunk)
+                        size += len(chunk)
+                    value["trace_complete_size"] = size
+                    value["trace_digest"] = hashing.hexdigest()
+                    legacy.pop(trace_name, None)
+                elif name.startswith("snapshots/") or name.startswith("steps/"):
+                    break
+    finally:
+        try:
+            reader.close()
+        finally:
+            close = getattr(body, "close", None)
+            if close is not None:
+                close()
+    return result
+
+
+def inspect_archived_agent_runs(origin: SessionOrigin, config: TransportConfig | None = None,
+                                client: Any | None = None
+                                ) -> tuple[list[dict[str, object]], set[str]]:
+    """Inspect same-origin agent metadata without downloading filesystem snapshots."""
+    config = config or TransportConfig.discover(required=True)
+    assert config is not None
+    client = client or config.client()
+    session_ids = set(_same_origin_remote_session_ids(origin, config, client))
+    runs: list[dict[str, object]] = []
+    for session_id in sorted(session_ids):
+        base = _key(
+            config, _component(origin.username), _component(origin.hostname),
+            "sessions", session_id,
+        )
+        pairs = _list_generation_pairs(client, config, f"{base}/generations/")
+        if not pairs:
+            continue
+        completion_data = _get_optional(client, config, f"{base}/completion.json")
+        if completion_data is None:
+            step = max(pairs)
+        else:
+            completion = json.loads(completion_data)
+            if (not isinstance(completion, dict)
+                    or completion.get("schema_version") != 1
+                    or completion.get("session_id") != session_id
+                    or not isinstance(completion.get("final_step"), int)
+                    or isinstance(completion.get("final_step"), bool)
+                    or int(completion["final_step"]) not in pairs):
+                raise ValueError("remote completion marker is invalid")
+            step = int(completion["final_step"])
+        generation, _ = pairs[step]
+        for metadata in _stream_agent_run_metadata(client, config, generation):
+            harness = metadata.get("harness")
+            native_id = metadata.get("agent_session_id")
+            size = metadata.get("trace_complete_size")
+            digest = metadata.get("trace_digest")
+            if (not isinstance(harness, str) or not isinstance(native_id, str)
+                    or not isinstance(size, int) or size < 0
+                    or not _valid_digest(digest)):
+                continue
+            runs.append({
+                "session_id": session_id,
+                "capture_scope": (
+                    "agent-only" if metadata.get("imported_agent_only") is True else "partial"
+                ),
+                "harness": harness,
+                "native_id": native_id,
+                "complete_size": size,
+                "digest": str(digest),
+            })
+    return runs, session_ids
+
+
+def ensure_local_session(session_id: str, paths: Paths | None = None,
+                         config: TransportConfig | None = None,
+                         client: Any | None = None) -> Path:
+    """Return a local session, pulling it from the archive when absent."""
+    session_id = validate_session_id(session_id)
+    paths = paths or Paths.discover()
+    store = SessionStore(paths)
+    try:
+        location, _ = store.find(session_id)
+        return location
+    except SessionNotFoundError:
+        return pull_session(session_id, paths, config, client=client)
+
+
 def pull_session(session_id: str, paths: Paths | None = None,
                  config: TransportConfig | None = None, force: bool = False,
                  client: Any | None = None) -> Path:
@@ -603,11 +794,12 @@ def pull_session(session_id: str, paths: Paths | None = None,
     client = client or config.client()
     index_key = _key(config, "index", "sessions", f"{session_id}.json")
     try:
-        index = json.loads(_bounded_body(
-            client.get_object(Bucket=config.bucket, Key=index_key)
-        ))
+        index_data = _bounded_body(client.get_object(Bucket=config.bucket, Key=index_key))
     except Exception as error:
-        raise FileNotFoundError(f"remote session not found: {session_id}") from error
+        if _is_not_found(error):
+            raise FileNotFoundError(f"remote session not found: {session_id}") from error
+        raise
+    index = json.loads(index_data)
     origin = _validate_index(index, session_id)
     base = _key(
         config, _component(origin["username"]), _component(origin["hostname"]),

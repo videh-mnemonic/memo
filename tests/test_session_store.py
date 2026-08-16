@@ -68,6 +68,23 @@ def test_unsupported_old_format_fails_explicitly(tmp_path: Path) -> None:
         store.load_session("old")
 
 
+def test_sessions_default_to_partial_and_validate_capture_scope(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    assert session.capture_scope == "partial"
+    session.capture_scope = "unknown"
+    with pytest.raises(ValueError, match="invalid capture scope"):
+        session.validate()
+
+
+def test_session_json_without_capture_scope_loads_as_partial(tmp_path: Path) -> None:
+    value = _session(tmp_path).to_dict()
+    value.pop("capture_scope")
+    path = tmp_path / "session.json"
+    path.write_text(json.dumps(value))
+
+    assert DirectorySession.load(path).capture_scope == "partial"
+
+
 def test_failed_head_replacement_preserves_previous_visibility(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "root"
     root.mkdir()

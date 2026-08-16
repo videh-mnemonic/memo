@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import uuid
 from pathlib import Path
 from typing import Any
@@ -84,6 +85,12 @@ class TraceCollector:
                 destination = session_path / "agents" / "traces" / trace_name
                 temporary.replace(destination)
                 metadata["trace_file"] = trace_name
+                metadata["trace_complete_size"] = boundary
+                hashing = hashlib.sha256()
+                with destination.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        hashing.update(chunk)
+                metadata["trace_digest"] = hashing.hexdigest()
                 atomic_write(
                     session_path / "agents" / "runs" / f"{run_id}.json",
                     _json_bytes(metadata),

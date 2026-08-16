@@ -41,6 +41,7 @@ class DirectorySession:
     updated_utc: str
     origin: SessionOrigin
     state: str = "active"
+    capture_scope: str = "partial"
     format: str = "memo-directory-session"
     format_version: int = DIRECTORY_FORMAT_VERSION
     last_pushed_step: int | None = None
@@ -52,6 +53,8 @@ class DirectorySession:
             raise ValueError("unsupported directory session format")
         if self.state not in {"active", "ending", "complete"}:
             raise ValueError(f"invalid directory session state: {self.state}")
+        if self.capture_scope not in {"partial", "full", "agent-only"}:
+            raise ValueError(f"invalid capture scope: {self.capture_scope}")
         if not Path(self.root).is_absolute():
             raise ValueError("directory session root must be absolute")
         self.origin.validate()

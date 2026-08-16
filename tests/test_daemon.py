@@ -104,6 +104,29 @@ def test_concurrent_streams_are_drained_by_end(tmp_path: Path) -> None:
         _stop(paths, thread)
 
 
+def test_end_scope_is_selected_before_completion(tmp_path: Path) -> None:
+    paths, root, _, thread = _running(tmp_path)
+    try:
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        pending = request(str(paths.socket), "end", {
+            "session_id": attached["session_id"],
+            "terminal_id": attached["terminal_id"],
+            "prompt_scope": True,
+        })
+        assert pending["scope_confirmation_required"] is True
+
+        ended = request(str(paths.socket), "end", {
+            "session_id": attached["session_id"],
+            "terminal_id": attached["terminal_id"],
+            "capture_scope": "full",
+        })
+
+        assert ended["state"] == "complete"
+        assert SessionStore(paths).load_session(str(attached["session_id"])).capture_scope == "full"
+    finally:
+        _stop(paths, thread)
+
+
 def test_resume_replace_and_stale_decisions(tmp_path: Path) -> None:
     paths, root, _, thread = _running(tmp_path)
     try:

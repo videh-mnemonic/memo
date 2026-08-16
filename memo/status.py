@@ -1,13 +1,85 @@
 from __future__ import annotations
 
+import stat
+from datetime import datetime, timezone
+from pathlib import Path
+
 from .config import Paths
 from .registry import Registry
 from .session_store import SessionStore
 
 
-def render_status(paths: Paths | None = None) -> str:
+def _parse_utc(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _age(value: str, now: datetime, *, ago: bool = False) -> str:
+    timestamp = _parse_utc(value)
+    if timestamp is None:
+        return "—"
+    seconds = max(0, int((now - timestamp).total_seconds()))
+    if ago and seconds < 5:
+        return "just now"
+    if seconds < 60:
+        result = f"{seconds}s"
+    elif seconds < 60 * 60:
+        result = f"{seconds // 60}m"
+    elif seconds < 24 * 60 * 60:
+        result = f"{seconds // (60 * 60)}h"
+    elif seconds < 7 * 24 * 60 * 60:
+        result = f"{seconds // (24 * 60 * 60)}d"
+    elif seconds < 30 * 24 * 60 * 60:
+        result = f"{seconds // (7 * 24 * 60 * 60)}w"
+    elif seconds < 365 * 24 * 60 * 60:
+        result = f"{seconds // (30 * 24 * 60 * 60)}mo"
+    else:
+        result = f"{seconds // (365 * 24 * 60 * 60)}y"
+    return f"{result} ago" if ago else result
+
+
+def _session_size(root: Path) -> int:
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            metadata = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(metadata.st_mode):
+            total += metadata.st_size
+    return total
+
+
+def _format_size(size: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    value = float(max(0, size))
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    if unit == "B":
+        return f"{int(value)} B"
+    rounded = round(value, 1)
+    return f"{int(rounded)} {unit}" if rounded.is_integer() else f"{rounded:.1f} {unit}"
+
+
+def render_status(paths: Paths | None = None, *, now: datetime | None = None,
+                  include_archive: bool = False, limit: int | None = None) -> str:
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be positive")
     paths = paths or Paths.discover()
-    rows = [("STATE", "SESSION", "ROOT", "STEP", "ATTACH", "UPDATED")]
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    rows = [("SESSION", "ROOT", "STATE", "SCOPE", "AGE", "LAST", "TERMINALS",
+             "STEPS", "SIZE", "ARCHIVED")]
     active = {}
     if paths.registry is not None and paths.registry.exists():
         with Registry(paths.registry) as registry:
@@ -18,14 +90,50 @@ def render_status(paths: Paths | None = None) -> str:
                          if value.detached_utc is None]),
                 )
     store = SessionStore(paths)
-    for _, session in store.list_sessions():
+    local_sessions = store.list_sessions()
+    if limit is not None:
+        local_sessions = local_sessions[:limit]
+    local_ids = set()
+    for session_path, session in local_sessions:
+        local_ids.add(session.session_id)
         head = store.head(session.session_id)
         state, attachments = active.get(session.session_id, (session.state, 0))
-        rows.append((state, session.session_id, session.root,
-                     str(head.step) if head else "-", str(attachments),
-                     head.created_utc if head else session.updated_utc))
+        steps = 0 if head is None else head.step + 1
+        archived = (
+            "—" if session.last_pushed_step is None
+            else f"{min(session.last_pushed_step + 1, steps)}/{steps}"
+        )
+        rows.append((
+            session.session_id,
+            session.root,
+            state,
+            session.capture_scope,
+            _age(session.created_utc, now),
+            "—" if head is None else _age(head.created_utc, now, ago=True),
+            str(attachments),
+            str(steps),
+            _format_size(_session_size(session_path)),
+            archived,
+        ))
+    remaining = None if limit is None else limit - len(local_sessions)
+    if include_archive and (remaining is None or remaining > 0):
+        from .transport import list_archived_session_ids
+
+        archived_ids = [
+            session_id for session_id in list_archived_session_ids()
+            if session_id not in local_ids
+        ]
+        if remaining is not None:
+            archived_ids = archived_ids[:remaining]
+        rows.extend((session_id, "—", "archived", "—", "—", "—", "—", "—", "—", "yes")
+                    for session_id in archived_ids)
     if len(rows) == 1:
         return "No sessions.\n"
     widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]))]
-    return "\n".join("  ".join(value.ljust(widths[index]) for index, value in enumerate(row))
-                     for row in rows) + "\n"
+    return "\n".join(
+        "  ".join(
+            value if index == len(row) - 1 else value.ljust(widths[index])
+            for index, value in enumerate(row)
+        )
+        for row in rows
+    ) + "\n"

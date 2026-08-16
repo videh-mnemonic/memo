@@ -24,6 +24,8 @@ def inspect_session(session_id: str, paths: Paths | None = None) -> str:
         f"Session: {session.session_id}",
         "Format: directory",
         f"State: {session.state}",
+        f"Capture scope: {session.capture_scope}",
+        f"Filesystem: {'not captured' if session.capture_scope == 'agent-only' else 'captured'}",
         f"Source: {location}",
         f"Root: {session.root}",
         f"Created: {session.created_utc}",
@@ -142,6 +144,8 @@ def replay_session(session_id: str, at: str | int, destination: Path,
                    paths: Paths | None = None) -> Path:
     store = SessionStore(paths or Paths.discover())
     session = _session(store, session_id)
+    if session.capture_scope == "agent-only":
+        raise ValueError("filesystem replay is unavailable for an agent-only session")
     manifest = store.step(session_id, parse_step(at))
     store.restore_manifest(session_id, manifest, destination, force)
     if include_prompts:

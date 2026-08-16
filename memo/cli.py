@@ -11,7 +11,20 @@ from .relay import run as run_relay
 from .status import render_status
 
 
-COMMANDS = {"end", "status", "inspect", "traces", "replay", "push", "pull"}
+COMMANDS = {"end", "status", "inspect", "traces", "replay", "push", "pull", "import"}
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
+
+
+def _ensure_local_session(session_id: str) -> None:
+    from .transport import ensure_local_session
+
+    ensure_local_session(session_id)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -19,7 +32,13 @@ def parser() -> argparse.ArgumentParser:
     subparsers = result.add_subparsers(dest="command")
     finish = subparsers.add_parser("end", help="finish a recording")
     finish.add_argument("path", nargs="?", type=Path)
-    subparsers.add_parser("status", help="list recordings")
+    finish.add_argument("--scope", choices=("partial", "full"))
+    subparsers.add_parser("import", help="recover native Claude and Codex sessions")
+    status = subparsers.add_parser("status", help="list recordings")
+    status.add_argument("--include-archive", action="store_true",
+                        help="include remote-only archived recordings")
+    status.add_argument("--limit", type=_positive_int,
+                        help="maximum number of recordings to display")
     inspect = subparsers.add_parser("inspect", help="inspect a recording")
     inspect.add_argument("session_id")
     traces = subparsers.add_parser("traces", help="export agent or terminal traces")
@@ -58,19 +77,38 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command == "status":
-            print(render_status(), end="")
+            print(render_status(include_archive=args.include_archive, limit=args.limit), end="")
         elif args.command == "inspect":
+            _ensure_local_session(args.session_id)
             print(inspect_session(args.session_id), end="")
         elif args.command == "end":
             target_path = args.path
             environment_session = os.environ.get("MEMO_SESSION_ID") if target_path is None else None
             environment_terminal = os.environ.get("MEMO_TERMINAL_ID")
+            prompt_scope = args.scope is None and sys.stdin.isatty()
             response = end(
                 target_path if target_path is not None or environment_session else Path.cwd(),
                 session_id=environment_session,
                 terminal_id=environment_terminal,
+                capture_scope=args.scope,
+                prompt_scope=prompt_scope,
             )
-            while response.get("confirmation_required") or response.get("stale"):
+            confirmed = False
+            expected_revision = None
+            while (response.get("confirmation_required") or response.get("stale")
+                   or response.get("scope_confirmation_required")):
+                if response.get("scope_confirmation_required"):
+                    answer = input("Did Memo capture all intended work for this session? [y/N] ")
+                    selected_scope = "full" if answer.strip().lower() in {"y", "yes"} else "partial"
+                    response = end(
+                        target_path if target_path is not None or environment_session else Path.cwd(),
+                        session_id=environment_session,
+                        terminal_id=environment_terminal,
+                        confirmed=confirmed,
+                        expected_revision=expected_revision,
+                        capture_scope=selected_scope,
+                    )
+                    continue
                 count = int(response["other_terminals"])
                 if response.get("stale"):
                     print("The recording's attached terminals changed; confirmation is required again.")
@@ -82,17 +120,32 @@ def main(argv: list[str] | None = None) -> int:
                 if answer.strip().lower() not in {"y", "yes"}:
                     print("recording unchanged")
                     return 0
+                confirmed = True
+                expected_revision = int(response["revision"])
                 response = end(
                     target_path if target_path is not None or environment_session else Path.cwd(),
                     session_id=environment_session,
                     terminal_id=environment_terminal,
-                    confirmed=True,
-                    expected_revision=int(response["revision"]),
+                    confirmed=confirmed,
+                    expected_revision=expected_revision,
+                    capture_scope=args.scope,
+                    prompt_scope=prompt_scope,
                 )
             action = "already complete" if response["already_complete"] else "completed"
             print(f"{action}: {response['session_id']} step={response['step']}")
             if response.get("cloud") == "pending":
                 print("cloud upload started; automatic retry remains enabled", file=sys.stderr)
+        elif args.command == "import":
+            from .importer import import_native_sessions
+
+            summary = import_native_sessions()
+            print(f"imported: {len(summary.imported)}")
+            print(f"refreshed: {len(summary.refreshed)}")
+            print(f"already captured: {len(summary.skipped)}")
+            print(f"unimportable: {len(summary.failed)}")
+            for source, error in summary.failed:
+                print(f"unimportable: {source}: {error}", file=sys.stderr)
+            return 1 if summary.failed else 0
         elif args.command == "push":
             response = push(args.session_id)
             for session_id in response["pushed"]:
@@ -107,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
             destination = pull_session(args.session_id, force=args.force)
             print(f"pulled: {args.session_id} path={destination}")
         elif args.command == "traces":
+            _ensure_local_session(args.session_id)
             terminal_ids = None
             if args.terminals is not None:
                 terminal_ids = [value.strip() for value in args.terminals.split(",")]
@@ -117,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 write_traces(args.session_id, args.path, terminal_ids, raw=args.raw)
         elif args.command == "replay":
+            _ensure_local_session(args.session_id)
             destination = replay_session(
                 args.session_id, args.at, args.directory, args.include_prompts, args.force
             )
