@@ -9,7 +9,7 @@ import termios
 import time
 from pathlib import Path
 
-from memo.config import Paths
+from memo.config import StoragePaths
 from memo.protocol import request
 
 
@@ -49,7 +49,7 @@ def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> No
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
-        paths = Paths.discover() if os.environ.get("MEMO_HOME") == str(home) else Paths(home)
+        paths = StoragePaths.discover() if os.environ.get("MEMO_HOME") == str(home) else StoragePaths(home)
         if paths.socket and paths.socket.exists():
             request(str(paths.socket), "shutdown")
         os.close(master)

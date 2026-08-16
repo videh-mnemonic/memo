@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from memo.config import Paths
+from memo.config import StoragePaths
 from memo.agents.harnesses.claude import ClaudeHarness
 from memo.agents.harnesses.codex import CodexHarness
 from memo.agents.importer import import_native_sessions
-from memo.load import trace_json
+from memo.export import trace_json
 from memo.session_store import SessionStore
 
 
@@ -39,7 +39,7 @@ def test_import_creates_and_refreshes_agent_only_session(tmp_path: Path, monkeyp
     root.mkdir()
     source = codex / "session.jsonl"
     source.write_text(_record("native-session", root, "first"))
-    paths = Paths(tmp_path / "memo-home")
+    paths = StoragePaths(tmp_path / "memo-home")
 
     first = import_native_sessions(paths)
 
@@ -69,7 +69,7 @@ def test_import_is_idempotent_and_preserves_divergent_archive(
     root.mkdir()
     source = codex / "session.jsonl"
     source.write_text(_record("native-session", root, "first"))
-    paths = Paths(tmp_path / "memo-home")
+    paths = StoragePaths(tmp_path / "memo-home")
     import_native_sessions(paths)
 
     unchanged = import_native_sessions(paths)
@@ -90,7 +90,7 @@ def test_shared_trace_override_identifies_provider_once(tmp_path: Path, monkeypa
     (traces / "session.jsonl").write_text(_record("native-session", root, "first"))
     monkeypatch.setenv("MEMO_TRACE_DIR", str(traces))
 
-    summary = import_native_sessions(Paths(tmp_path / "memo-home"))
+    summary = import_native_sessions(StoragePaths(tmp_path / "memo-home"))
 
     assert summary.imported == ["native-session"]
     assert summary.failed == []

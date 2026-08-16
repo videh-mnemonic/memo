@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from memo.cli import main, parser
-from memo.config import Paths
+from memo.config import StoragePaths
 
 
 def test_removed_public_commands_are_not_registered() -> None:
@@ -65,7 +65,7 @@ def test_public_push_and_pull_subcommands_route_results(tmp_path: Path, monkeypa
     assert main(["push", "session"]) == 0
     assert capsys.readouterr().out == "pushed: session\n"
 
-    destination = Paths(tmp_path / "home").archive / "session"
+    destination = StoragePaths(tmp_path / "home").archive / "session"
     monkeypatch.setattr(transport, "pull_session", lambda session_id, force=False: destination)
     assert main(["pull", "session", "--force"]) == 0
     assert capsys.readouterr().out == f"pulled: session path={destination}\n"

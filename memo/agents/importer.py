@@ -14,7 +14,7 @@ from typing import Any
 from .harnesses import registered_harnesses
 from .harnesses.harness import AgentHarness, SourceRecord, model_context, source_records
 from .tracewatch import files, snapshot_complete
-from ..config import Paths, TransportConfig
+from ..config import StoragePaths, TransportConfig
 from ..models import DirectorySession, SessionOrigin, StepManifest
 from ..session_store import SessionStore, atomic_write, validate_session_id
 from ..step import utcnow
@@ -224,7 +224,7 @@ def _create(store: SessionStore, candidate: Candidate, snapshot: Path,
     )
     assert store.paths.archive is not None
     staging_archive = Path(tempfile.mkdtemp(prefix=".import-", dir=store.paths.archive))
-    staging_paths = Paths(
+    staging_paths = StoragePaths(
         store.paths.home, archive=staging_archive, runtime=store.paths.runtime,
         socket=store.paths.socket, registry=store.paths.registry, spool=store.paths.spool,
     )
@@ -276,10 +276,10 @@ def _refresh(store: SessionStore, session_id: str, candidate: Candidate,
     return session_id
 
 
-def import_native_sessions(paths: Paths | None = None, *,
+def import_native_sessions(paths: StoragePaths | None = None, *,
                            config: TransportConfig | None = None,
                            client: Any | None = None) -> ImportSummary:
-    paths = paths or Paths.discover()
+    paths = paths or StoragePaths.discover()
     store = SessionStore(paths)
     summary = ImportSummary()
     discovered = _discover(summary)

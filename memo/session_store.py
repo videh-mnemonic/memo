@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from .config import Paths
+from .config import StoragePaths
 from .models import DirectorySession, StepManifest
 
 if TYPE_CHECKING:
@@ -50,7 +50,7 @@ def atomic_write(path: Path, data: bytes) -> None:
 
 
 class SessionStore:
-    def __init__(self, paths: Paths):
+    def __init__(self, paths: StoragePaths):
         self.paths = paths
         paths.ensure_storage()
 
@@ -321,7 +321,7 @@ class SessionStore:
             os.close(descriptor)
 
 
-def list_directory_sessions(paths: Paths) -> list[tuple[Path, DirectorySession]]:
+def list_directory_sessions(paths: StoragePaths) -> list[tuple[Path, DirectorySession]]:
     assert paths.archive is not None
     result = []
     for session_file in sorted(paths.archive.glob("*/session.json")):

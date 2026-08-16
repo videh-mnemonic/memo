@@ -8,15 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from memo.config import Paths
-from memo.load import replay_session, terminal_ids, trace_json, write_traces
+from memo.config import StoragePaths
+from memo.export import replay_session, terminal_ids, trace_json, write_traces
 from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.session_store import SessionStore, atomic_write
 from memo.streams import StreamEvent
 
 
-def _paths(tmp_path: Path) -> Paths:
-    return Paths(tmp_path)
+def _paths(tmp_path: Path) -> StoragePaths:
+    return StoragePaths(tmp_path)
 
 
 def _write_stream(session_path: Path, terminal_id: str, events: list[StreamEvent]) -> None:
@@ -34,7 +34,7 @@ def _write_stream(session_path: Path, terminal_id: str, events: list[StreamEvent
     }) + "\n").encode())
 
 
-def _fixture(tmp_path: Path) -> tuple[Paths, SessionStore, DirectorySession]:
+def _fixture(tmp_path: Path) -> tuple[StoragePaths, SessionStore, DirectorySession]:
     root = tmp_path / "root"
     root.mkdir()
     paths = _paths(tmp_path / "home")

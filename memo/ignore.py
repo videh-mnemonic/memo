@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pathspec.gitignore import GitIgnoreSpec
 
-from .config import Paths
+from .config import StoragePaths
 
 
 @dataclass(frozen=True)
@@ -17,7 +17,7 @@ class IgnoreDecision:
 class IgnorePolicy:
     """Repository-scoped Git ignore rules with Memo self-exclusion."""
 
-    def __init__(self, root: Path, paths: Paths | None = None):
+    def __init__(self, root: Path, paths: StoragePaths | None = None):
         self.root = root.resolve()
         self.paths = paths
         self._cache: dict[Path, list[tuple[Path, str, GitIgnoreSpec]]] = {}

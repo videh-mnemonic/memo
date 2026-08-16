@@ -2,7 +2,7 @@ from pathlib import Path
 
 from memo.config import (MAX_FILE_SIZE_BYTES, PUSH_INTERVAL_SECONDS,
                          STEP_INTERVAL_SECONDS, WATCHER_DEBOUNCE_SECONDS,
-                         Paths, TransportConfig)
+                         StoragePaths, TransportConfig)
 
 
 def test_paths_discovery_uses_only_memo_home(monkeypatch, tmp_path: Path) -> None:
@@ -10,8 +10,8 @@ def test_paths_discovery_uses_only_memo_home(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.setenv("MEMO_HOME", str(home))
     monkeypatch.setenv("TMPDIR", str(tmp_path / "ignored-temp"))
 
-    paths = Paths.discover()
-    assert paths == Paths(home.resolve())
+    paths = StoragePaths.discover()
+    assert paths == StoragePaths(home.resolve())
     assert paths.archive == home / "archive"
     assert paths.runtime == home / "runtime"
     assert paths.spool == home / "runtime" / "sessions"

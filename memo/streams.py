@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
-from .config import Paths
+from .config import StoragePaths
 from .registry import Registry
 from .session_store import atomic_write
 
@@ -47,7 +47,7 @@ class StreamEvent:
 
 
 class StreamStore:
-    def __init__(self, paths: Paths, registry: Registry):
+    def __init__(self, paths: StoragePaths, registry: Registry):
         self.paths = paths
         self.registry = registry
         self._locks: dict[str, threading.Lock] = {}

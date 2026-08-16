@@ -4,7 +4,7 @@ import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import Paths
+from .config import StoragePaths
 from .models import DirectorySession
 from .registry import Registry
 from .session_store import SessionStore
@@ -93,14 +93,14 @@ def _local_row(store: SessionStore, session_path: Path, session: DirectorySessio
     )
 
 
-def render_status(paths: Paths | None = None, *, now: datetime | None = None,
+def render_status(paths: StoragePaths | None = None, *, now: datetime | None = None,
                   include_archive: bool = False, limit: int | None = None,
                   session_id: str | None = None) -> str:
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive")
     if session_id is not None and (include_archive or limit is not None):
         raise ValueError("single-session status cannot use --include-archive or --limit")
-    paths = paths or Paths.discover()
+    paths = paths or StoragePaths.discover()
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)

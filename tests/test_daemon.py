@@ -6,14 +6,14 @@ import threading
 import time
 from pathlib import Path
 
-from memo.config import Paths
+from memo.config import StoragePaths
 from memo.daemon import MemoDaemon
 from memo.protocol import request
 from memo.session_store import SessionStore
 
 
-def _running(tmp_path: Path, interval: float = 10) -> tuple[Paths, Path, MemoDaemon, threading.Thread]:
-    paths = Paths(tmp_path / "memo-home")
+def _running(tmp_path: Path, interval: float = 10) -> tuple[StoragePaths, Path, MemoDaemon, threading.Thread]:
+    paths = StoragePaths(tmp_path / "memo-home")
     root = tmp_path / "work"
     root.mkdir()
     daemon = MemoDaemon(paths, interval=interval)
@@ -26,7 +26,7 @@ def _running(tmp_path: Path, interval: float = 10) -> tuple[Paths, Path, MemoDae
     return paths, root, daemon, thread
 
 
-def _stop(paths: Paths, thread: threading.Thread) -> None:
+def _stop(paths: StoragePaths, thread: threading.Thread) -> None:
     if paths.socket and paths.socket.exists():
         request(str(paths.socket), "shutdown")
     thread.join(timeout=3)

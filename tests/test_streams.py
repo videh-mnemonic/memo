@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from memo.config import Paths
+from memo.config import StoragePaths
 from memo.registry import Registry
 from memo.streams import StreamStore, merged_timeline
 
@@ -19,7 +19,7 @@ def _event(sequence: int, data: bytes = b"x") -> dict[str, object]:
 
 def _store(tmp_path: Path) -> tuple[StreamStore, Registry, str]:
     home = tmp_path / "home"
-    paths = Paths(home)
+    paths = StoragePaths(home)
     paths.ensure_storage()
     assert paths.registry is not None
     registry = Registry(paths.registry)

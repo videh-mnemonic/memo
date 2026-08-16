@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from memo.config import Paths
+from memo.config import StoragePaths
 from memo.models import DirectorySession, SessionOrigin
 from memo.registry import Registry
 from memo.session_store import SessionStore, atomic_write
@@ -11,8 +11,8 @@ from memo.status import _age, _format_size, _session_size, render_status
 from memo.step import StepPublisher
 
 
-def _paths(tmp_path: Path) -> Paths:
-    return Paths(tmp_path)
+def _paths(tmp_path: Path) -> StoragePaths:
+    return StoragePaths(tmp_path)
 
 
 def test_status_reports_operational_session_summary(tmp_path: Path, monkeypatch) -> None:

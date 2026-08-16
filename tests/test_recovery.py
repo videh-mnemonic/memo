@@ -3,7 +3,7 @@ import json
 import struct
 from pathlib import Path
 
-from memo.config import Paths
+from memo.config import StoragePaths
 from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.registry import Registry
 from memo.session_store import SessionStore
@@ -12,7 +12,7 @@ from memo.streams import StreamStore
 
 def _setup(tmp_path: Path):
     home = tmp_path / "home"
-    paths = Paths(home)
+    paths = StoragePaths(home)
     paths.ensure_storage()
     root = tmp_path / "root"
     root.mkdir()

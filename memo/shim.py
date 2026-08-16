@@ -9,7 +9,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from .config import Paths
+from .config import StoragePaths
 from .daemon import ensure_daemon
 from .agents.harnesses import get_harness, registered_harnesses
 from .protocol import request
@@ -17,8 +17,8 @@ from .session_store import atomic_write
 from .step import utcnow
 
 
-def ensure_shims(paths: Paths | None = None) -> Path:
-    paths = paths or Paths.discover()
+def ensure_shims(paths: StoragePaths | None = None) -> Path:
+    paths = paths or StoragePaths.discover()
     paths.ensure_storage()
     assert paths.runtime is not None
     directory = paths.runtime / "shims"
@@ -62,7 +62,7 @@ def run(harness_name: str, args: list[str]) -> int:
 
     session_id = os.environ.get("MEMO_SESSION_ID")
     terminal_id = os.environ.get("MEMO_TERMINAL_ID")
-    paths = Paths.discover()
+    paths = StoragePaths.discover()
     launch_id = uuid.uuid4().hex
     notified = False
     if session_id and terminal_id:

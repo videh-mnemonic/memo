@@ -7,7 +7,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import MAX_FILE_SIZE_BYTES, Paths
+from .config import MAX_FILE_SIZE_BYTES, StoragePaths
 from .ignore import IgnorePolicy
 from .models import DirectorySession, SnapshotEntry, StepManifest
 from .session_store import SessionStore
@@ -52,7 +52,7 @@ def _stable_copy(source: Path, target: Path, before: os.stat_result) -> bool:
 
 
 def scan_tree(root: Path, destination: Path, *, previous: Path | None = None,
-              paths: Paths | None = None, max_file_size: int | None = None) -> list[SnapshotEntry]:
+              paths: StoragePaths | None = None, max_file_size: int | None = None) -> list[SnapshotEntry]:
     entries: list[SnapshotEntry] = []
     seen: set[str] = set()
     policy = IgnorePolicy(root, paths)

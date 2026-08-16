@@ -13,7 +13,7 @@ import tty
 from pathlib import Path
 from types import FrameType
 
-from .config import Paths
+from .config import StoragePaths
 from .daemon import attach
 from .protocol import request
 from .shim import ensure_shims
@@ -35,9 +35,9 @@ def _resize(source_fd: int, pty_fd: int) -> None:
         pass
 
 
-def run(path: Path, paths: Paths | None = None, shell: str | None = None,
+def run(path: Path, paths: StoragePaths | None = None, shell: str | None = None,
         stdin_fd: int = 0, stdout_fd: int = 1) -> int:
-    paths = paths or Paths.discover()
+    paths = paths or StoragePaths.discover()
     shim_directory = ensure_shims(paths)
     allocation = attach(path, paths)
     while allocation.get("decision_required") or allocation.get("stale"):

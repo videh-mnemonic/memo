@@ -1,13 +1,13 @@
 import os
 from pathlib import Path
 
-from memo.config import Paths
+from memo.config import StoragePaths
 from memo.step import scan_tree
 
 
-def _paths(tmp_path: Path) -> Paths:
+def _paths(tmp_path: Path) -> StoragePaths:
     home = tmp_path / "home"
-    return Paths(home)
+    return StoragePaths(home)
 
 
 def test_scan_records_policy_size_special_and_deletion(tmp_path: Path) -> None:

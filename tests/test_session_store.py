@@ -4,13 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from memo.config import Paths
+from memo.config import StoragePaths
 from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.session_store import SessionNotFoundError, SessionStore
 
 
-def _paths(tmp_path: Path) -> Paths:
-    return Paths(tmp_path)
+def _paths(tmp_path: Path) -> StoragePaths:
+    return StoragePaths(tmp_path)
 
 
 def _session(root: Path) -> DirectorySession:

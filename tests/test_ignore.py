@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from memo.config import Paths
+from memo.config import StoragePaths
 from memo.ignore import IgnorePolicy
 
 
@@ -53,7 +53,7 @@ def test_memo_storage_is_excluded_when_nested_in_recording(tmp_path: Path) -> No
     root = tmp_path / "root"
     root.mkdir()
     home = root / ".memo-home"
-    paths = Paths(home)
+    paths = StoragePaths(home)
     paths.ensure_storage()
     policy = IgnorePolicy(root, paths)
 

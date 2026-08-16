@@ -12,7 +12,7 @@ from typing import IO, Any
 
 from .step import StepPublisher, utcnow
 from .config import (PUSH_INTERVAL_SECONDS, STEP_INTERVAL_SECONDS,
-                     WATCHER_DEBOUNCE_SECONDS, Paths, TransportConfig)
+                     WATCHER_DEBOUNCE_SECONDS, StoragePaths, TransportConfig)
 from .models import DirectorySession, SessionOrigin
 from .protocol import (
     DisconnectedError,
@@ -35,8 +35,8 @@ class DaemonAlreadyRunning(RuntimeError):
 
 
 class MemoDaemon:
-    def __init__(self, paths: Paths | None = None, interval: float | None = None):
-        self.paths = paths or Paths.discover()
+    def __init__(self, paths: StoragePaths | None = None, interval: float | None = None):
+        self.paths = paths or StoragePaths.discover()
         self.paths.ensure_storage()
         assert self.paths.registry is not None
         assert self.paths.socket is not None
@@ -574,8 +574,8 @@ class MemoDaemon:
                 self._lock_handle.close()
 
 
-def ensure_daemon(paths: Paths | None = None, timeout: float = 5.0) -> None:
-    paths = paths or Paths.discover()
+def ensure_daemon(paths: StoragePaths | None = None, timeout: float = 5.0) -> None:
+    paths = paths or StoragePaths.discover()
     paths.ensure_storage()
     assert paths.socket is not None
     try:
@@ -601,10 +601,10 @@ def ensure_daemon(paths: Paths | None = None, timeout: float = 5.0) -> None:
     raise RuntimeError("memo daemon did not start")
 
 
-def attach(path: Path, paths: Paths | None = None, *, decision: str | None = None,
+def attach(path: Path, paths: StoragePaths | None = None, *, decision: str | None = None,
            expected_session_id: str | None = None,
            expected_revision: int | None = None) -> dict[str, Any]:
-    paths = paths or Paths.discover()
+    paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
     assert paths.socket is not None
     payload: dict[str, Any] = {"path": str(path)}
@@ -614,11 +614,11 @@ def attach(path: Path, paths: Paths | None = None, *, decision: str | None = Non
     return request(str(paths.socket), "attach", payload)
 
 
-def end(path: Path | None = None, paths: Paths | None = None, *,
+def end(path: Path | None = None, paths: StoragePaths | None = None, *,
         session_id: str | None = None, terminal_id: str | None = None,
         confirmed: bool = False, expected_revision: int | None = None,
         capture_scope: str | None = None, prompt_scope: bool = False) -> dict[str, Any]:
-    paths = paths or Paths.discover()
+    paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
     assert paths.socket is not None
     payload: dict[str, Any] = {}
@@ -639,8 +639,8 @@ def end(path: Path | None = None, paths: Paths | None = None, *,
     return request(str(paths.socket), "end", payload, timeout=60.0)
 
 
-def push(session_id: str | None = None, paths: Paths | None = None) -> dict[str, Any]:
-    paths = paths or Paths.discover()
+def push(session_id: str | None = None, paths: StoragePaths | None = None) -> dict[str, Any]:
+    paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
     assert paths.socket is not None
     payload = {"session_id": session_id} if session_id else {}
@@ -648,8 +648,8 @@ def push(session_id: str | None = None, paths: Paths | None = None) -> dict[str,
 
 
 def remove_archived(exclude: list[str] | None = None,
-                    paths: Paths | None = None) -> dict[str, Any]:
-    paths = paths or Paths.discover()
+                    paths: StoragePaths | None = None) -> dict[str, Any]:
+    paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
     assert paths.socket is not None
     return request(

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from memo.agents.collector import TraceCollector
-from memo.config import Paths
+from memo.config import StoragePaths
 from memo.models import DirectorySession, SessionOrigin
 from memo.registry import AgentLaunch, Registry
 from memo.session_store import SessionStore
@@ -56,7 +56,7 @@ def test_collector_archives_all_matching_sessions_and_updates_resume(
     project.mkdir()
     other = tmp_path / "other"
     other.mkdir()
-    paths = Paths(tmp_path / "home")
+    paths = StoragePaths(tmp_path / "home")
     paths.ensure_storage()
     store = SessionStore(paths)
     store.create(DirectorySession(
@@ -127,7 +127,7 @@ def test_collector_archives_all_matching_sessions_and_updates_resume(
 
 
 def test_shims_are_derived_from_registered_harnesses(tmp_path: Path) -> None:
-    directory = ensure_shims(Paths(tmp_path / "home"))
+    directory = ensure_shims(StoragePaths(tmp_path / "home"))
     assert {path.name for path in directory.iterdir()} == {"claude", "codex"}
     assert all(path.stat().st_mode & 0o100 for path in directory.iterdir())
 
@@ -135,7 +135,7 @@ def test_shims_are_derived_from_registered_harnesses(tmp_path: Path) -> None:
 def test_shim_notifies_around_real_process_and_preserves_status(
     tmp_path: Path, monkeypatch
 ) -> None:
-    paths = Paths(tmp_path / "home")
+    paths = StoragePaths(tmp_path / "home")
     shim_directory = ensure_shims(paths)
     binaries = tmp_path / "bin"
     binaries.mkdir()
@@ -147,7 +147,7 @@ def test_shim_notifies_around_real_process_and_preserves_status(
     monkeypatch.setenv("MEMO_SHIM_DIR", str(shim_directory))
     monkeypatch.setenv("MEMO_SESSION_ID", "session")
     monkeypatch.setenv("MEMO_TERMINAL_ID", "terminal")
-    monkeypatch.setattr("memo.shim.Paths.discover", lambda: paths)
+    monkeypatch.setattr("memo.shim.StoragePaths.discover", lambda: paths)
     monkeypatch.setattr("memo.shim.ensure_daemon", lambda _: None)
     monkeypatch.setattr(
         "memo.shim.request",

@@ -17,7 +17,7 @@ from urllib.parse import quote
 
 import zstandard
 
-from .config import Paths, TransportConfig
+from .config import StoragePaths, TransportConfig
 from .models import DirectorySession, SessionOrigin, StepManifest
 from .session_store import (SessionNotFoundError, SessionStore, atomic_write,
                             validate_session_id)
@@ -770,12 +770,12 @@ def inspect_archived_agent_runs(origin: SessionOrigin, config: TransportConfig |
     return runs, session_ids
 
 
-def ensure_local_session(session_id: str, paths: Paths | None = None,
+def ensure_local_session(session_id: str, paths: StoragePaths | None = None,
                          config: TransportConfig | None = None,
                          client: Any | None = None) -> Path:
     """Return a local session, pulling it from the archive when absent."""
     session_id = validate_session_id(session_id)
-    paths = paths or Paths.discover()
+    paths = paths or StoragePaths.discover()
     store = SessionStore(paths)
     try:
         location, _ = store.find(session_id)
@@ -784,11 +784,11 @@ def ensure_local_session(session_id: str, paths: Paths | None = None,
         return pull_session(session_id, paths, config, client=client)
 
 
-def pull_session(session_id: str, paths: Paths | None = None,
+def pull_session(session_id: str, paths: StoragePaths | None = None,
                  config: TransportConfig | None = None, force: bool = False,
                  client: Any | None = None) -> Path:
     session_id = validate_session_id(session_id)
-    paths = paths or Paths.discover()
+    paths = paths or StoragePaths.discover()
     config = config or TransportConfig.discover(required=True)
     assert config is not None
     client = client or config.client()

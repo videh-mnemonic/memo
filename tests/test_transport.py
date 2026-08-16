@@ -14,8 +14,8 @@ from pathlib import Path
 import pytest
 import zstandard
 
-from memo.config import Paths, TransportConfig
-from memo.load import replay_session
+from memo.config import StoragePaths, TransportConfig
+from memo.export import replay_session
 from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.session_store import SessionStore, atomic_write
 from memo.streams import StreamEvent
@@ -134,8 +134,8 @@ class FakeS3:
         ]}
 
 
-def _paths(root: Path) -> Paths:
-    return Paths(root)
+def _paths(root: Path) -> StoragePaths:
+    return StoragePaths(root)
 
 
 def test_list_archived_session_ids_uses_index_and_filters_invalid_keys() -> None:
@@ -259,7 +259,7 @@ def _write_stream(session_path: Path) -> None:
     }) + "\n").encode())
 
 
-def _published(paths: Paths, root: Path,
+def _published(paths: StoragePaths, root: Path,
                content: bytes | None = None) -> tuple[SessionStore, DirectorySession]:
     store = SessionStore(paths)
     session = DirectorySession(

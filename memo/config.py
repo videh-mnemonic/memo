@@ -11,7 +11,7 @@ PUSH_INTERVAL_SECONDS = 15 * 60.0
 
 
 @dataclass(frozen=True)
-class Paths:
+class StoragePaths:
     home: Path
     archive: Path | None = None
     runtime: Path | None = None
@@ -29,7 +29,7 @@ class Paths:
         object.__setattr__(self, "spool", self.spool or runtime / "sessions")
 
     @classmethod
-    def discover(cls) -> "Paths":
+    def discover(cls) -> "StoragePaths":
         home = Path(os.environ.get("MEMO_HOME", "~/memo")).expanduser().resolve()
         return cls(home)
 
