@@ -6,9 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..config import StoragePaths
-from ..models import StepManifest
-from ..session_store import SessionStore
-from ..streams import StreamEvent
+from ..recording.models import StepManifest
+from ..recording.store import SessionStore
+from ..recording.streams import StreamEvent
 
 
 def parse_step(value: str | int) -> int:

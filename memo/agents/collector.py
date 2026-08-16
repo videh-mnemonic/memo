@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from .harnesses import get_harness
-from .harnesses.harness import model_context, source_records
+from .harnesses.base import model_context, source_records
 from .tracewatch import TraceCheckpoint, changed, snapshot_complete
-from ..registry import CaptureWindow, Registry
-from ..session_store import SessionStore, atomic_write
+from ..daemon.registry import CaptureWindow, Registry
+from ..recording.store import SessionStore, atomic_write
 
 
 def _json_bytes(value: dict[str, object]) -> bytes:

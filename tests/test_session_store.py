@@ -92,7 +92,7 @@ def test_failed_head_replacement_preserves_previous_visibility(tmp_path: Path, m
     session = _session(root)
     directory = store.create(session)
     first = _publish(store, session, 0)
-    from memo import session_store
+    from memo.recording import store as session_store
     original = session_store.atomic_write
     def fail_head(path: Path, data: bytes) -> None:
         if path.name == "HEAD":
@@ -174,7 +174,7 @@ def test_remove_archived_renames_before_recursive_removal(
         destinations.append(path)
         raise OSError("injected removal failure")
 
-    monkeypatch.setattr("memo.session_store.shutil.rmtree", fail_removal)
+    monkeypatch.setattr("memo.recording.store.shutil.rmtree", fail_removal)
     with pytest.raises(OSError, match="injected"):
         store.remove_archived("session")
 

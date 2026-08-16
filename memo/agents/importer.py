@@ -12,12 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from .harnesses import registered_harnesses
-from .harnesses.harness import AgentHarness, SourceRecord, model_context, source_records
+from .harnesses.base import AgentHarness, SourceRecord, model_context, source_records
 from .tracewatch import files, snapshot_complete
 from ..config import StoragePaths, TransportConfig
-from ..models import DirectorySession, SessionOrigin, StepManifest
-from ..session_store import SessionStore, atomic_write, validate_session_id
-from ..step import utcnow
+from ..recording.models import DirectorySession, SessionOrigin, StepManifest
+from ..recording.store import SessionStore, atomic_write, validate_session_id
+from ..recording.snapshots import utcnow
 
 
 @dataclass

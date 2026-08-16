@@ -5,10 +5,10 @@ import os
 import sys
 from pathlib import Path
 
-from .daemon import end, push, remove_archived
-from .export import replay_session, terminal_ids, trace_json, write_traces
-from .relay import run as run_relay
-from .status import render_status
+from ..daemon.client import end, push, remove_archived
+from ..export import replay_session, terminal_ids, trace_json, write_traces
+from ..recording.relay import run as run_relay
+from .commands.status import render_status
 
 
 COMMANDS = {"end", "status", "traces", "replay", "push", "pull", "import", "tidy"}
@@ -22,7 +22,7 @@ def _positive_int(value: str) -> int:
 
 
 def _ensure_local_session(session_id: str) -> None:
-    from .transport import ensure_local_session
+    from ..transport import ensure_local_session
 
     ensure_local_session(session_id)
 
@@ -147,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             if response.get("cloud") == "pending":
                 print("cloud upload started; automatic retry remains enabled", file=sys.stderr)
         elif args.command == "import":
-            from .agents.importer import import_native_sessions
+            from ..agents.importer import import_native_sessions
 
             summary = import_native_sessions()
             print(f"imported: {len(summary.imported)}")
@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"unimportable: {source}: {error}", file=sys.stderr)
             return 1 if summary.failed else 0
         elif args.command == "tidy":
-            from .agents.importer import import_native_sessions
+            from ..agents.importer import import_native_sessions
 
             imported = import_native_sessions()
             print(f"imported: {len(imported.imported)}")
@@ -194,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"failed: {session_id}: {error}", file=sys.stderr)
             return 1 if response["failed"] else 0
         elif args.command == "pull":
-            from .transport import pull_session
+            from ..transport import pull_session
             destination = pull_session(args.session_id, force=args.force)
             print(f"pulled: {args.session_id} path={destination}")
         elif args.command == "traces":

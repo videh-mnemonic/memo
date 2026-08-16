@@ -147,10 +147,10 @@ def test_shim_notifies_around_real_process_and_preserves_status(
     monkeypatch.setenv("MEMO_SHIM_DIR", str(shim_directory))
     monkeypatch.setenv("MEMO_SESSION_ID", "session")
     monkeypatch.setenv("MEMO_TERMINAL_ID", "terminal")
-    monkeypatch.setattr("memo.shim.StoragePaths.discover", lambda: paths)
-    monkeypatch.setattr("memo.shim.ensure_daemon", lambda _: None)
+    monkeypatch.setattr("memo.agents.shim.StoragePaths.discover", lambda: paths)
+    monkeypatch.setattr("memo.agents.shim.ensure_daemon", lambda _: None)
     monkeypatch.setattr(
-        "memo.shim.request",
+        "memo.agents.shim.request",
         lambda _socket, operation, payload, **_kwargs: messages.append((operation, payload)) or {},
     )
 

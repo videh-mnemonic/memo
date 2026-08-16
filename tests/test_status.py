@@ -48,7 +48,7 @@ def test_status_reports_operational_session_summary(tmp_path: Path, monkeypatch)
     with Registry(paths.registry) as registry:
         registry.create(root, session.created_utc, session.session_id)
         registry.allocate_attachment(session.session_id, session.created_utc, "terminal")
-    monkeypatch.setattr("memo.status._session_size", lambda _path: 284 * 1024 * 1024)
+    monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 284 * 1024 * 1024)
 
     lines = render_status(paths, now=now).splitlines()
 
@@ -76,7 +76,7 @@ def test_status_uses_count_based_steps_and_never_archived_marker(
     )
     store.create(session)
     StepPublisher(store).publish(session)
-    monkeypatch.setattr("memo.status._session_size", lambda _path: 0)
+    monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
 
     line = render_status(paths, now=now).splitlines()[1]
 
@@ -125,7 +125,7 @@ def test_status_can_select_one_exact_session(tmp_path: Path, monkeypatch) -> Non
             session_id, str(root.resolve()), "now", "now",
             SessionOrigin("1.0.0", "user", "host"), "complete",
         ))
-    monkeypatch.setattr("memo.status._session_size", lambda _path: 0)
+    monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
 
     lines = render_status(paths, session_id="two").splitlines()
 
@@ -151,7 +151,7 @@ def test_status_appends_remote_only_sessions_and_applies_combined_limit(
             SessionOrigin("1.0.0", "user", "host"), "complete",
         )
         store.create(session)
-    monkeypatch.setattr("memo.status._session_size", lambda _path: 0)
+    monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
     monkeypatch.setattr(
         "memo.transport.list_archived_session_ids",
         lambda: ["local-a", "remote-a", "remote-b"],
@@ -173,7 +173,7 @@ def test_status_limit_can_be_satisfied_without_listing_archive(
         "local", str(root.resolve()), "now", "now",
         SessionOrigin("1.0.0", "user", "host"), "complete",
     ))
-    monkeypatch.setattr("memo.status._session_size", lambda _path: 0)
+    monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
     monkeypatch.setattr(
         "memo.transport.list_archived_session_ids",
         lambda: (_ for _ in ()).throw(AssertionError("archive should not be listed")),

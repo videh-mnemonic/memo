@@ -39,7 +39,7 @@ def test_unstable_read_retains_prior_version(tmp_path: Path, monkeypatch) -> Non
     previous.mkdir()
     (previous / "changing.txt").write_text("prior")
     destination = tmp_path / "snapshot"
-    from memo import step
+    from memo.recording import snapshots as step
     monkeypatch.setattr(step, "_stable_copy", lambda *args: False)
     entry = next(item for item in scan_tree(root, destination, previous=previous, max_file_size=100)
                  if item.path == "changing.txt")

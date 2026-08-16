@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .harness import AgentHarness, ParseContext, SourceRecord, TraceEvent
+from .base import AgentHarness, ParseContext, SourceRecord, TraceEvent
 
 
 def _flag_resume(args: Sequence[str]) -> str | None:

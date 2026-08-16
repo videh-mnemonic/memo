@@ -4,10 +4,10 @@ import json
 from pathlib import Path
 
 from ..agents.harnesses import get_harness
-from ..agents.harnesses.harness import source_records, trace_events
+from ..agents.harnesses.base import source_records, trace_events
 from ..config import StoragePaths
-from ..session_store import SessionStore
-from ..streams import StreamEvent
+from ..recording.store import SessionStore
+from ..recording.streams import StreamEvent
 
 
 def terminal_ids(session_id: str, paths: StoragePaths | None = None) -> list[str]:

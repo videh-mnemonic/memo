@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from .claude import _filename_id, _first_string, _flag_resume
-from .harness import AgentHarness, ParseContext, SourceRecord, TraceEvent
+from .base import AgentHarness, ParseContext, SourceRecord, TraceEvent
 
 
 class CodexHarness(AgentHarness):

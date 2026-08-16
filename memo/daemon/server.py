@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import fcntl
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -10,24 +9,23 @@ from multiprocessing.connection import Client, Connection, Listener
 from pathlib import Path
 from typing import IO, Any
 
-from .step import StepPublisher, utcnow
-from .config import (PUSH_INTERVAL_SECONDS, STEP_INTERVAL_SECONDS,
-                     WATCHER_DEBOUNCE_SECONDS, StoragePaths, TransportConfig)
-from .models import DirectorySession, SessionOrigin
+from ..recording.snapshots import StepPublisher, utcnow
+from ..config import (PUSH_INTERVAL_SECONDS, STEP_INTERVAL_SECONDS,
+                      WATCHER_DEBOUNCE_SECONDS, StoragePaths, TransportConfig)
+from ..recording.models import DirectorySession, SessionOrigin
 from .protocol import (
     DisconnectedError,
     ProtocolError,
     Request,
     Response,
     receive_request,
-    request,
     send_message,
 )
 from .registry import ActiveSession, AgentLaunch, Registry
-from .session_store import SessionStore
-from .agents.collector import TraceCollector
-from .agents.harnesses import get_harness
-from .agents.tracewatch import capture
+from ..recording.store import SessionStore
+from ..agents.collector import TraceCollector
+from ..agents.harnesses import get_harness
+from ..agents.tracewatch import capture
 
 
 class DaemonAlreadyRunning(RuntimeError):
@@ -42,7 +40,7 @@ class MemoDaemon:
         assert self.paths.socket is not None
         self.registry = Registry(self.paths.registry)
         self.store = SessionStore(self.paths)
-        from .streams import StreamStore
+        from ..recording.streams import StreamStore
         self.streams = StreamStore(self.paths, self.registry)
         self.publisher = StepPublisher(
             self.store,
@@ -391,8 +389,8 @@ class MemoDaemon:
         return {"launch_id": launch_id, "capture": "complete"}
 
     def _push(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from .transport import (PushSummary, prepare_generation,
-                                publish_generation)
+        from ..transport import (PushSummary, prepare_generation,
+                                 publish_generation)
         config = TransportConfig.discover(required=True)
         assert config is not None
         selected = payload.get("session_id")
@@ -574,89 +572,6 @@ class MemoDaemon:
             if self._lock_handle:
                 fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_UN)
                 self._lock_handle.close()
-
-
-def ensure_daemon(paths: StoragePaths | None = None, timeout: float = 5.0) -> None:
-    paths = paths or StoragePaths.discover()
-    paths.ensure_storage()
-    assert paths.socket is not None
-    try:
-        if request(str(paths.socket), "health", timeout=0.25).get("status") == "ok":
-            return
-    except (OSError, ProtocolError):
-        pass
-    subprocess.Popen(
-        [sys.executable, "-m", "memo.daemon"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        env=os.environ.copy(),
-    )
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            if request(str(paths.socket), "health", timeout=0.25).get("status") == "ok":
-                return
-        except (OSError, ProtocolError):
-            time.sleep(0.05)
-    raise RuntimeError("memo daemon did not start")
-
-
-def attach(path: Path, paths: StoragePaths | None = None, *, decision: str | None = None,
-           expected_session_id: str | None = None,
-           expected_revision: int | None = None) -> dict[str, Any]:
-    paths = paths or StoragePaths.discover()
-    ensure_daemon(paths)
-    assert paths.socket is not None
-    payload: dict[str, Any] = {"path": str(path)}
-    if decision is not None:
-        payload.update({"decision": decision, "expected_session_id": expected_session_id,
-                        "expected_revision": expected_revision})
-    return request(str(paths.socket), "attach", payload)
-
-
-def end(path: Path | None = None, paths: StoragePaths | None = None, *,
-        session_id: str | None = None, terminal_id: str | None = None,
-        confirmed: bool = False, expected_revision: int | None = None,
-        capture_scope: str | None = None, prompt_scope: bool = False) -> dict[str, Any]:
-    paths = paths or StoragePaths.discover()
-    ensure_daemon(paths)
-    assert paths.socket is not None
-    payload: dict[str, Any] = {}
-    if path is not None:
-        payload["path"] = str(path)
-    if session_id is not None:
-        payload["session_id"] = session_id
-    if terminal_id is not None:
-        payload["terminal_id"] = terminal_id
-    if confirmed:
-        payload["confirmed"] = True
-    if expected_revision is not None:
-        payload["expected_revision"] = expected_revision
-    if capture_scope is not None:
-        payload["capture_scope"] = capture_scope
-    if prompt_scope:
-        payload["prompt_scope"] = True
-    return request(str(paths.socket), "end", payload, timeout=60.0)
-
-
-def push(session_id: str | None = None, paths: StoragePaths | None = None) -> dict[str, Any]:
-    paths = paths or StoragePaths.discover()
-    ensure_daemon(paths)
-    assert paths.socket is not None
-    payload = {"session_id": session_id} if session_id else {}
-    return request(str(paths.socket), "push", payload, timeout=300.0)
-
-
-def remove_archived(exclude: list[str] | None = None,
-                    paths: StoragePaths | None = None) -> dict[str, Any]:
-    paths = paths or StoragePaths.discover()
-    ensure_daemon(paths)
-    assert paths.socket is not None
-    return request(
-        str(paths.socket), "remove_archived", {"exclude": exclude or []}, timeout=60.0
-    )
 
 
 def main() -> int:

@@ -1,23 +1,6 @@
-from __future__ import annotations
+"""Provider-specific coding-agent harnesses."""
 
-"""Registered provider-specific agent trace harnesses."""
+from .base import AgentHarness
+from .registry import get_harness, registered_harnesses
 
-from .claude import ClaudeHarness
-from .codex import CodexHarness
-from .harness import AgentHarness
-
-
-_HARNESSES: dict[str, AgentHarness] = {
-    harness.name: harness for harness in (ClaudeHarness(), CodexHarness())
-}
-
-
-def get_harness(name: str) -> AgentHarness:
-    try:
-        return _HARNESSES[name]
-    except KeyError as error:
-        raise ValueError(f"unsupported agent harness: {name}") from error
-
-
-def registered_harnesses() -> tuple[AgentHarness, ...]:
-    return tuple(_HARNESSES.values())
+__all__ = ["AgentHarness", "get_harness", "registered_harnesses"]
