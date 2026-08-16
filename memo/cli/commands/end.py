@@ -16,6 +16,11 @@ def configure(subparsers: Any) -> None:
     command = subparsers.add_parser(NAME, help="finish a recording")
     command.add_argument("path", nargs="?", type=Path)
     command.add_argument("--scope", choices=("partial", "full"))
+    command.add_argument(
+        "--wait-for-push",
+        action="store_true",
+        help="wait for the final cloud upload before returning",
+    )
     command.set_defaults(handler=run)
 
 
@@ -30,6 +35,7 @@ def run(args: Any) -> int:
         terminal_id=environment_terminal,
         capture_scope=args.scope,
         prompt_scope=prompt_scope,
+        wait_for_push=args.wait_for_push,
     )
     confirmed = False
     expected_revision = None
@@ -48,6 +54,7 @@ def run(args: Any) -> int:
                 confirmed=confirmed,
                 expected_revision=expected_revision,
                 capture_scope=selected_scope,
+                wait_for_push=args.wait_for_push,
             )
             continue
         count = int(response["other_terminals"])
@@ -71,9 +78,16 @@ def run(args: Any) -> int:
             expected_revision=expected_revision,
             capture_scope=args.scope,
             prompt_scope=prompt_scope,
+            wait_for_push=args.wait_for_push,
         )
     action = "already complete" if response["already_complete"] else "completed"
     print(f"{action}: {response['session_id']} step={response['step']}")
     if response.get("cloud") == "pending":
         print("cloud upload started; automatic retry remains enabled", file=sys.stderr)
+    elif response.get("cloud") == "pushed":
+        print("cloud upload complete", file=sys.stderr)
+    elif response.get("cloud") == "failed":
+        for session_id, error in response.get("push", {}).get("failed", []):
+            print(f"cloud upload failed: {session_id}: {error}", file=sys.stderr)
+        return 1
     return 0

@@ -250,6 +250,7 @@ class MemoDaemon:
 
     def _end(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._expire_stale_attachments()
+        s3_config = self._s3_config(payload, required=False)
         active = self._resolve_active(payload)
         if active is None:
             session_id = payload.get("session_id")
@@ -309,15 +310,22 @@ class MemoDaemon:
             result = self._finish(active, capture_scope=selected_scope)
         # Local completion is authoritative. Cloud publication starts only after
         # lifecycle locks have been released and cannot delay or roll it back.
-        if S3Config.discover() is not None:
-            self._schedule_push(active.session_id)
-            result["cloud"] = "pending"
+        if s3_config is not None:
+            if payload.get("wait_for_push"):
+                push_result = self._push(
+                    {"session_id": active.session_id, "s3": s3_config.to_dict()}
+                )
+                result["push"] = push_result
+                result["cloud"] = "failed" if push_result["failed"] else "pushed"
+            else:
+                self._schedule_push(active.session_id, s3_config)
+                result["cloud"] = "pending"
         return result
 
-    def _schedule_push(self, session_id: str) -> None:
+    def _schedule_push(self, session_id: str, config: S3Config) -> None:
         def upload() -> None:
             try:
-                result = self._push({"session_id": session_id})
+                result = self._push({"session_id": session_id, "s3": config.to_dict()})
                 if result["failed"]:
                     print(
                         f"memo daemon: final cloud push pending for {session_id}: "
@@ -331,6 +339,17 @@ class MemoDaemon:
                 )
 
         threading.Thread(target=upload, daemon=True).start()
+
+    def _s3_config(self, payload: dict[str, Any], *, required: bool) -> S3Config | None:
+        raw = payload.get("s3")
+        if raw is None:
+            return S3Config.discover(required=required)
+        if not isinstance(raw, dict):
+            raise ProtocolError("s3 config must be an object")
+        try:
+            return S3Config.from_dict(raw)
+        except ValueError as error:
+            raise ProtocolError(str(error)) from error
 
     def _finish(self, active: ActiveSession, capture_scope: str | None = None) -> dict[str, Any]:
         with self._session_lock(active.session_id):
@@ -454,7 +473,7 @@ class MemoDaemon:
     def _push(self, payload: dict[str, Any]) -> dict[str, Any]:
         from ..transport import PushSummary, prepare_generation, publish_generation
 
-        config = S3Config.discover(required=True)
+        config = self._s3_config(payload, required=True)
         assert config is not None
         selected = payload.get("session_id")
         summary = PushSummary()

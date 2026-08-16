@@ -36,7 +36,7 @@ offers to resume it or complete it and start a new one.
 ### End a recording
 
 ```console
-memo end [PATH] [--scope {partial,full}]
+memo end [PATH] [--scope {partial,full}] [--wait-for-push]
 ```
 
 Publishes a final step and completes the recording. Inside a Memo shell, `PATH`
@@ -44,6 +44,8 @@ can be omitted even after changing directories.
 
 - `--scope partial`: mark the recording as missing some intended work.
 - `--scope full`: mark the recording as containing all intended work.
+- `--wait-for-push`: when S3 is configured, wait for the final cloud upload and
+  fail if it cannot complete.
 
 Without `--scope`, an interactive invocation asks. Memo also asks before ending
 a recording that still has other attached shells.
@@ -123,7 +125,9 @@ recording store. Legacy source directories and tarballs are left in place.
 The migrator is conservative: it converts recordings with enough Git artifacts
 to reconstruct a final filesystem snapshot, preserves copied Claude/Codex
 JSONL traces as agent run sidecars, skips sessions that already exist in the
-new store, and reports incomplete or unsupported legacy recordings.
+new store, and reports incomplete or unsupported legacy recordings. It is a
+final-state migration: old per-leg Git history is not expanded into separate
+new-format steps.
 
 ### Push recordings
 
@@ -165,6 +169,25 @@ minutes, and a final upload after `memo end`:
 export MEMO_S3_BUCKET=my-memo-bucket
 ```
 
+Use normal AWS credential sources. Environment variables are the most direct:
+
+```console
+export MEMO_S3_BUCKET=my-memo-bucket
+export MEMO_S3_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...   # only for temporary credentials
+```
+
+Or use an AWS profile:
+
+```console
+aws configure --profile memo
+export MEMO_S3_BUCKET=my-memo-bucket
+export MEMO_S3_PROFILE=memo
+export MEMO_S3_REGION=us-east-1
+```
+
 Optional settings:
 
 - `MEMO_S3_PREFIX`: object-key prefix; defaults to `memo`.
@@ -177,6 +200,12 @@ Memo uses AWS environment, profile, and IAM credential providers. Credentials
 need `GetObject`, prefix-limited `ListBucket`, `PutObject`, and
 `AbortMultipartUpload`; object deletion is not required. Archives are
 checksummed, validated before installation, and installed atomically.
+
+Memo sends current `MEMO_S3_*`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, and temporary session-token settings with push/end
+requests. If a daemon was started before S3 variables were set, explicit
+`memo push` and final `memo end` uploads use the caller's current settings; the
+daemon's periodic automatic upload loop uses the daemon process environment.
 
 ### Show Memo in your shell prompt
 

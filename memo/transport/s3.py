@@ -49,20 +49,30 @@ def _close_response(response: Any) -> None:
 
 def _minio_client(config: S3Config) -> Any:
     from minio import Minio
-    from minio.credentials import AWSConfigProvider, ChainedProvider, EnvAWSProvider, IamAwsProvider
+    from minio.credentials import (
+        AWSConfigProvider,
+        ChainedProvider,
+        EnvAWSProvider,
+        IamAwsProvider,
+        StaticProvider,
+    )
 
     endpoint = config.endpoint_url or "https://s3.amazonaws.com"
     parsed = urlsplit(endpoint if "://" in endpoint else f"https://{endpoint}")
     if not parsed.netloc:
         raise ValueError(f"invalid S3 endpoint: {endpoint}")
-    providers = [EnvAWSProvider()]
-    providers.append(AWSConfigProvider(profile=config.profile))
-    providers.append(IamAwsProvider())
+    if config.access_key and config.secret_key:
+        credentials = StaticProvider(config.access_key, config.secret_key, config.session_token)
+    else:
+        providers = [EnvAWSProvider()]
+        providers.append(AWSConfigProvider(profile=config.profile))
+        providers.append(IamAwsProvider())
+        credentials = ChainedProvider(providers)
     return Minio(
         parsed.netloc,
         secure=parsed.scheme != "http",
         region=config.region,
-        credentials=ChainedProvider(providers),
+        credentials=credentials,
     )
 
 

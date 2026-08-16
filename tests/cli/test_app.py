@@ -43,6 +43,28 @@ def test_end_prefers_shell_session_identity(monkeypatch, tmp_path: Path, capsys)
     assert "completed: session step=2" in capsys.readouterr().out
 
 
+def test_end_wait_for_push_reports_failure(monkeypatch, capsys) -> None:
+    captured = {}
+
+    def fake_end(path=None, **values):
+        captured.update({"path": path, **values})
+        return {
+            "session_id": "session",
+            "step": 2,
+            "already_complete": False,
+            "cloud": "failed",
+            "push": {"pushed": [], "skipped": [], "failed": [("session", "denied")]},
+        }
+
+    monkeypatch.setattr("memo.cli.commands.end.end", fake_end)
+
+    assert main(["end", "--wait-for-push", "."]) == 1
+    assert captured["wait_for_push"] is True
+    captured_output = capsys.readouterr()
+    assert "completed: session step=2" in captured_output.out
+    assert "cloud upload failed: session: denied" in captured_output.err
+
+
 def test_end_decline_leaves_recording_unchanged(monkeypatch, capsys) -> None:
     calls = []
     monkeypatch.setattr(

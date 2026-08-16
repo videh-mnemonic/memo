@@ -10,6 +10,7 @@ from memo.daemon.protocol import request
 from memo.daemon.server import TERMINAL_STALE_SECONDS, MemoDaemon
 from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore
+from memo.transport.config import S3Config
 
 
 def _running(
@@ -350,7 +351,7 @@ def test_end_starts_final_push_after_releasing_lifecycle_locks(
 ) -> None:
     monkeypatch.setattr(
         "memo.daemon.server.S3Config.discover",
-        classmethod(lambda cls, required=False: object()),
+        classmethod(lambda cls, required=False: S3Config("bucket")),
     )
     called = threading.Event()
     lock_state: dict[str, bool] = {}
@@ -385,5 +386,35 @@ def test_end_starts_final_push_after_releasing_lifecycle_locks(
         assert ended["cloud"] == "pending"
         assert called.wait(3)
         assert lock_state == {"session": True, "root": True, "complete": True}
+    finally:
+        _stop(paths, thread)
+
+
+def test_end_can_wait_for_final_push(tmp_path: Path, monkeypatch) -> None:
+    observed_payload: dict[str, object] = {}
+
+    def fake_push(self: MemoDaemon, payload: dict[str, object]) -> dict[str, object]:
+        observed_payload.update(payload)
+        return {"pushed": [str(payload["session_id"])], "skipped": [], "failed": []}
+
+    monkeypatch.setattr(MemoDaemon, "_push", fake_push)
+    paths, root, _, thread = _running(tmp_path)
+    try:
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        ended = request(
+            str(paths.socket),
+            "end",
+            {
+                "session_id": attached["session_id"],
+                "terminal_id": attached["terminal_id"],
+                "wait_for_push": True,
+                "s3": S3Config("bucket", access_key="access", secret_key="secret").to_dict(),
+            },
+        )
+        assert ended["state"] == "complete"
+        assert ended["cloud"] == "pushed"
+        assert ended["push"]["pushed"] == [attached["session_id"]]
+        assert observed_payload["session_id"] == attached["session_id"]
+        assert observed_payload["s3"]["access_key"] == "access"
     finally:
         _stop(paths, thread)

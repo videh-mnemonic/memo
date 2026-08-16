@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from ..recording.paths import StoragePaths
+from ..transport.config import S3Config
 from .protocol import ProtocolError, request
+
+
+def _s3_payload() -> dict[str, Any] | None:
+    config = S3Config.discover()
+    return None if config is None else config.to_dict()
 
 
 def ensure_daemon(paths: StoragePaths | None = None, timeout: float = 5.0) -> None:
@@ -71,6 +77,7 @@ def end(
     expected_revision: int | None = None,
     capture_scope: str | None = None,
     prompt_scope: bool = False,
+    wait_for_push: bool = False,
 ) -> dict[str, Any]:
     paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
@@ -89,13 +96,22 @@ def end(
         payload["capture_scope"] = capture_scope
     if prompt_scope:
         payload["prompt_scope"] = True
-    return request(str(paths.socket), "end", payload, timeout=60.0)
+    if wait_for_push:
+        payload["wait_for_push"] = True
+    config = _s3_payload()
+    if config is not None:
+        payload["s3"] = config
+    timeout = 300.0 if wait_for_push else 60.0
+    return request(str(paths.socket), "end", payload, timeout=timeout)
 
 
 def push(session_id: str | None = None, paths: StoragePaths | None = None) -> dict[str, Any]:
     paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
     payload = {"session_id": session_id} if session_id else {}
+    config = _s3_payload()
+    if config is not None:
+        payload["s3"] = config
     return request(str(paths.socket), "push", payload, timeout=300.0)
 
 
