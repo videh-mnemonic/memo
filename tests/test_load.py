@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from memo.config import Paths
-from memo.load import inspect_session, replay_session, trace_json, write_traces
+from memo.load import replay_session, terminal_ids, trace_json, write_traces
 from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.session_store import SessionStore, atomic_write
 from memo.streams import StreamEvent
@@ -65,14 +65,9 @@ def _fixture(tmp_path: Path) -> tuple[Paths, SessionStore, DirectorySession]:
     return paths, store, session
 
 
-def test_inspect_reports_latest_step(tmp_path: Path) -> None:
+def test_terminal_ids_reports_latest_step_streams(tmp_path: Path) -> None:
     paths, _, _ = _fixture(tmp_path)
-    output = inspect_session("session", paths)
-    assert "Format: directory" in output
-    assert "State: complete" in output
-    assert "Capture scope: partial" in output
-    assert "Filesystem: captured" in output
-    assert "Step: 1" in output
+    assert terminal_ids("session", paths) == ["a", "z"]
 
 
 def test_agent_only_session_cannot_replay(tmp_path: Path) -> None:
@@ -146,4 +141,4 @@ def test_invalid_directory_manifest_is_rejected(tmp_path: Path) -> None:
     assert head is not None
     (session_path / head.snapshot / "note.txt").unlink()
     with pytest.raises(ValueError, match="missing snapshot file"):
-        inspect_session("session", paths)
+        terminal_ids("session", paths)

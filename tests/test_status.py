@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from memo.config import Paths
 from memo.models import DirectorySession, SessionOrigin
 from memo.registry import Registry
@@ -111,6 +113,29 @@ def test_session_size_counts_regular_files_recursively(tmp_path: Path) -> None:
 
 def test_status_reports_no_sessions_when_storage_is_empty(tmp_path: Path) -> None:
     assert render_status(_paths(tmp_path)) == "No sessions.\n"
+
+
+def test_status_can_select_one_exact_session(tmp_path: Path, monkeypatch) -> None:
+    paths = _paths(tmp_path / "memo-home")
+    store = SessionStore(paths)
+    for session_id in ("one", "two"):
+        root = tmp_path / session_id
+        root.mkdir()
+        store.create(DirectorySession(
+            session_id, str(root.resolve()), "now", "now",
+            SessionOrigin("1.0.0", "user", "host"), "complete",
+        ))
+    monkeypatch.setattr("memo.status._session_size", lambda _path: 0)
+
+    lines = render_status(paths, session_id="two").splitlines()
+
+    assert len(lines) == 2
+    assert lines[1].split()[0] == "two"
+
+
+def test_single_status_rejects_list_only_options(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="single-session status"):
+        render_status(_paths(tmp_path), session_id="session", limit=1)
 
 
 def test_status_appends_remote_only_sessions_and_applies_combined_limit(

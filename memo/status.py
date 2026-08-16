@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import Paths
+from .models import DirectorySession
 from .registry import Registry
 from .session_store import SessionStore
 
@@ -69,10 +70,36 @@ def _format_size(size: int) -> str:
     return f"{int(rounded)} {unit}" if rounded.is_integer() else f"{rounded:.1f} {unit}"
 
 
+def _local_row(store: SessionStore, session_path: Path, session: DirectorySession,
+               active: dict[str, tuple[str, int]], now: datetime) -> tuple[str, ...]:
+    head = store.head(session.session_id)
+    state, attachments = active.get(session.session_id, (session.state, 0))
+    steps = 0 if head is None else head.step + 1
+    archived = (
+        "—" if session.last_pushed_step is None
+        else f"{min(session.last_pushed_step + 1, steps)}/{steps}"
+    )
+    return (
+        session.session_id,
+        session.root,
+        state,
+        session.capture_scope,
+        _age(session.created_utc, now),
+        "—" if head is None else _age(head.created_utc, now, ago=True),
+        str(attachments),
+        str(steps),
+        _format_size(_session_size(session_path)),
+        archived,
+    )
+
+
 def render_status(paths: Paths | None = None, *, now: datetime | None = None,
-                  include_archive: bool = False, limit: int | None = None) -> str:
+                  include_archive: bool = False, limit: int | None = None,
+                  session_id: str | None = None) -> str:
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive")
+    if session_id is not None and (include_archive or limit is not None):
+        raise ValueError("single-session status cannot use --include-archive or --limit")
     paths = paths or Paths.discover()
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -90,31 +117,17 @@ def render_status(paths: Paths | None = None, *, now: datetime | None = None,
                          if value.detached_utc is None]),
                 )
     store = SessionStore(paths)
-    local_sessions = store.list_sessions()
-    if limit is not None:
-        local_sessions = local_sessions[:limit]
-    local_ids = set()
-    for session_path, session in local_sessions:
-        local_ids.add(session.session_id)
-        head = store.head(session.session_id)
-        state, attachments = active.get(session.session_id, (session.state, 0))
-        steps = 0 if head is None else head.step + 1
-        archived = (
-            "—" if session.last_pushed_step is None
-            else f"{min(session.last_pushed_step + 1, steps)}/{steps}"
-        )
-        rows.append((
-            session.session_id,
-            session.root,
-            state,
-            session.capture_scope,
-            _age(session.created_utc, now),
-            "—" if head is None else _age(head.created_utc, now, ago=True),
-            str(attachments),
-            str(steps),
-            _format_size(_session_size(session_path)),
-            archived,
-        ))
+    if session_id is not None:
+        local_sessions = [store.find(session_id)]
+        local_ids = {session_id}
+    else:
+        all_local_sessions = store.list_sessions()
+        local_ids = {session.session_id for _, session in all_local_sessions}
+        local_sessions = all_local_sessions[:limit]
+    rows.extend(
+        _local_row(store, session_path, session, active, now)
+        for session_path, session in local_sessions
+    )
     remaining = None if limit is None else limit - len(local_sessions)
     if include_archive and (remaining is None or remaining > 0):
         from .transport import list_archived_session_ids

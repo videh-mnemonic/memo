@@ -44,6 +44,34 @@ The directory passed to `memo` is the recording's identity and filesystem root. 
 
 Changing directory inside the shell does not stop terminal recording. All input and output in the Memo shell continues to be recorded. Filesystem snapshots, however, remain rooted at the original directory; files outside that tree are not added merely because the shell changed into another directory.
 
+### Show Memo in your shell prompt
+
+Memo sets `MEMO_SESSION_ID` inside every attached shell. You can use it to make recorded shells visibly different from ordinary shells, even after changing directories.
+
+For Bash, add this near the end of `~/.bashrc`, after any other prompt setup:
+
+```bash
+if [[ -n ${MEMO_SESSION_ID:-} ]]; then
+    PS1="[memo] $PS1"
+fi
+```
+
+For Zsh, add this near the end of `~/.zshrc`, after any theme or prompt setup:
+
+```zsh
+if [[ -n ${MEMO_SESSION_ID:-} ]]; then
+    PROMPT="[memo] $PROMPT"
+fi
+```
+
+New Memo shells will then have a prompt such as:
+
+```text
+[memo] user@host:~/project$
+```
+
+The indicator disappears automatically in shells that were not opened through Memo.
+
 ## Recordings and shells are different things
 
 A recording is not the same as a shell process.
@@ -154,7 +182,7 @@ Memo does not continuously scan all Claude and Codex history. A capture window b
 
 Native trace files can still be growing when Memo publishes. Memo copies only through the last complete newline observed at a fixed byte boundary. An incomplete final JSON record remains pending for a later collection pass.
 
-## Inspect recordings
+## Review recordings
 
 List local recordings:
 
@@ -168,10 +196,10 @@ Status shows each recording's root, lifecycle state, capture scope, age, latest 
 
 By default, status lists local recordings. `--include-archive` appends remote-only recordings after the local recordings and avoids duplicate session IDs. `--limit` caps the combined number of rows. Metadata unavailable without downloading an archive is shown as `—`.
 
-Inspect the latest published state and discover its terminal IDs:
+Show one recording using the same status columns:
 
 ```console
-memo inspect <session-id>
+memo status <session-id>
 ```
 
 Local recordings use the globally unique session ID as their archive key:
@@ -212,7 +240,7 @@ Export traces from the latest published step to standard output:
 memo traces <session-id>
 ```
 
-`inspect`, `traces`, and `replay` automatically pull a session from the configured cloud archive when it is not already available locally.
+Single-session `status`, `traces`, and `replay` automatically pull a session from the configured cloud archive when it is not already available locally.
 
 Write them to a file:
 
@@ -226,7 +254,13 @@ If the step contains captured agent runs, the default export is the normalized a
 memo traces <session-id> --raw
 ```
 
-To export terminal events explicitly, select one or more terminal IDs shown by `memo inspect`:
+List the terminal stream IDs available at the latest step:
+
+```console
+memo traces <session-id> --list-terminals
+```
+
+To export terminal events explicitly, select one or more of those IDs:
 
 ```console
 memo traces <session-id> --terminals <terminal-id>
