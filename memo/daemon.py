@@ -25,9 +25,9 @@ from .protocol import (
 )
 from .registry import ActiveSession, AgentLaunch, Registry
 from .session_store import SessionStore
-from .collector import TraceCollector
-from .harnesses import get_harness
-from .tracewatch import capture
+from .agents.collector import TraceCollector
+from .agents.harnesses import get_harness
+from .agents.tracewatch import capture
 
 
 class DaemonAlreadyRunning(RuntimeError):

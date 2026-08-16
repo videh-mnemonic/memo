@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 
 from memo.config import Paths
-from memo.harnesses.claude import ClaudeHarness
-from memo.harnesses.codex import CodexHarness
-from memo.importer import import_native_sessions
+from memo.agents.harnesses.claude import ClaudeHarness
+from memo.agents.harnesses.codex import CodexHarness
+from memo.agents.importer import import_native_sessions
 from memo.load import trace_json
 from memo.session_store import SessionStore
 

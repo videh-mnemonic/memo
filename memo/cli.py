@@ -147,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             if response.get("cloud") == "pending":
                 print("cloud upload started; automatic retry remains enabled", file=sys.stderr)
         elif args.command == "import":
-            from .importer import import_native_sessions
+            from .agents.importer import import_native_sessions
 
             summary = import_native_sessions()
             print(f"imported: {len(summary.imported)}")
@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"unimportable: {source}: {error}", file=sys.stderr)
             return 1 if summary.failed else 0
         elif args.command == "tidy":
-            from .importer import import_native_sessions
+            from .agents.importer import import_native_sessions
 
             imported = import_native_sessions()
             print(f"imported: {len(imported.imported)}")

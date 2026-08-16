@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import Paths
 from .daemon import ensure_daemon
-from .harnesses import get_harness, registered_harnesses
+from .agents.harnesses import get_harness, registered_harnesses
 from .protocol import request
 from .session_store import atomic_write
 from .step import utcnow

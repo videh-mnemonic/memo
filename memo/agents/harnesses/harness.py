@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Provider harness contracts and normalized trace event helpers."""
+
 import json
 import os
 from abc import ABC, abstractmethod
@@ -140,6 +142,23 @@ def source_records(path: Path) -> Iterable[SourceRecord]:
                 yield SourceRecord(seq=seq, line=line.rstrip("\n"), error=str(error))
                 continue
             yield SourceRecord(seq=seq, value=value, line=line.rstrip("\n"))
+
+
+def model_context(records: Iterable[SourceRecord]) -> tuple[object | None, object | None]:
+    model = None
+    reasoning = None
+    for record in records:
+        if not isinstance(record.value, dict):
+            continue
+        values = [record.value]
+        values.extend(
+            value for key in ("payload", "message", "meta", "session")
+            if isinstance((value := record.value.get(key)), dict)
+        )
+        for value in values:
+            model = value.get("model", model)
+            reasoning = value.get("effort", value.get("reasoning", reasoning))
+    return model, reasoning
 
 
 def _native_version(value: Any) -> Any:

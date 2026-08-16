@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from memo.harnesses import get_harness
-from memo.harnesses.harness import source_records, trace_events
+from memo.agents.harnesses import get_harness
+from memo.agents.harnesses.harness import source_records, trace_events
 
 
 def test_source_records_represent_every_physical_line(tmp_path: Path) -> None:

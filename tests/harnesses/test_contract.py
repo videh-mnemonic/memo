@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from memo.harnesses import get_harness, registered_harnesses
-from memo.harnesses.harness import ParseContext, SourceRecord, TraceEvent
+from memo.agents.harnesses import get_harness, registered_harnesses
+from memo.agents.harnesses.harness import ParseContext, SourceRecord, TraceEvent
 
 
 def test_registry_contract() -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Claude native trace integration."""
+
 import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence

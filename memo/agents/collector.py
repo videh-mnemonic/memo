@@ -7,31 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from .harnesses import get_harness
-from .harnesses.harness import SourceRecord, source_records
-from .registry import CaptureWindow, Registry
-from .session_store import SessionStore, atomic_write
+from .harnesses.harness import model_context, source_records
 from .tracewatch import TraceCheckpoint, changed, snapshot_complete
+from ..registry import CaptureWindow, Registry
+from ..session_store import SessionStore, atomic_write
 
 
 def _json_bytes(value: dict[str, object]) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
-
-
-def _model_context(records: list[SourceRecord]) -> tuple[object | None, object | None]:
-    model = None
-    reasoning = None
-    for record in records:
-        if not isinstance(record.value, dict):
-            continue
-        values = [record.value]
-        values.extend(
-            value for key in ("payload", "message", "meta", "session")
-            if isinstance((value := record.value.get(key)), dict)
-        )
-        for value in values:
-            model = value.get("model", model)
-            reasoning = value.get("effort", value.get("reasoning", reasoning))
-    return model, reasoning
 
 
 class TraceCollector:
@@ -76,7 +59,7 @@ class TraceCollector:
                     continue
                 native_id = harness.identify_session(records, source)
                 run_id, metadata = self._run(window, native_id)
-                model, reasoning = _model_context(records)
+                model, reasoning = model_context(records)
                 if model is not None:
                     metadata["model"] = model
                 if reasoning is not None:

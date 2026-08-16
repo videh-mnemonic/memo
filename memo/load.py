@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import Paths
-from .harnesses import get_harness
-from .harnesses.harness import source_records, trace_events
+from .agents.harnesses import get_harness
+from .agents.harnesses.harness import source_records, trace_events
 from .models import StepManifest
 from .session_store import SessionStore
 from .streams import StreamEvent

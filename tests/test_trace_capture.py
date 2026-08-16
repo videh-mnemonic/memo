@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from memo.collector import TraceCollector
+from memo.agents.collector import TraceCollector
 from memo.config import Paths
 from memo.models import DirectorySession, SessionOrigin
 from memo.registry import AgentLaunch, Registry
 from memo.session_store import SessionStore
 from memo.shim import ensure_shims, run as run_shim
-from memo.tracewatch import TraceCheckpoint, capture, changed, snapshot_complete
+from memo.agents.tracewatch import TraceCheckpoint, capture, changed, snapshot_complete
 
 
 def _record(session_id: str, cwd: Path, content: str) -> str:

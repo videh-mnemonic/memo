@@ -11,14 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .collector import _model_context
-from .config import Paths, TransportConfig
 from .harnesses import registered_harnesses
-from .harnesses.harness import AgentHarness, SourceRecord, source_records
-from .models import DirectorySession, SessionOrigin, StepManifest
-from .session_store import SessionStore, atomic_write, validate_session_id
-from .step import utcnow
+from .harnesses.harness import AgentHarness, SourceRecord, model_context, source_records
 from .tracewatch import files, snapshot_complete
+from ..config import Paths, TransportConfig
+from ..models import DirectorySession, SessionOrigin, StepManifest
+from ..session_store import SessionStore, atomic_write, validate_session_id
+from ..step import utcnow
 
 
 @dataclass
@@ -183,7 +182,7 @@ def _choose_candidate(candidates: list[Candidate], temporary: Path) -> tuple[Can
 def _metadata(candidate: Candidate, run_id: str, trace_name: str,
               boundary: int, digest: str) -> dict[str, Any]:
     started, ended = _timestamps(candidate.records, candidate.source)
-    model, reasoning = _model_context(list(candidate.records))
+    model, reasoning = model_context(candidate.records)
     return {
         "run_id": run_id,
         "harness": candidate.harness.name,
@@ -287,7 +286,7 @@ def import_native_sessions(paths: Paths | None = None, *,
     known, session_ids = _local_runs(store)
     config = config if config is not None else TransportConfig.discover()
     if config is not None:
-        from .transport import inspect_archived_agent_runs
+        from ..transport import inspect_archived_agent_runs
 
         remote_runs, remote_ids = inspect_archived_agent_runs(
             SessionOrigin.current(), config, client=client,
@@ -318,7 +317,7 @@ def import_native_sessions(paths: Paths | None = None, *,
                 if imported:
                     current = max(imported, key=lambda run: run.complete_size)
                     if not current.local:
-                        from .transport import pull_session
+                        from ..transport import pull_session
 
                         pull_session(current.session_id, paths, config, client=client)
                     summary.refreshed.append(

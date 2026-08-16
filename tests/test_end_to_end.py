@@ -95,7 +95,7 @@ def test_tidy_imports_pushes_then_removes_archived(monkeypatch, capsys) -> None:
             "failed": [],
         }
 
-    monkeypatch.setattr("memo.importer.import_native_sessions", fake_import)
+    monkeypatch.setattr("memo.agents.importer.import_native_sessions", fake_import)
     monkeypatch.setattr("memo.cli.push", fake_push)
     monkeypatch.setattr("memo.cli.remove_archived", fake_remove)
 

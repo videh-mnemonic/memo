@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Discover and safely snapshot growing native agent trace files."""
+
 import json
 import os
 from collections.abc import Sequence
