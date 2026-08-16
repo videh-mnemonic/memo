@@ -158,15 +158,46 @@ def test_status_can_select_one_exact_session(tmp_path: Path, monkeypatch) -> Non
         )
     monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
 
-    lines = render_status(paths, session_id="two").splitlines()
+    output = render_status(paths, session_id="two")
 
-    assert len(lines) == 2
-    assert lines[1].split()[0] == "two"
+    assert "Session: two" in output
+    assert "State: complete" in output
+    assert "Lifecycle: complete" in output
+    assert "Session: one" not in output
+
+
+def test_status_can_filter_active_recordings(tmp_path: Path, monkeypatch) -> None:
+    paths = _paths(tmp_path / "memo-home")
+    store = SessionStore(paths)
+    for session_id, state in (("active", "active"), ("complete", "complete")):
+        root = tmp_path / session_id
+        root.mkdir()
+        store.create(
+            DirectorySession(
+                session_id,
+                str(root.resolve()),
+                "now",
+                "now",
+                SessionOrigin("1.0.0", "user", "host"),
+                state,
+            )
+        )
+    with Registry(paths.registry) as registry:
+        registry.create(tmp_path / "active", "now", "active")
+    monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
+
+    output = render_status(paths, active_only=True)
+
+    assert "active" in output
+    assert "complete" not in output
 
 
 def test_single_status_rejects_list_only_options(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="single-session status"):
         render_status(_paths(tmp_path), session_id="session", limit=1)
+
+    with pytest.raises(ValueError, match="--active"):
+        render_status(_paths(tmp_path), session_id="session", active_only=True)
 
 
 def test_status_appends_remote_only_sessions_and_applies_combined_limit(

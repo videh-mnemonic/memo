@@ -87,6 +87,20 @@ def test_public_push_and_pull_subcommands_route_results(
     assert capsys.readouterr().out == f"pulled: session path={destination}\n"
 
 
+def test_import_dry_run_routes_to_importer(monkeypatch, capsys) -> None:
+    captured = {}
+
+    def fake_import(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(imported=["one"], refreshed=["two"], skipped=[], failed=[])
+
+    monkeypatch.setattr("memo.cli.commands.import_sessions.import_native_sessions", fake_import)
+
+    assert main(["import", "--dry-run"]) == 0
+    assert captured == {"dry_run": True}
+    assert "would import: one" in capsys.readouterr().out
+
+
 def test_tidy_imports_pushes_then_removes_archived(monkeypatch, capsys) -> None:
     calls: list[object] = []
 
@@ -153,7 +167,12 @@ def test_status_options_route_to_renderer(monkeypatch, capsys) -> None:
     )
 
     assert main(["status", "--include-archive", "--limit", "7"]) == 0
-    assert captured == {"include_archive": True, "limit": 7, "session_id": None}
+    assert captured == {
+        "include_archive": True,
+        "limit": 7,
+        "session_id": None,
+        "active_only": False,
+    }
     assert capsys.readouterr().out == "status\n"
 
 

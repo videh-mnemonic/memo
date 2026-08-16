@@ -57,8 +57,11 @@ memo status [SESSION_ID] [--include-archive] [--limit N]
 - `SESSION_ID`: show one recording; pulls it from S3 if needed.
 - `--include-archive`: include remote-only recordings in the list.
 - `--limit N`: limit the total number of listed recordings.
+- `--active`: list only recordings that are still active.
 
-`--include-archive` and `--limit` cannot be used with `SESSION_ID`.
+`--include-archive`, `--limit`, and `--active` cannot be used with `SESSION_ID`.
+Single-recording status shows lifecycle, step, terminal, archive, and agent-run
+details.
 
 ### Export traces
 
@@ -97,10 +100,30 @@ Agent-only recordings contain no filesystem and cannot be replayed.
 
 ```console
 memo import
+memo import --dry-run
 ```
 
 Imports or refreshes uncaptured Claude and Codex native sessions as standalone,
 agent-only Memo recordings. Unchanged sessions are skipped.
+
+Use `--dry-run` to preview imported, refreshed, skipped, and unimportable
+sessions without writing recordings.
+
+### Migrate old Memo recordings
+
+```console
+memo migrate-legacy
+memo migrate-legacy --dry-run
+```
+
+Migrates complete recordings written by the older pre-daemon Memo prototype from
+the old `$MEMO_HOME/scratch` and old tarball archive layout into the current
+recording store. Legacy source directories and tarballs are left in place.
+
+The migrator is conservative: it converts recordings with enough Git artifacts
+to reconstruct a final filesystem snapshot, preserves copied Claude/Codex
+JSONL traces as agent run sidecars, skips sessions that already exist in the
+new store, and reports incomplete or unsupported legacy recordings.
 
 ### Push recordings
 
@@ -196,6 +219,9 @@ without uploading or removing anything.
   until `memo end`.
 - Memo runs a per-user background daemon. Filesystem activity requests durable
   numbered steps, with a regular publication interval of about 15 seconds.
+- VS Code, terminal, or shell restarts do not complete a recording by
+  themselves. Re-enter the directory with `memo` to resume, or run `memo end`
+  when the work should be finalized.
 - Each step contains a directory snapshot, terminal-stream high-water marks,
   and references to captured agent runs. `HEAD` points only to a completely
   published step.

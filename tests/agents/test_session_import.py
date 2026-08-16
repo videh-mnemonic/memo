@@ -77,6 +77,37 @@ def test_import_creates_and_refreshes_agent_only_session(tmp_path: Path, monkeyp
     assert len(json.loads(trace_json("native-session", paths=paths))) == 3
 
 
+def test_import_dry_run_reports_without_writing(tmp_path: Path, monkeypatch) -> None:
+    _, codex = _roots(monkeypatch, tmp_path)
+    root = tmp_path / "project"
+    root.mkdir()
+    source = codex / "session.jsonl"
+    source.write_text(_record("native-session", root, "first"))
+    paths = StoragePaths(tmp_path / "memo-home")
+
+    preview = import_native_sessions(paths, dry_run=True)
+
+    assert preview.imported == ["native-session"]
+    assert not SessionStore(paths).session_path("native-session").exists()
+
+    import_native_sessions(paths)
+    source.write_text(
+        source.read_text()
+        + json.dumps(
+            {
+                "timestamp": "2026-08-15T12:02:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": "second"},
+            }
+        )
+        + "\n"
+    )
+    refresh = import_native_sessions(paths, dry_run=True)
+
+    assert refresh.refreshed == ["native-session"]
+    assert SessionStore(paths).head("native-session").step == 0
+
+
 def test_import_is_idempotent_and_preserves_divergent_archive(
     tmp_path: Path,
     monkeypatch,

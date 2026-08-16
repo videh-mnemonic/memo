@@ -306,7 +306,11 @@ def _refresh(
 
 
 def import_native_sessions(
-    paths: StoragePaths | None = None, *, config: S3Config | None = None, client: Any | None = None
+    paths: StoragePaths | None = None,
+    *,
+    config: S3Config | None = None,
+    client: Any | None = None,
+    dry_run: bool = False,
 ) -> ImportSummary:
     paths = paths or StoragePaths.discover()
     store = SessionStore(paths)
@@ -350,6 +354,9 @@ def import_native_sessions(
                 imported = [run for run in prefixes if run.capture_scope == "agent-only"]
                 if imported:
                     current = max(imported, key=lambda run: run.complete_size)
+                    if dry_run:
+                        summary.refreshed.append(current.session_id)
+                        continue
                     if not current.local:
                         from ..transport import pull_session
 
@@ -360,8 +367,11 @@ def import_native_sessions(
                 else:
                     if candidate.native_id in session_ids:
                         raise ValueError("native session ID collides with an existing Memo session")
-                    summary.imported.append(_create(store, candidate, snapshot, boundary, digest))
-                    session_ids.add(candidate.native_id)
+                    if dry_run:
+                        summary.imported.append(candidate.native_id)
+                    else:
+                        summary.imported.append(_create(store, candidate, snapshot, boundary, digest))
+                        session_ids.add(candidate.native_id)
             except (OSError, ValueError, StopIteration, json.JSONDecodeError) as error:
                 summary.failed.append((label, str(error)))
     return summary
