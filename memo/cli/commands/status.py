@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import argparse
 import stat
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ...recording.paths import StoragePaths
-from ...recording.metadata import DirectorySession
 from ...daemon.registry import Registry
+from ...recording.metadata import DirectorySession
+from ...recording.paths import StoragePaths
 from ...recording.store import SessionStore
 from .common import require_local_session
-
 
 NAME = "status"
 
@@ -28,10 +27,12 @@ def _positive_int(value: str) -> int:
 def configure(subparsers: Any) -> None:
     command = subparsers.add_parser(NAME, help="list recordings")
     command.add_argument("session_id", nargs="?", help="show one recording")
-    command.add_argument("--include-archive", action="store_true",
-                         help="include remote-only archived recordings")
-    command.add_argument("--limit", type=_positive_int,
-                         help="maximum number of recordings to display")
+    command.add_argument(
+        "--include-archive", action="store_true", help="include remote-only archived recordings"
+    )
+    command.add_argument(
+        "--limit", type=_positive_int, help="maximum number of recordings to display"
+    )
     command.set_defaults(handler=run)
 
 
@@ -40,22 +41,25 @@ def run(args: Any) -> int:
         if args.include_archive or args.limit is not None:
             raise ValueError("single-session status cannot use --include-archive or --limit")
         require_local_session(args.session_id)
-    print(render_status(
-        include_archive=args.include_archive,
-        limit=args.limit,
-        session_id=args.session_id,
-    ), end="")
+    print(
+        render_status(
+            include_archive=args.include_archive,
+            limit=args.limit,
+            session_id=args.session_id,
+        ),
+        end="",
+    )
     return 0
 
 
 def _parse_utc(value: str) -> datetime | None:
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _age(value: str, now: datetime, *, ago: bool = False) -> str:
@@ -108,13 +112,19 @@ def _format_size(size: int) -> str:
     return f"{int(rounded)} {unit}" if rounded.is_integer() else f"{rounded:.1f} {unit}"
 
 
-def _local_row(store: SessionStore, session_path: Path, session: DirectorySession,
-               active: dict[str, tuple[str, int]], now: datetime) -> tuple[str, ...]:
+def _local_row(
+    store: SessionStore,
+    session_path: Path,
+    session: DirectorySession,
+    active: dict[str, tuple[str, int]],
+    now: datetime,
+) -> tuple[str, ...]:
     head = store.head(session.session_id)
     state, attachments = active.get(session.session_id, (session.state, 0))
     steps = 0 if head is None else head.step + 1
     archived = (
-        "—" if session.last_pushed_step is None
+        "—"
+        if session.last_pushed_step is None
         else f"{min(session.last_pushed_step + 1, steps)}/{steps}"
     )
     return (
@@ -131,28 +141,50 @@ def _local_row(store: SessionStore, session_path: Path, session: DirectorySessio
     )
 
 
-def render_status(paths: StoragePaths | None = None, *, now: datetime | None = None,
-                  include_archive: bool = False, limit: int | None = None,
-                  session_id: str | None = None) -> str:
+def render_status(
+    paths: StoragePaths | None = None,
+    *,
+    now: datetime | None = None,
+    include_archive: bool = False,
+    limit: int | None = None,
+    session_id: str | None = None,
+) -> str:
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive")
     if session_id is not None and (include_archive or limit is not None):
         raise ValueError("single-session status cannot use --include-archive or --limit")
     paths = paths or StoragePaths.discover()
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    now = now.astimezone(timezone.utc)
-    rows = [("SESSION", "ROOT", "STATE", "SCOPE", "AGE", "LAST", "TERMINALS",
-             "STEPS", "SIZE", "ARCHIVED")]
+        now = now.replace(tzinfo=UTC)
+    now = now.astimezone(UTC)
+    rows = [
+        (
+            "SESSION",
+            "ROOT",
+            "STATE",
+            "SCOPE",
+            "AGE",
+            "LAST",
+            "TERMINALS",
+            "STEPS",
+            "SIZE",
+            "ARCHIVED",
+        )
+    ]
     active = {}
-    if paths.registry is not None and paths.registry.exists():
+    if paths.registry.exists():
         with Registry(paths.registry) as registry:
             for item in registry.list_active():
                 active[item.session_id] = (
                     item.state,
-                    len([value for value in registry.list_attachments(item.session_id)
-                         if value.detached_utc is None]),
+                    len(
+                        [
+                            value
+                            for value in registry.list_attachments(item.session_id)
+                            if value.detached_utc is None
+                        ]
+                    ),
                 )
     store = SessionStore(paths)
     if session_id is not None:
@@ -171,20 +203,24 @@ def render_status(paths: StoragePaths | None = None, *, now: datetime | None = N
         from ...transport import list_archived_session_ids
 
         archived_ids = [
-            session_id for session_id in list_archived_session_ids()
-            if session_id not in local_ids
+            session_id for session_id in list_archived_session_ids() if session_id not in local_ids
         ]
         if remaining is not None:
             archived_ids = archived_ids[:remaining]
-        rows.extend((session_id, "—", "archived", "—", "—", "—", "—", "—", "—", "yes")
-                    for session_id in archived_ids)
+        rows.extend(
+            (session_id, "—", "archived", "—", "—", "—", "—", "—", "—", "yes")
+            for session_id in archived_ids
+        )
     if len(rows) == 1:
         return "No sessions.\n"
     widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]))]
-    return "\n".join(
-        "  ".join(
-            value if index == len(row) - 1 else value.ljust(widths[index])
-            for index, value in enumerate(row)
+    return (
+        "\n".join(
+            "  ".join(
+                value if index == len(row) - 1 else value.ljust(widths[index])
+                for index, value in enumerate(row)
+            )
+            for row in rows
         )
-        for row in rows
-    ) + "\n"
+        + "\n"
+    )

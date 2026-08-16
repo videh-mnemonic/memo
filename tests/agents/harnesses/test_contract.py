@@ -13,7 +13,9 @@ def test_registry_contract() -> None:
         assert get_harness(harness.name) is harness
         assert harness.executable
         assert harness.default_trace_roots()
-        result = harness.parse_record(SourceRecord(0, {"type": "unsupported"}), ParseContext("001", 0))
+        result = harness.parse_record(
+            SourceRecord(0, {"type": "unsupported"}), ParseContext("001", 0)
+        )
         assert isinstance(result, TraceEvent)
         assert result.provider == harness.name
         assert result.event["type"] == "unknown"

@@ -5,11 +5,11 @@ from multiprocessing import Pipe
 import pytest
 
 from memo.daemon.protocol import (
+    MAX_FRAME_SIZE,
     DisconnectedError,
     ProtocolError,
     Request,
     Response,
-    MAX_FRAME_SIZE,
     receive_request,
     receive_response,
     send_message,
@@ -29,10 +29,14 @@ def test_request_round_trip() -> None:
 @pytest.mark.parametrize(
     "value, message",
     [
-        ({"protocol_version": 3, "schema_version": 2, "operation": "health", "payload": {}},
-         "protocol version"),
-        ({"protocol_version": 2, "schema_version": 3, "operation": "health", "payload": {}},
-         "schema version"),
+        (
+            {"protocol_version": 3, "schema_version": 2, "operation": "health", "payload": {}},
+            "protocol version",
+        ),
+        (
+            {"protocol_version": 2, "schema_version": 3, "operation": "health", "payload": {}},
+            "schema version",
+        ),
         ({"protocol_version": 2, "schema_version": 2, "payload": {}}, "malformed"),
     ],
 )

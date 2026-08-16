@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from memo.recording.paths import StoragePaths
 from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
+from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionNotFoundError, SessionStore
 
 
@@ -14,15 +14,25 @@ def _paths(tmp_path: Path) -> StoragePaths:
 
 
 def _session(root: Path) -> DirectorySession:
-    return DirectorySession("session", str(root.resolve()), "now", "now",
-                            SessionOrigin("1.0.0", "user", "host"))
+    return DirectorySession(
+        "session", str(root.resolve()), "now", "now", SessionOrigin("1.0.0", "user", "host")
+    )
 
 
 def _publish(store: SessionStore, session: DirectorySession, step: int) -> StepManifest:
     temporary = Path(tempfile.mkdtemp(prefix="prepared-", dir=store.session_path("session")))
     (temporary / "file.txt").write_text(str(step))
-    return store.publish(session, StepManifest("session", step, "now", f"snapshots/{step}",
-                         [SnapshotEntry("file.txt", "file", 0o644, 1)]), temporary)
+    return store.publish(
+        session,
+        StepManifest(
+            "session",
+            step,
+            "now",
+            f"snapshots/{step}",
+            [SnapshotEntry("file.txt", "file", 0o644, 1)],
+        ),
+        temporary,
+    )
 
 
 def test_publishes_zero_based_steps_and_numeric_head(tmp_path: Path) -> None:
@@ -58,12 +68,19 @@ def test_unsupported_old_format_fails_explicitly(tmp_path: Path) -> None:
     store = SessionStore(_paths(tmp_path))
     path = store.session_path("old")
     path.mkdir(parents=True)
-    (path / "session.json").write_text(json.dumps({
-        "session_id": "old", "root": str(tmp_path.resolve()),
-        "origin": {"memo_version_id": "1.0.0", "username": "user", "hostname": "host"},
-        "created_utc": "now", "updated_utc": "now", "format": "memo-directory-session",
-        "format_version": 1,
-    }))
+    (path / "session.json").write_text(
+        json.dumps(
+            {
+                "session_id": "old",
+                "root": str(tmp_path.resolve()),
+                "origin": {"memo_version_id": "1.0.0", "username": "user", "hostname": "host"},
+                "created_utc": "now",
+                "updated_utc": "now",
+                "format": "memo-directory-session",
+                "format_version": 1,
+            }
+        )
+    )
     with pytest.raises(ValueError, match="unsupported directory session format"):
         store.load_session("old")
 
@@ -93,11 +110,14 @@ def test_failed_head_replacement_preserves_previous_visibility(tmp_path: Path, m
     directory = store.create(session)
     first = _publish(store, session, 0)
     from memo.recording import store as session_store
+
     original = session_store.atomic_write
+
     def fail_head(path: Path, data: bytes) -> None:
         if path.name == "HEAD":
             raise OSError("injected publication failure")
         original(path, data)
+
     monkeypatch.setattr(session_store, "atomic_write", fail_head)
     with pytest.raises(OSError, match="injected"):
         _publish(store, session, 1)
@@ -155,7 +175,8 @@ def test_remove_archived_requires_complete_fully_pushed_head(tmp_path: Path) -> 
 
 
 def test_remove_archived_renames_before_recursive_removal(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     root = tmp_path / "root"
     root.mkdir()

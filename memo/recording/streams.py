@@ -8,12 +8,13 @@ import json
 import os
 import struct
 import threading
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
+from .filesystem import atomic_write
 from .paths import StoragePaths
-from .store import atomic_write
 
 if TYPE_CHECKING:
     from ..daemon.registry import Registry
@@ -44,7 +45,7 @@ class StreamEvent:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, value: dict[str, object]) -> "StreamEvent":
+    def from_dict(cls, value: dict[str, object]) -> StreamEvent:
         event = cls(**value)  # type: ignore[arg-type]
         event.validate()
         return event
@@ -62,7 +63,6 @@ class StreamStore:
             return self._locks.setdefault(terminal_id, threading.Lock())
 
     def _spool(self, session_id: str, terminal_id: str) -> Path:
-        assert self.paths.spool is not None
         return self.paths.spool / session_id / "spool" / f"{terminal_id}.frames"
 
     @staticmethod
@@ -70,8 +70,9 @@ class StreamStore:
         body = json.dumps(event.to_dict(), sort_keys=True, separators=(",", ":")).encode()
         return struct.pack("!I", len(body)) + body
 
-    def append(self, session_id: str, terminal_id: str,
-               values: list[dict[str, object]], receipt_ns: int) -> int:
+    def append(
+        self, session_id: str, terminal_id: str, values: list[dict[str, object]], receipt_ns: int
+    ) -> int:
         attachment = self.registry.attachment(terminal_id)
         if attachment is None or attachment.session_id != session_id:
             raise KeyError(f"unknown terminal attachment: {terminal_id}")
@@ -188,7 +189,6 @@ class StreamStore:
         return recovered
 
     def seal_session(self, session_id: str) -> dict[str, int]:
-        assert self.paths.archive is not None
         session_path = self.paths.archive / session_id
         high_water: dict[str, int] = {}
         for attachment in self.registry.list_attachments(session_id):
@@ -201,22 +201,29 @@ class StreamStore:
                 chunks = terminal_path / "chunks"
                 chunks.mkdir(parents=True, exist_ok=True)
                 metadata_path = terminal_path / "stream.json"
-                metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {
-                    "schema_version": 1,
-                    "terminal_id": attachment.terminal_id,
-                    "highest_sequence": 0,
-                    "chunks": [],
-                }
+                metadata = (
+                    json.loads(metadata_path.read_text())
+                    if metadata_path.is_file()
+                    else {
+                        "schema_version": 1,
+                        "terminal_id": attachment.terminal_id,
+                        "highest_sequence": 0,
+                        "chunks": [],
+                    }
+                )
                 previous = int(metadata["highest_sequence"])
                 if previous > attachment.accepted_sequence:
-                    raise ValueError(f"stream metadata exceeds durable spool: {attachment.terminal_id}")
+                    raise ValueError(
+                        f"stream metadata exceeds durable spool: {attachment.terminal_id}"
+                    )
                 new_events = [event for event in events if event.sequence > previous]
                 end = attachment.accepted_sequence
                 if new_events:
                     chunk_id = f"{new_events[0].sequence:08d}-{end:08d}"
                     chunk = chunks / f"{chunk_id}.jsonl.gz"
                     content = b"".join(
-                        json.dumps(event.to_dict(), sort_keys=True, separators=(",", ":")).encode() + b"\n"
+                        json.dumps(event.to_dict(), sort_keys=True, separators=(",", ":")).encode()
+                        + b"\n"
                         for event in new_events
                     )
                     atomic_write(chunk, gzip.compress(content, mtime=0))
@@ -231,7 +238,10 @@ class StreamStore:
 
 
 def read_chunk(path: Path) -> list[StreamEvent]:
-    return [StreamEvent.from_dict(json.loads(line)) for line in gzip.decompress(path.read_bytes()).splitlines()]
+    return [
+        StreamEvent.from_dict(json.loads(line))
+        for line in gzip.decompress(path.read_bytes()).splitlines()
+    ]
 
 
 def merged_timeline(chunks: Iterable[Path]) -> list[StreamEvent]:

@@ -9,15 +9,17 @@ import shutil
 import tarfile
 import tempfile
 import uuid
+from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterable
+from typing import Any, BinaryIO
 
 import zstandard
 
+from ..agents.run_metadata import AgentRunMetadata
 from ..recording.metadata import DirectorySession, StepManifest
 from ..recording.store import SessionStore
-
 
 STREAM_READ_SIZE = 64 * 1024
 
@@ -51,8 +53,9 @@ class HashingWriter:
 class HashingReader:
     """Bound reads while calculating their SHA-256 digest."""
 
-    def __init__(self, source: BinaryIO, digest: Any | None = None,
-                 read_size: int = STREAM_READ_SIZE) -> None:
+    def __init__(
+        self, source: BinaryIO, digest: Any | None = None, read_size: int = STREAM_READ_SIZE
+    ) -> None:
         self.source = source
         self.digest = digest or hashlib.sha256()
         self.read_size = read_size
@@ -113,8 +116,12 @@ def safe_extract_tar_zst_stream(source: BinaryIO, target: Path) -> str:
             for member in archive:
                 name = PurePosixPath(member.name)
                 parts = name.parts
-                if (name.is_absolute() or not parts or member.name.endswith("/.")
-                        or any(part in ("", ".", "..") for part in parts)):
+                if (
+                    name.is_absolute()
+                    or not parts
+                    or member.name.endswith("/.")
+                    or any(part in ("", ".", "..") for part in parts)
+                ):
                     raise ValueError(f"unsafe archive path: {member.name}")
                 if member.issym() or member.islnk() or member.isdev():
                     raise ValueError(f"unsupported archive entry: {member.name}")
@@ -127,16 +134,14 @@ def safe_extract_tar_zst_stream(source: BinaryIO, target: Path) -> str:
                     if shapes.get(key[:index]) == "file":
                         raise ValueError(f"archive path conflict: {member.name}")
                 if member.isfile() and any(
-                    existing[:len(key)] == key for existing in shapes if len(existing) > len(key)
+                    existing[: len(key)] == key for existing in shapes if len(existing) > len(key)
                 ):
                     raise ValueError(f"archive path conflict: {member.name}")
                 try:
                     destination = root.joinpath(*parts)
                     destination.resolve().relative_to(root)
                 except ValueError as error:
-                    raise ValueError(
-                        f"archive path escapes destination: {member.name}"
-                    ) from error
+                    raise ValueError(f"archive path escapes destination: {member.name}") from error
                 shapes[key] = "file" if member.isfile() else "directory"
                 archive.extract(member, target, filter="data")
     while hashing.read(STREAM_READ_SIZE):
@@ -166,8 +171,12 @@ def atomic_install_directory(prepared: Path, destination: Path, force: bool = Fa
 
 
 def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Path]:
-    paths = [session_path / "session.json", session_path / "HEAD",
-             session_path / "steps", session_path / "snapshots"]
+    paths = [
+        session_path / "session.json",
+        session_path / "HEAD",
+        session_path / "steps",
+        session_path / "snapshots",
+    ]
     for manifest in manifests:
         paths.append(session_path / "steps" / f"{manifest.step}.json")
         paths.extend((session_path / manifest.snapshot).rglob("*"))
@@ -190,15 +199,18 @@ def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Pa
         paths.extend(metadata.parent / item for item in values.get("chunks", []))
     agent_runs = sorted({run_id for manifest in manifests for run_id in manifest.agent_runs})
     if agent_runs:
-        paths.extend([session_path / "agents", session_path / "agents" / "runs",
-                      session_path / "agents" / "traces"])
+        paths.extend(
+            [
+                session_path / "agents",
+                session_path / "agents" / "runs",
+                session_path / "agents" / "traces",
+            ]
+        )
     for run_id in agent_runs:
         metadata = session_path / "agents" / "runs" / f"{run_id}.json"
         paths.append(metadata)
-        values = json.loads(metadata.read_text())
-        trace_file = values.get("trace_file")
-        if trace_file:
-            paths.append(session_path / "agents" / "traces" / trace_file)
+        run = AgentRunMetadata.load(metadata)
+        paths.append(session_path / "agents" / "traces" / run.trace_file)
     return sorted(
         {path for path in paths if path.exists()},
         key=lambda item: item.relative_to(session_path).as_posix(),
@@ -225,11 +237,11 @@ def prepare_generation(store: SessionStore, session: DirectorySession) -> Prepar
         raise ValueError(f"session has no published step: {session.session_id}")
     manifest = manifests[-1]
     root = store.session_path(session.session_id)
-    assert store.paths.runtime is not None
     upload_dir = store.paths.runtime / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(
-        prefix=f".{session.session_id}-{manifest.step:08d}-", suffix=".tar.zst",
+        prefix=f".{session.session_id}-{manifest.step:08d}-",
+        suffix=".tar.zst",
         dir=upload_dir,
     )
     path = Path(name)
@@ -241,9 +253,7 @@ def prepare_generation(store: SessionStore, session: DirectorySession) -> Prepar
             os.fsync(handle.fileno())
         return PreparedGeneration(session.session_id, manifest.step, hashing.hexdigest(), path)
     except BaseException:
-        try:
+        with suppress(OSError):
             os.close(descriptor)
-        except OSError:
-            pass
         path.unlink(missing_ok=True)
         raise

@@ -6,20 +6,21 @@ import threading
 import time
 from pathlib import Path
 
-from memo.recording.paths import StoragePaths
-from memo.daemon.server import MemoDaemon
 from memo.daemon.protocol import request
+from memo.daemon.server import MemoDaemon
+from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore
 
 
-def _running(tmp_path: Path, interval: float = 10) -> tuple[StoragePaths, Path, MemoDaemon, threading.Thread]:
+def _running(
+    tmp_path: Path, interval: float = 10
+) -> tuple[StoragePaths, Path, MemoDaemon, threading.Thread]:
     paths = StoragePaths(tmp_path / "memo-home")
     root = tmp_path / "work"
     root.mkdir()
     daemon = MemoDaemon(paths, interval=interval)
     thread = threading.Thread(target=daemon.serve_forever)
     thread.start()
-    assert paths.socket is not None
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and not paths.socket.exists():
         time.sleep(0.01)
@@ -47,7 +48,9 @@ def test_zero_terminal_recording_keeps_publishing(tmp_path: Path) -> None:
             time.sleep(0.05)
             manifest = store.head(attached["session_id"])
         assert manifest is not None and manifest.step >= 1
-        assert (store.session_path(attached["session_id"]) / manifest.snapshot / "file.txt").read_text() == "second"
+        assert (
+            store.session_path(attached["session_id"]) / manifest.snapshot / "file.txt"
+        ).read_text() == "second"
         decision = request(str(paths.socket), "attach", {"path": str(root)})
         assert decision["decision_required"] is True
     finally:
@@ -61,38 +64,76 @@ def test_concurrent_streams_are_drained_by_end(tmp_path: Path) -> None:
         second = request(str(paths.socket), "attach", {"path": str(root)})
 
         def send(allocation: dict[str, object], value: bytes) -> None:
-            request(str(paths.socket), "events", {
-                "terminal_id": allocation["terminal_id"],
-                "events": [{"sequence": 1, "direction": "output",
-                            "data": base64.b64encode(value).decode()}],
-            })
+            request(
+                str(paths.socket),
+                "events",
+                {
+                    "terminal_id": allocation["terminal_id"],
+                    "events": [
+                        {
+                            "sequence": 1,
+                            "direction": "output",
+                            "data": base64.b64encode(value).decode(),
+                        }
+                    ],
+                },
+            )
 
-        clients = [threading.Thread(target=send, args=(first, b"first")),
-                   threading.Thread(target=send, args=(second, b"second"))]
+        clients = [
+            threading.Thread(target=send, args=(first, b"first")),
+            threading.Thread(target=send, args=(second, b"second")),
+        ]
         for client in clients:
             client.start()
         for client in clients:
             client.join()
-        warning = request(str(paths.socket), "end", {
-            "session_id": first["session_id"], "terminal_id": first["terminal_id"],
-        })
+        warning = request(
+            str(paths.socket),
+            "end",
+            {
+                "session_id": first["session_id"],
+                "terminal_id": first["terminal_id"],
+            },
+        )
         assert warning["confirmation_required"] is True
         assert warning["other_terminals"] == 1
-        ended = request(str(paths.socket), "end", {
-            "session_id": first["session_id"], "terminal_id": first["terminal_id"],
-            "confirmed": True, "expected_revision": warning["revision"],
-        })
+        ended = request(
+            str(paths.socket),
+            "end",
+            {
+                "session_id": first["session_id"],
+                "terminal_id": first["terminal_id"],
+                "confirmed": True,
+                "expected_revision": warning["revision"],
+            },
+        )
         assert ended["state"] == "complete"
-        assert request(str(paths.socket), "events", {
-            "terminal_id": second["terminal_id"], "events": [],
-        })["recording_ended"] is True
-        assert request(str(paths.socket), "end", {
-            "session_id": first["session_id"],
-        })["already_complete"] is True
+        assert (
+            request(
+                str(paths.socket),
+                "events",
+                {
+                    "terminal_id": second["terminal_id"],
+                    "events": [],
+                },
+            )["recording_ended"]
+            is True
+        )
+        assert (
+            request(
+                str(paths.socket),
+                "end",
+                {
+                    "session_id": first["session_id"],
+                },
+            )["already_complete"]
+            is True
+        )
         manifest = SessionStore(paths).head(first["session_id"])
         assert manifest is not None
         assert manifest.stream_high_water == {
-            first["terminal_id"]: 1, second["terminal_id"]: 1,
+            first["terminal_id"]: 1,
+            second["terminal_id"]: 1,
         }
         session = paths.archive / first["session_id"]
         for terminal_id in manifest.stream_high_water:
@@ -108,18 +149,26 @@ def test_end_scope_is_selected_before_completion(tmp_path: Path) -> None:
     paths, root, _, thread = _running(tmp_path)
     try:
         attached = request(str(paths.socket), "attach", {"path": str(root)})
-        pending = request(str(paths.socket), "end", {
-            "session_id": attached["session_id"],
-            "terminal_id": attached["terminal_id"],
-            "prompt_scope": True,
-        })
+        pending = request(
+            str(paths.socket),
+            "end",
+            {
+                "session_id": attached["session_id"],
+                "terminal_id": attached["terminal_id"],
+                "prompt_scope": True,
+            },
+        )
         assert pending["scope_confirmation_required"] is True
 
-        ended = request(str(paths.socket), "end", {
-            "session_id": attached["session_id"],
-            "terminal_id": attached["terminal_id"],
-            "capture_scope": "full",
-        })
+        ended = request(
+            str(paths.socket),
+            "end",
+            {
+                "session_id": attached["session_id"],
+                "terminal_id": attached["terminal_id"],
+                "capture_scope": "full",
+            },
+        )
 
         assert ended["state"] == "complete"
         assert SessionStore(paths).load_session(str(attached["session_id"])).capture_scope == "full"
@@ -133,26 +182,41 @@ def test_resume_replace_and_stale_decisions(tmp_path: Path) -> None:
         first = request(str(paths.socket), "attach", {"path": str(root)})
         request(str(paths.socket), "detach", {"terminal_id": first["terminal_id"]})
         choice = request(str(paths.socket), "attach", {"path": str(root)})
-        joined = request(str(paths.socket), "attach", {
-            "path": str(root), "decision": "resume",
-            "expected_session_id": choice["session_id"],
-            "expected_revision": choice["revision"],
-        })
+        joined = request(
+            str(paths.socket),
+            "attach",
+            {
+                "path": str(root),
+                "decision": "resume",
+                "expected_session_id": choice["session_id"],
+                "expected_revision": choice["revision"],
+            },
+        )
         assert joined["session_id"] == first["session_id"]
         assert joined["terminal_id"] != first["terminal_id"]
-        stale = request(str(paths.socket), "attach", {
-            "path": str(root), "decision": "replace",
-            "expected_session_id": choice["session_id"],
-            "expected_revision": choice["revision"],
-        })
+        stale = request(
+            str(paths.socket),
+            "attach",
+            {
+                "path": str(root),
+                "decision": "replace",
+                "expected_session_id": choice["session_id"],
+                "expected_revision": choice["revision"],
+            },
+        )
         assert stale["stale"] is True
         request(str(paths.socket), "detach", {"terminal_id": joined["terminal_id"]})
         replace_choice = request(str(paths.socket), "attach", {"path": str(root)})
-        replacement = request(str(paths.socket), "attach", {
-            "path": str(root), "decision": "replace",
-            "expected_session_id": replace_choice["session_id"],
-            "expected_revision": replace_choice["revision"],
-        })
+        replacement = request(
+            str(paths.socket),
+            "attach",
+            {
+                "path": str(root),
+                "decision": "replace",
+                "expected_session_id": replace_choice["session_id"],
+                "expected_revision": replace_choice["revision"],
+            },
+        )
         assert replacement["session_id"] != first["session_id"]
         assert SessionStore(paths).load_session(first["session_id"]).state == "complete"
     finally:
@@ -164,14 +228,25 @@ def test_end_rejects_stale_confirmation_after_attachment_change(tmp_path: Path) 
     try:
         first = request(str(paths.socket), "attach", {"path": str(root)})
         second = request(str(paths.socket), "attach", {"path": str(root)})
-        warning = request(str(paths.socket), "end", {
-            "session_id": first["session_id"], "terminal_id": first["terminal_id"],
-        })
+        warning = request(
+            str(paths.socket),
+            "end",
+            {
+                "session_id": first["session_id"],
+                "terminal_id": first["terminal_id"],
+            },
+        )
         third = request(str(paths.socket), "attach", {"path": str(root)})
-        stale = request(str(paths.socket), "end", {
-            "session_id": first["session_id"], "terminal_id": first["terminal_id"],
-            "confirmed": True, "expected_revision": warning["revision"],
-        })
+        stale = request(
+            str(paths.socket),
+            "end",
+            {
+                "session_id": first["session_id"],
+                "terminal_id": first["terminal_id"],
+                "confirmed": True,
+                "expected_revision": warning["revision"],
+            },
+        )
         assert stale["stale"] is True
         assert stale["other_terminals"] == 2
         assert len(daemon.registry.attached(first["session_id"])) == 3
@@ -182,7 +257,8 @@ def test_end_rejects_stale_confirmation_after_attachment_change(tmp_path: Path) 
 
 
 def test_end_starts_final_push_after_releasing_lifecycle_locks(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     monkeypatch.setattr(
         "memo.daemon.server.S3Config.discover",
@@ -209,10 +285,14 @@ def test_end_starts_final_push_after_releasing_lifecycle_locks(
     paths, root, _, thread = _running(tmp_path)
     try:
         attached = request(str(paths.socket), "attach", {"path": str(root)})
-        ended = request(str(paths.socket), "end", {
-            "session_id": attached["session_id"],
-            "terminal_id": attached["terminal_id"],
-        })
+        ended = request(
+            str(paths.socket),
+            "end",
+            {
+                "session_id": attached["session_id"],
+                "terminal_id": attached["terminal_id"],
+            },
+        )
         assert ended["state"] == "complete"
         assert ended["cloud"] == "pending"
         assert called.wait(3)

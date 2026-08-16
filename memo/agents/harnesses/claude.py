@@ -2,33 +2,18 @@
 
 from __future__ import annotations
 
-import re
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
-from .base import AgentHarness, ParseContext, SourceRecord, TraceEvent
-
-
-def _flag_resume(args: Sequence[str]) -> str | None:
-    for flag in ("--resume", "-r"):
-        if flag in args:
-            index = args.index(flag)
-            if index + 1 < len(args):
-                return args[index + 1]
-    return None
-
-
-def _filename_id(path: Path) -> str:
-    match = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F-]{27,})$", path.stem)
-    return match.group(1) if match else path.stem
-
-
-def _first_string(record: dict[str, Any], keys: tuple[str, ...]) -> str | None:
-    for key in keys:
-        value = record.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
+from .base import (
+    AgentHarness,
+    ParseContext,
+    SourceRecord,
+    TraceEvent,
+    flag_resume,
+    identify_session,
+)
 
 
 def _version(value: dict[str, Any]) -> Any:
@@ -50,23 +35,10 @@ class ClaudeHarness(AgentHarness):
         return (Path.home() / ".claude" / "projects",)
 
     def parse_resume(self, args: Sequence[str]) -> str | None:
-        return _flag_resume(args)
+        return flag_resume(args)
 
     def identify_session(self, records: Iterable[SourceRecord], path: Path) -> str:
-        keys = ("session_id", "sessionId", "conversation_id", "conversationId", "id")
-        for source in records:
-            if not isinstance(source.value, dict):
-                continue
-            value = _first_string(source.value, keys)
-            if value:
-                return value
-            for container_key in ("message", "meta", "session"):
-                container = source.value.get(container_key)
-                if isinstance(container, dict):
-                    value = _first_string(container, keys)
-                    if value:
-                        return value
-        return _filename_id(path)
+        return identify_session(records, path, ("message", "meta", "session"))
 
     def parse_record(self, record: SourceRecord, context: ParseContext) -> TraceEvent:
         value = record.value
@@ -102,16 +74,23 @@ class ClaudeHarness(AgentHarness):
                 "arguments": tool_use.get("input", tool_use.get("arguments")),
             }
             return self.event(
-                record, context, "tool_call", content=content,
-                relationships=relationships, **common,
+                record,
+                context,
+                "tool_call",
+                content=content,
+                relationships=relationships,
+                **common,
             )
         if tool_result is not None:
             call_id = tool_result.get("tool_use_id") or tool_result.get("call_id")
             relationships = {"call_id": call_id} if call_id is not None else None
             return self.event(
-                record, context, "tool_result",
+                record,
+                context,
+                "tool_result",
                 content=tool_result.get("content", tool_result.get("output")),
-                relationships=relationships, **common,
+                relationships=relationships,
+                **common,
             )
         if role == "user" or kind in {"user", "human"}:
             event_type = "user_input"

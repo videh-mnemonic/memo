@@ -3,9 +3,9 @@ import json
 import struct
 from pathlib import Path
 
-from memo.recording.paths import StoragePaths
-from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.daemon.registry import Registry
+from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
+from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore
 from memo.recording.streams import StreamStore
 
@@ -20,16 +20,18 @@ def _setup(tmp_path: Path):
     active = registry.create(root, "now", "session")
     registry.allocate_attachment(active.session_id, "now", "terminal")
     store = SessionStore(paths)
-    store.create(DirectorySession("session", str(root.resolve()), "now", "now",
-                                  SessionOrigin("1.0.0", "user", "host")))
+    store.create(
+        DirectorySession(
+            "session", str(root.resolve()), "now", "now", SessionOrigin("1.0.0", "user", "host")
+        )
+    )
     return paths, registry, store
 
 
 def test_recovery_truncates_partial_frame_and_restores_ack(tmp_path: Path) -> None:
     paths, registry, _ = _setup(tmp_path)
     streams = StreamStore(paths, registry)
-    event = {"sequence": 1, "direction": "output",
-             "data": base64.b64encode(b"durable").decode()}
+    event = {"sequence": 1, "direction": "output", "data": base64.b64encode(b"durable").decode()}
     streams.append("session", "terminal", [event], 10)
     spool = paths.spool / "session" / "spool" / "terminal.frames"
     valid_size = spool.stat().st_size
@@ -51,8 +53,9 @@ def test_integrity_keeps_last_head_and_ignores_unpublished_artifacts(tmp_path: P
     prepared = session_path / "prepared"
     prepared.mkdir()
     (prepared / "file.txt").write_text("complete")
-    manifest = StepManifest("session", 0, "now", "snapshots/0",
-                            [SnapshotEntry("file.txt", "file", 0o644, 8)])
+    manifest = StepManifest(
+        "session", 0, "now", "snapshots/0", [SnapshotEntry("file.txt", "file", 0o644, 8)]
+    )
     store.publish(session, manifest, prepared)
     (session_path / "snapshots" / ".abandoned").mkdir()
     (session_path / "steps" / ".abandoned.tmp").write_text("partial")

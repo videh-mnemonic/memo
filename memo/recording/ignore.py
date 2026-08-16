@@ -29,7 +29,11 @@ class IgnorePolicy:
         if self.paths is None:
             return []
         candidates = [self.paths.runtime, self.paths.archive]
-        return [path.resolve() for path in candidates if path is not None and path.resolve().is_relative_to(self.root)]
+        return [
+            path.resolve()
+            for path in candidates
+            if path is not None and path.resolve().is_relative_to(self.root)
+        ]
 
     @staticmethod
     def _is_repository(path: Path) -> bool:

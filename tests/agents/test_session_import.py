@@ -3,24 +3,33 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from memo.recording.paths import StoragePaths
 from memo.agents.harnesses.claude import ClaudeHarness
 from memo.agents.harnesses.codex import CodexHarness
 from memo.agents.session_import import import_native_sessions
 from memo.export import trace_json
+from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore
 
 
 def _record(session_id: str, cwd: Path, content: str) -> str:
-    return json.dumps({
-        "timestamp": "2026-08-15T12:00:00Z",
-        "type": "session_meta",
-        "payload": {"id": session_id, "cwd": str(cwd), "model": "gpt-test"},
-    }) + "\n" + json.dumps({
-        "timestamp": "2026-08-15T12:01:00Z",
-        "type": "response_item",
-        "payload": {"type": "message", "role": "assistant", "content": content},
-    }) + "\n"
+    return (
+        json.dumps(
+            {
+                "timestamp": "2026-08-15T12:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": session_id, "cwd": str(cwd), "model": "gpt-test"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "timestamp": "2026-08-15T12:01:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": content},
+            }
+        )
+        + "\n"
+    )
 
 
 def _roots(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
@@ -50,10 +59,17 @@ def test_import_creates_and_refreshes_agent_only_session(tmp_path: Path, monkeyp
     assert store.head("native-session").step == 0
     assert json.loads(trace_json("native-session", paths=paths))[1]["event"]["content"] == "first"
 
-    source.write_text(source.read_text() + json.dumps({
-        "timestamp": "2026-08-15T12:02:00Z", "type": "response_item",
-        "payload": {"type": "message", "role": "assistant", "content": "second"},
-    }) + "\n")
+    source.write_text(
+        source.read_text()
+        + json.dumps(
+            {
+                "timestamp": "2026-08-15T12:02:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": "second"},
+            }
+        )
+        + "\n"
+    )
     second = import_native_sessions(paths)
 
     assert second.refreshed == ["native-session"]
@@ -62,7 +78,8 @@ def test_import_creates_and_refreshes_agent_only_session(tmp_path: Path, monkeyp
 
 
 def test_import_is_idempotent_and_preserves_divergent_archive(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     _, codex = _roots(monkeypatch, tmp_path)
     root = tmp_path / "project"

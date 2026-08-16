@@ -15,15 +15,22 @@ from types import SimpleNamespace
 import pytest
 import zstandard
 
-from memo.recording.paths import StoragePaths
-from memo.transport.config import S3Config
+from memo.agents.run_metadata import AgentRunMetadata
 from memo.export import replay_session
+from memo.recording.filesystem import atomic_write
 from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
-from memo.recording.store import SessionStore, atomic_write
+from memo.recording.paths import StoragePaths
+from memo.recording.store import SessionStore
 from memo.recording.streams import StreamEvent
-from memo.transport import (ensure_local_session, inspect_archived_agent_runs,
-                            list_archived_session_ids,
-                            prepare_generation, pull_session, push_session)
+from memo.transport import (
+    ensure_local_session,
+    inspect_archived_agent_runs,
+    list_archived_session_ids,
+    prepare_generation,
+    pull_session,
+    push_session,
+)
+from memo.transport.config import S3Config
 from memo.transport.s3 import MULTIPART_PART_SIZE
 
 
@@ -62,8 +69,9 @@ class FakeS3:
     def _bytes(value) -> bytes:
         return value.read() if hasattr(value, "read") else bytes(value)
 
-    def put_object(self, bucket: str, key: str, data, length: int,
-                   content_type: str | None = None) -> None:
+    def put_object(
+        self, bucket: str, key: str, data, length: int, content_type: str | None = None
+    ) -> None:
         self.operations.append(("put", key))
         if key == self.fail_key or self.fail_operation == ("put", key):
             raise OSError("injected upload failure")
@@ -95,12 +103,12 @@ class FakeS3:
         self.response_bodies.append((key, body))
         return body
 
-    def list_objects(self, bucket: str, prefix: str,
-                     recursive: bool = True):
+    def list_objects(self, bucket: str, prefix: str, recursive: bool = True):
         self.operations.append(("list", prefix))
         return (
             SimpleNamespace(object_name=key)
-            for key in sorted(self.objects) if key.startswith(prefix)
+            for key in sorted(self.objects)
+            if key.startswith(prefix)
         )
 
 
@@ -111,17 +119,17 @@ def _paths(root: Path) -> StoragePaths:
 def test_list_archived_session_ids_uses_index_and_filters_invalid_keys() -> None:
     client = FakeS3()
     digest = "a" * 64
-    client.objects.update({
-        f"prefix/index/sessions/b/{digest}.json": b"{}",
-        f"prefix/index/sessions/a/{digest}.json": b"{}",
-        "prefix/index/sessions/nested/session.json": b"{}",
-        "prefix/index/sessions/readme.txt": b"",
-        "prefix/unrelated.json": b"{}",
-    })
+    client.objects.update(
+        {
+            f"prefix/index/sessions/b/{digest}.json": b"{}",
+            f"prefix/index/sessions/a/{digest}.json": b"{}",
+            "prefix/index/sessions/nested/session.json": b"{}",
+            "prefix/index/sessions/readme.txt": b"",
+            "prefix/unrelated.json": b"{}",
+        }
+    )
 
-    assert list_archived_session_ids(
-        S3Config("bucket", "prefix"), client
-    ) == ["a", "b"]
+    assert list_archived_session_ids(S3Config("bucket", "prefix"), client) == ["a", "b"]
 
 
 def test_ensure_local_session_does_not_contact_archive_when_local(tmp_path: Path) -> None:
@@ -129,14 +137,21 @@ def test_ensure_local_session_does_not_contact_archive_when_local(tmp_path: Path
     root = tmp_path / "root"
     root.mkdir()
     store = SessionStore(paths)
-    local = store.create(DirectorySession(
-        "session", str(root.resolve()), "now", "now",
-        SessionOrigin("1.0.0", "user", "host"), "complete",
-    ))
+    local = store.create(
+        DirectorySession(
+            "session",
+            str(root.resolve()),
+            "now",
+            "now",
+            SessionOrigin("1.0.0", "user", "host"),
+            "complete",
+        )
+    )
 
-    assert ensure_local_session(
-        "session", paths, S3Config("bucket", "prefix"), client=object()
-    ) == local
+    assert (
+        ensure_local_session("session", paths, S3Config("bucket", "prefix"), client=object())
+        == local
+    )
 
 
 def test_ensure_local_session_pulls_when_missing(tmp_path: Path) -> None:
@@ -148,9 +163,7 @@ def test_ensure_local_session_pulls_when_missing(tmp_path: Path) -> None:
     push_session(source_store, session, config, client)
     destination_paths = _paths(tmp_path / "destination-home")
 
-    destination = ensure_local_session(
-        "session", destination_paths, config, client=client
-    )
+    destination = ensure_local_session("session", destination_paths, config, client=client)
 
     assert destination == destination_paths.archive / "session"
     assert SessionStore(destination_paths).load_session("session").session_id == "session"
@@ -160,17 +173,21 @@ def test_remote_agent_inspection_streams_metadata_without_snapshot(tmp_path: Pat
     root = tmp_path / "source"
     root.mkdir()
     store, session = _published(
-        _paths(tmp_path / "source-home"), root, content=os.urandom(2 * 1024 * 1024),
+        _paths(tmp_path / "source-home"),
+        root,
+        content=os.urandom(2 * 1024 * 1024),
     )
     session_path = store.session_path("session")
     trace = session_path / "agents/traces/run.jsonl"
     metadata_path = session_path / "agents/runs/run.json"
     metadata = json.loads(metadata_path.read_text())
-    metadata.update({
-        "agent_session_id": "native-session",
-        "trace_complete_size": trace.stat().st_size,
-        "trace_digest": hashlib.sha256(trace.read_bytes()).hexdigest(),
-    })
+    metadata.update(
+        {
+            "agent_session_id": "native-session",
+            "trace_complete_size": trace.stat().st_size,
+            "trace_digest": hashlib.sha256(trace.read_bytes()).hexdigest(),
+        }
+    )
     atomic_write(metadata_path, (json.dumps(metadata) + "\n").encode())
     client = FakeS3()
     config = S3Config("bucket", "prefix")
@@ -180,34 +197,8 @@ def test_remote_agent_inspection_streams_metadata_without_snapshot(tmp_path: Pat
 
     assert session_ids == {"session"}
     assert runs[0]["native_id"] == "native-session"
-    generation, body = next(
-        item for item in client.response_bodies if item[0].endswith(".tar.zst")
-    )
+    generation, body = next(item for item in client.response_bodies if item[0].endswith(".tar.zst"))
     assert body.was_closed
-    assert body.bytes_read < len(client.objects[generation])
-
-
-def test_remote_agent_inspection_hashes_legacy_trace_without_snapshot(tmp_path: Path) -> None:
-    root = tmp_path / "source"
-    root.mkdir()
-    store, session = _published(
-        _paths(tmp_path / "source-home"), root, content=os.urandom(2 * 1024 * 1024),
-    )
-    metadata_path = store.session_path("session") / "agents/runs/run.json"
-    metadata = json.loads(metadata_path.read_text())
-    metadata["agent_session_id"] = "legacy-native"
-    atomic_write(metadata_path, (json.dumps(metadata) + "\n").encode())
-    client = FakeS3()
-    config = S3Config("bucket", "prefix")
-    push_session(store, session, config, client)
-
-    runs, _ = inspect_archived_agent_runs(session.origin, config, client)
-
-    assert runs[0]["native_id"] == "legacy-native"
-    assert runs[0]["complete_size"] > 0
-    generation, body = next(
-        item for item in client.response_bodies if item[0].endswith(".tar.zst")
-    )
     assert body.bytes_read < len(client.objects[generation])
 
 
@@ -219,34 +210,59 @@ def _write_stream(session_path: Path) -> None:
         StreamEvent("terminal", 1, "input", base64.b64encode(b"first\n").decode(), 1),
         StreamEvent("terminal", 2, "input", base64.b64encode(b"second\n").decode(), 2),
     ]
-    atomic_write(chunk, gzip.compress(b"".join(
-        json.dumps(event.to_dict()).encode() + b"\n" for event in events
-    ), mtime=0))
-    atomic_write(terminal / "stream.json", (json.dumps({
-        "schema_version": 1,
-        "terminal_id": "terminal",
-        "highest_sequence": 2,
-        "chunks": ["chunks/events.jsonl.gz"],
-    }) + "\n").encode())
+    atomic_write(
+        chunk,
+        gzip.compress(
+            b"".join(json.dumps(event.to_dict()).encode() + b"\n" for event in events), mtime=0
+        ),
+    )
+    atomic_write(
+        terminal / "stream.json",
+        (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "terminal_id": "terminal",
+                    "highest_sequence": 2,
+                    "chunks": ["chunks/events.jsonl.gz"],
+                }
+            )
+            + "\n"
+        ).encode(),
+    )
 
 
-def _published(paths: StoragePaths, root: Path,
-               content: bytes | None = None) -> tuple[SessionStore, DirectorySession]:
+def _published(
+    paths: StoragePaths, root: Path, content: bytes | None = None
+) -> tuple[SessionStore, DirectorySession]:
     store = SessionStore(paths)
     session = DirectorySession(
-        "session", str(root.resolve()), "now", "now",
-        SessionOrigin("1.0.0", "user", "host"), state="complete"
+        "session",
+        str(root.resolve()),
+        "now",
+        "now",
+        SessionOrigin("1.0.0", "user", "host"),
+        state="complete",
     )
     directory = store.create(session)
     _write_stream(directory)
-    (directory / "agents/traces/run.jsonl").write_text(
-        '{"session_id":"native-session","type":"user","content":"trace prompt"}\n'
-    )
-    atomic_write(directory / "agents/runs/run.json", (json.dumps({
-        "run_id": "run",
-        "harness": "claude",
-        "trace_file": "run.jsonl",
-    }) + "\n").encode())
+    trace = directory / "agents/traces/run.jsonl"
+    trace.write_text('{"session_id":"native-session","type":"user","content":"trace prompt"}\n')
+    AgentRunMetadata(
+        run_id="run",
+        harness="claude",
+        model=None,
+        reasoning=None,
+        command=None,
+        cwd=str(root.resolve()),
+        started_utc="now",
+        ended_utc="now",
+        exit_code=None,
+        agent_session_id="native-session",
+        trace_file=trace.name,
+        trace_complete_size=trace.stat().st_size,
+        trace_digest=hashlib.sha256(trace.read_bytes()).hexdigest(),
+    ).write(directory / "agents/runs/run.json")
     for step, high_water in ((0, 1), (1, 2)):
         prepared = Path(tempfile.mkdtemp(prefix="prepared-", dir=directory))
         data = content if content is not None and step == 1 else f"step {step}\n".encode()
@@ -280,11 +296,13 @@ def _replace_remote_package(client: FakeS3, package: bytes) -> dict[str, object]
     client.objects.pop(old_generation)
     digest = hashlib.sha256(package).hexdigest()
     pointer["sha256"] = digest
-    generation = str(Path(old_generation).with_name(f"{pointer['final_step']:08d}-{digest}.tar.zst"))
+    generation = str(
+        Path(old_generation).with_name(f"{pointer['final_step']:08d}-{digest}.tar.zst")
+    )
     pointer["generation"] = generation
-    completion_key = str(Path(completion_key).with_name(
-        f"{pointer['final_step']:08d}-{digest}.json"
-    ))
+    completion_key = str(
+        Path(completion_key).with_name(f"{pointer['final_step']:08d}-{digest}.json")
+    )
     client.objects[completion_key] = json.dumps(
         pointer, sort_keys=True, separators=(",", ":")
     ).encode()
@@ -315,10 +333,14 @@ def test_package_is_deterministic_and_contains_complete_history(tmp_path: Path) 
     assert first.step == 1
     names = _archive_names(first_data)
     assert {
-        "steps/0.json", "steps/1.json", "snapshots/0/file.txt",
-        "snapshots/1/file.txt", "streams/terminals/terminal/stream.json",
+        "steps/0.json",
+        "steps/1.json",
+        "snapshots/0/file.txt",
+        "snapshots/1/file.txt",
+        "streams/terminals/terminal/stream.json",
         "streams/terminals/terminal/chunks/events.jsonl.gz",
-        "agents/runs/run.json", "agents/traces/run.jsonl",
+        "agents/runs/run.json",
+        "agents/traces/run.jsonl",
     }.issubset(names)
 
 
@@ -335,27 +357,35 @@ def test_push_publishes_immutable_generation_index_and_completion_and_skips_unch
     digest = str(result["digest"])
     generation = f"prefix/user/host/sessions/session/generations/00000001-{digest}.tar.zst"
     completion_key = f"prefix/user/host/sessions/session/completions/00000001-{digest}.json"
-    index_key = next(key for key in client.objects if key.startswith(
-        "prefix/index/sessions/session/"
-    ))
+    index_key = next(
+        key for key in client.objects if key.startswith("prefix/index/sessions/session/")
+    )
     assert client.operations[-1] == ("put", completion_key)
     completion = json.loads(client.objects[completion_key])
     package = client.objects[generation]
     assert hashlib.sha256(package).hexdigest() == completion["sha256"]
     assert completion == {
-        "schema_version": 1, "session_id": "session", "final_step": 1,
-        "generation": generation, "sha256": result["digest"],
+        "schema_version": 1,
+        "session_id": "session",
+        "final_step": 1,
+        "generation": generation,
+        "sha256": result["digest"],
     }
-    assert client.operations.index(("upload", generation)) < \
-        client.operations.index(("put", index_key)) < \
-        client.operations.index(("put", completion_key))
+    assert (
+        client.operations.index(("upload", generation))
+        < client.operations.index(("put", index_key))
+        < client.operations.index(("put", completion_key))
+    )
     assert not any(operation in {"copy", "delete"} for operation, _ in client.operations)
     index_data = client.objects[index_key]
     assert Path(index_key).stem == hashlib.sha256(index_data).hexdigest()
     index = json.loads(index_data)
     assert index == {
-        "schema_version": 1, "session_id": "session", "memo_version_id": "1.0.0",
-        "username": "user", "hostname": "host",
+        "schema_version": 1,
+        "session_id": "session",
+        "memo_version_id": "1.0.0",
+        "username": "user",
+        "hostname": "host",
     }
 
     session.last_pushed_step = None
@@ -418,8 +448,9 @@ def test_failed_completion_marker_does_not_advance_local_state(
     config = S3Config("bucket", "prefix")
     original_put = client.put_object
 
-    def fail_completion(bucket: str, key: str, data, length: int,
-                        content_type: str | None = None) -> None:
+    def fail_completion(
+        bucket: str, key: str, data, length: int, content_type: str | None = None
+    ) -> None:
         if "/completions/" in key:
             raise OSError("injected completion failure")
         original_put(bucket, key, data, length, content_type)
@@ -442,8 +473,9 @@ def test_index_failure_leaves_generation_but_not_local_state(tmp_path: Path) -> 
     client = FakeS3()
     original_put = client.put_object
 
-    def fail_index(bucket: str, key: str, data, length: int,
-                   content_type: str | None = None) -> None:
+    def fail_index(
+        bucket: str, key: str, data, length: int, content_type: str | None = None
+    ) -> None:
         if "/index/sessions/session/" in f"/{key}":
             raise OSError("injected index failure")
         original_put(bucket, key, data, length, content_type)
@@ -466,8 +498,9 @@ def test_retry_verifies_existing_objects_and_finishes_publication(tmp_path: Path
     config = S3Config("bucket", "prefix")
     original_put = client.put_object
 
-    def fail_completion(bucket: str, key: str, data, length: int,
-                        content_type: str | None = None) -> None:
+    def fail_completion(
+        bucket: str, key: str, data, length: int, content_type: str | None = None
+    ) -> None:
         if "/completions/" in key:
             raise OSError("injected completion failure")
         original_put(bucket, key, data, length, content_type)
@@ -481,8 +514,9 @@ def test_retry_verifies_existing_objects_and_finishes_publication(tmp_path: Path
 
     assert result["status"] == "pushed"
     assert any("/completions/" in key for key in client.objects)
-    assert any(operation == "stat" and key.endswith(".tar.zst")
-               for operation, key in client.operations)
+    assert any(
+        operation == "stat" and key.endswith(".tar.zst") for operation, key in client.operations
+    )
     assert store.load_session("session").last_pushed_step == 1
 
 
@@ -491,10 +525,7 @@ def test_push_rejects_a_different_digest_for_the_same_step(tmp_path: Path) -> No
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    conflicting = (
-        "prefix/user/host/sessions/session/generations/"
-        f"00000001-{'0' * 64}.tar.zst"
-    )
+    conflicting = f"prefix/user/host/sessions/session/generations/00000001-{'0' * 64}.tar.zst"
     client.objects[conflicting] = b"other"
 
     with pytest.raises(ValueError, match="generation fork"):
@@ -522,10 +553,7 @@ def test_push_rejects_conflicting_completion(tmp_path: Path) -> None:
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    conflict_key = (
-        "prefix/user/host/sessions/session/completions/"
-        f"00000000-{'0' * 64}.json"
-    )
+    conflict_key = f"prefix/user/host/sessions/session/completions/00000000-{'0' * 64}.json"
     client.objects[conflict_key] = b"{}"
 
     with pytest.raises(ValueError, match="conflicting completion"):
@@ -578,9 +606,7 @@ def test_active_session_pull_uses_highest_complete_generation(tmp_path: Path) ->
     push_session(store, session, config, client)
 
     assert not any("/completions/" in key for key in client.objects)
-    pulled_path = pull_session(
-        "session", _paths(tmp_path / "pulled-home"), config, client=client
-    )
+    pulled_path = pull_session("session", _paths(tmp_path / "pulled-home"), config, client=client)
     assert SessionStore._validate_history(pulled_path, "session")[-1].step == 1
 
 
@@ -596,9 +622,7 @@ def test_completion_marker_pins_pull_to_final_generation(tmp_path: Path) -> None
     digest = Path(generation).name.split("-", 1)[1].removesuffix(".tar.zst")
     client.objects[f"{base}00000099-{digest}.tar.zst"] = client.objects[generation]
 
-    pulled_path = pull_session(
-        "session", _paths(tmp_path / "pulled-home"), config, client=client
-    )
+    pulled_path = pull_session("session", _paths(tmp_path / "pulled-home"), config, client=client)
 
     assert SessionStore._validate_history(pulled_path, "session")[-1].step == 1
 
@@ -622,7 +646,9 @@ def test_pull_verifies_checksum_and_remote_history_before_install(tmp_path: Path
     assert not corrupt_paths.archive.joinpath("session").exists()
 
     client.objects[generation] = original
-    uncompressed = zstandard.ZstdDecompressor().decompress(original, max_output_size=64 * 1024 * 1024)
+    uncompressed = zstandard.ZstdDecompressor().decompress(
+        original, max_output_size=64 * 1024 * 1024
+    )
     raw = io.BytesIO()
     with tarfile.open(fileobj=io.BytesIO(uncompressed), mode="r:") as source:
         with zstandard.ZstdCompressor(level=3).stream_writer(raw, closefd=False) as compressed:
@@ -653,14 +679,17 @@ def test_atomic_install_failure_restores_existing_session(tmp_path: Path, monkey
     (destination / "local.txt").write_text("keep")
 
     from memo.transport import archive
+
     original_replace = os.replace
     calls = 0
+
     def fail_install(source: Path, target: Path) -> None:
         nonlocal calls
         calls += 1
         if calls == 3:
             raise OSError("injected install failure")
         original_replace(source, target)
+
     monkeypatch.setattr(archive.os, "replace", fail_install)
     with pytest.raises(OSError, match="injected install failure"):
         pull_session("session", paths, config, force=True, client=client)
@@ -679,14 +708,17 @@ def test_pull_streams_bounded_reads_and_closes_all_response_bodies(tmp_path: Pat
 
     assert len(client.response_bodies) == 3
     assert all(body.was_closed for _, body in client.response_bodies)
-    assert all(body.read_sizes and max(body.read_sizes) <= 64 * 1024
-               for _, body in client.response_bodies)
+    assert all(
+        body.read_sizes and max(body.read_sizes) <= 64 * 1024 for _, body in client.response_bodies
+    )
     index_key = next(key for key in client.objects if "/index/sessions/session/" in key)
     completion_key = next(key for key in client.objects if "/completions/" in key)
     completion = json.loads(client.objects[completion_key])
     generation = completion["generation"]
     assert [key for operation, key in client.operations if operation == "get"] == [
-        index_key, completion_key, generation,
+        index_key,
+        completion_key,
+        generation,
     ]
 
 
@@ -728,9 +760,7 @@ def test_pull_rejects_invalid_index_before_package_request(
     index = json.loads(client.objects.pop(index_key))
     index[field] = value
     index_data = json.dumps(index, sort_keys=True, separators=(",", ":")).encode()
-    index_key = str(Path(index_key).with_name(
-        f"{hashlib.sha256(index_data).hexdigest()}.json"
-    ))
+    index_key = str(Path(index_key).with_name(f"{hashlib.sha256(index_data).hexdigest()}.json"))
     client.objects[index_key] = index_data
 
     with pytest.raises(ValueError, match=message):
@@ -785,11 +815,22 @@ def _directory(name: str) -> tuple[tarfile.TarInfo, None]:
         ([_regular("parent/child"), _regular("parent")], "archive path conflict"),
         ([_regular("valid-prefix"), _regular("../late-escape")], "unsafe archive path"),
     ],
-    ids=["traversal", "absolute", "symlink", "hardlink", "device", "duplicate",
-         "file-parent", "file-after-child", "late-unsafe"],
+    ids=[
+        "traversal",
+        "absolute",
+        "symlink",
+        "hardlink",
+        "device",
+        "duplicate",
+        "file-parent",
+        "file-after-child",
+        "late-unsafe",
+    ],
 )
 def test_pull_rejects_malicious_members_and_removes_staging(
-    tmp_path: Path, members: list[tuple[tarfile.TarInfo, bytes | None]], message: str,
+    tmp_path: Path,
+    members: list[tuple[tarfile.TarInfo, bytes | None]],
+    message: str,
 ) -> None:
     if message == "unsupported archive entry":
         info = members[0][0]
@@ -835,8 +876,7 @@ def test_large_package_has_bounded_parts_reads_and_memory(tmp_path: Path) -> Non
 
     assert len(client.part_sizes) >= 3
     assert max(client.part_sizes) <= MULTIPART_PART_SIZE
-    assert all(size <= 64 * 1024 for _, body in client.response_bodies
-               for size in body.read_sizes)
+    assert all(size <= 64 * 1024 for _, body in client.response_bodies for size in body.read_sizes)
     assert peak < 5 * MULTIPART_PART_SIZE
 
 

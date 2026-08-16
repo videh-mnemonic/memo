@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
-from .claude import _filename_id, _first_string, _flag_resume
-from .base import AgentHarness, ParseContext, SourceRecord, TraceEvent
+from .base import (
+    AgentHarness,
+    ParseContext,
+    SourceRecord,
+    TraceEvent,
+    flag_resume,
+    identify_session,
+)
 
 
 class CodexHarness(AgentHarness):
@@ -17,7 +24,7 @@ class CodexHarness(AgentHarness):
         return (Path.home() / ".codex" / "sessions",)
 
     def parse_resume(self, args: Sequence[str]) -> str | None:
-        flagged = _flag_resume(args)
+        flagged = flag_resume(args)
         if flagged:
             return flagged
         if args[:1] == ["resume"] and len(args) > 1:
@@ -25,20 +32,7 @@ class CodexHarness(AgentHarness):
         return None
 
     def identify_session(self, records: Iterable[SourceRecord], path: Path) -> str:
-        keys = ("session_id", "sessionId", "conversation_id", "conversationId", "id")
-        for source in records:
-            if not isinstance(source.value, dict):
-                continue
-            value = _first_string(source.value, keys)
-            if value:
-                return value
-            for container_key in ("payload", "meta", "session"):
-                container = source.value.get(container_key)
-                if isinstance(container, dict):
-                    value = _first_string(container, keys)
-                    if value:
-                        return value
-        return _filename_id(path)
+        return identify_session(records, path, ("payload", "meta", "session"))
 
     def parse_record(self, record: SourceRecord, context: ParseContext) -> TraceEvent:
         outer = record.value
@@ -62,20 +56,41 @@ class CodexHarness(AgentHarness):
         if str(outer.get("type", "")).lower() == "session_meta":
             return self.event(record, context, "metadata", content=event, **common)
         if kind in {"user", "user_message"}:
-            return self.event(record, context, "user_input", content=event.get("message", event.get("content")), **common)
+            return self.event(
+                record,
+                context,
+                "user_input",
+                content=event.get("message", event.get("content")),
+                **common,
+            )
         if kind in {"assistant", "assistant_message", "message"}:
             role = str(event.get("role", "")).lower()
             event_type = "user_input" if role == "user" else "agent_message"
-            return self.event(record, context, event_type, content=event.get("message", event.get("content")), **common)
+            return self.event(
+                record,
+                context,
+                event_type,
+                content=event.get("message", event.get("content")),
+                **common,
+            )
         if kind in {"function_call", "custom_tool_call"}:
             call_id = event.get("call_id")
             content = {"tool_name": event.get("name"), "arguments": event.get("arguments")}
             relationships = {"call_id": call_id} if call_id is not None else None
-            return self.event(record, context, "tool_call", content=content, relationships=relationships, **common)
+            return self.event(
+                record, context, "tool_call", content=content, relationships=relationships, **common
+            )
         if kind in {"function_call_output", "custom_tool_call_output"}:
             call_id = event.get("call_id")
             relationships = {"call_id": call_id} if call_id is not None else None
-            return self.event(record, context, "tool_result", content=event.get("output"), relationships=relationships, **common)
+            return self.event(
+                record,
+                context,
+                "tool_result",
+                content=event.get("output"),
+                relationships=relationships,
+                **common,
+            )
         if kind in {"token_count", "usage"}:
             usage = self._usage(event)
             common["usage"] = usage
@@ -97,4 +112,8 @@ class CodexHarness(AgentHarness):
         info = event.get("info")
         if isinstance(info, dict):
             return info.get("total_token_usage", info.get("last_token_usage", info))
-        return {key: event[key] for key in ("input_tokens", "output_tokens", "total_tokens") if key in event} or None
+        return {
+            key: event[key]
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+            if key in event
+        } or None

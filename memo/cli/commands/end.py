@@ -9,7 +9,6 @@ from typing import Any
 
 from ...daemon.client import end
 
-
 NAME = "end"
 
 
@@ -34,8 +33,11 @@ def run(args: Any) -> int:
     )
     confirmed = False
     expected_revision = None
-    while (response.get("confirmation_required") or response.get("stale")
-           or response.get("scope_confirmation_required")):
+    while (
+        response.get("confirmation_required")
+        or response.get("stale")
+        or response.get("scope_confirmation_required")
+    ):
         if response.get("scope_confirmation_required"):
             answer = input("Did Memo capture all intended work for this session? [y/N] ")
             selected_scope = "full" if answer.strip().lower() in {"y", "yes"} else "partial"

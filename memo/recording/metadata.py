@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import getpass
+import json
 import socket
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-
 
 DIRECTORY_FORMAT_VERSION = 2
 STEP_SCHEMA_VERSION = 1
@@ -21,18 +20,17 @@ class SessionOrigin:
     hostname: str
 
     @classmethod
-    def current(cls) -> "SessionOrigin":
+    def current(cls) -> SessionOrigin:
         from .. import __version__
+
         return cls(__version__, getpass.getuser(), socket.gethostname())
 
     def validate(self) -> None:
-        if any(not isinstance(value, str) or not value for value in (
-            self.memo_version_id, self.username, self.hostname
-        )):
+        if any(
+            not isinstance(value, str) or not value
+            for value in (self.memo_version_id, self.username, self.hostname)
+        ):
             raise ValueError("session origin fields must be nonempty")
-
-    def to_dict(self) -> dict[str, str]:
-        return asdict(self)
 
 
 @dataclass
@@ -51,7 +49,10 @@ class DirectorySession:
     remote_object: str | None = None
 
     def validate(self) -> None:
-        if self.format != "memo-directory-session" or self.format_version != DIRECTORY_FORMAT_VERSION:
+        if (
+            self.format != "memo-directory-session"
+            or self.format_version != DIRECTORY_FORMAT_VERSION
+        ):
             raise ValueError("unsupported directory session format")
         if self.state not in {"active", "ending", "complete"}:
             raise ValueError(f"invalid directory session state: {self.state}")
@@ -72,7 +73,7 @@ class DirectorySession:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "DirectorySession":
+    def from_dict(cls, value: dict[str, Any]) -> DirectorySession:
         value = dict(value)
         value["origin"] = SessionOrigin(**value["origin"])
         result = cls(**value)
@@ -80,7 +81,7 @@ class DirectorySession:
         return result
 
     @classmethod
-    def load(cls, path: Path) -> "DirectorySession":
+    def load(cls, path: Path) -> DirectorySession:
         return cls.from_dict(json.loads(path.read_text()))
 
 
@@ -94,7 +95,7 @@ class SnapshotEntry:
     retained: bool = False
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "SnapshotEntry":
+    def from_dict(cls, value: dict[str, Any]) -> SnapshotEntry:
         return cls(**value)
 
 
@@ -122,8 +123,13 @@ class StepManifest:
             if path.is_absolute() or ".." in path.parts:
                 raise ValueError(f"unsafe snapshot entry: {entry.path}")
             if entry.kind not in {
-                "file", "directory", "ignored-policy", "oversized", "special",
-                "missing", "unstable",
+                "file",
+                "directory",
+                "ignored-policy",
+                "oversized",
+                "special",
+                "missing",
+                "unstable",
             }:
                 raise ValueError(f"unsupported snapshot entry kind: {entry.kind}")
         for terminal_id, sequence in self.stream_high_water.items():
@@ -139,7 +145,7 @@ class StepManifest:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "StepManifest":
+    def from_dict(cls, value: dict[str, Any]) -> StepManifest:
         value = dict(value)
         value["entries"] = [SnapshotEntry.from_dict(item) for item in value.get("entries", [])]
         result = cls(**value)
@@ -147,5 +153,5 @@ class StepManifest:
         return result
 
     @classmethod
-    def load(cls, path: Path) -> "StepManifest":
+    def load(cls, path: Path) -> StepManifest:
         return cls.from_dict(json.loads(path.read_text()))

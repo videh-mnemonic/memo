@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass
 from multiprocessing.connection import Client, Connection
 from typing import Any
 
-
 PROTOCOL_VERSION = 2
 SCHEMA_VERSION = 2
 MAX_FRAME_SIZE = 8 * 1024 * 1024
@@ -29,7 +28,7 @@ class Request:
     schema_version: int = SCHEMA_VERSION
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "Request":
+    def from_dict(cls, value: dict[str, Any]) -> Request:
         try:
             result = cls(
                 operation=value["operation"],
@@ -57,7 +56,7 @@ class Response:
     schema_version: int = SCHEMA_VERSION
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "Response":
+    def from_dict(cls, value: dict[str, Any]) -> Response:
         try:
             result = cls(**value)
         except TypeError as error:
@@ -72,8 +71,11 @@ class Response:
 
 
 def _encode(value: Request | Response | dict[str, Any]) -> bytes:
-    body = json.dumps(asdict(value) if not isinstance(value, dict) else value,
-                      separators=(",", ":"), sort_keys=True).encode("utf-8")
+    body = json.dumps(
+        asdict(value) if not isinstance(value, dict) else value,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
     if len(body) > MAX_FRAME_SIZE:
         raise ProtocolError("frame is too large")
     return body
@@ -109,8 +111,9 @@ def send_message(connection: Connection, value: Request | Response | dict[str, A
     connection.send_bytes(_encode(value))
 
 
-def request(socket_path: str, operation: str, payload: dict[str, Any] | None = None,
-            timeout: float = 10.0) -> dict[str, Any]:
+def request(
+    socket_path: str, operation: str, payload: dict[str, Any] | None = None, timeout: float = 10.0
+) -> dict[str, Any]:
     with Client(socket_path, family="AF_UNIX") as connection:
         send_message(connection, Request(operation, payload or {}))
         if not connection.poll(timeout):

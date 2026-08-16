@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,8 +68,9 @@ class Registry:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = path
-        self.connection = sqlite3.connect(path, timeout=30, isolation_level=None,
-                                          check_same_thread=False)
+        self.connection = sqlite3.connect(
+            path, timeout=30, isolation_level=None, check_same_thread=False
+        )
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute(
@@ -102,7 +103,7 @@ class Registry:
     def close(self) -> None:
         self.connection.close()
 
-    def __enter__(self) -> "Registry":
+    def __enter__(self) -> Registry:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -135,12 +136,12 @@ class Registry:
         with self._lock:
             row = self.connection.execute(
                 "SELECT root, session_id, created_utc, state, revision "
-                "FROM active_sessions WHERE session_id = ?", (session_id,),
+                "FROM active_sessions WHERE session_id = ?",
+                (session_id,),
             ).fetchone()
         return self._row(row) if row else None
 
-    def create(self, path: Path, created_utc: str,
-               session_id: str | None = None) -> ActiveSession:
+    def create(self, path: Path, created_utc: str, session_id: str | None = None) -> ActiveSession:
         root = canonical_root(path)
         with self._lock:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -169,8 +170,9 @@ class Registry:
                     self.connection.execute("ROLLBACK")
                 raise
 
-    def allocate_attachment(self, session_id: str, attached_utc: str,
-                            terminal_id: str | None = None) -> Attachment:
+    def allocate_attachment(
+        self, session_id: str, attached_utc: str, terminal_id: str | None = None
+    ) -> Attachment:
         attachment = Attachment(terminal_id or uuid.uuid4().hex, session_id, 0, attached_utc)
         with self._lock:
             state = self.connection.execute(
@@ -195,7 +197,8 @@ class Registry:
         with self._lock:
             row = self.connection.execute(
                 "SELECT terminal_id, session_id, accepted_sequence, attached_utc, detached_utc "
-                "FROM attachments WHERE terminal_id = ?", (terminal_id,),
+                "FROM attachments WHERE terminal_id = ?",
+                (terminal_id,),
             ).fetchone()
         return Attachment(*row) if row else None
 
@@ -256,19 +259,22 @@ class Registry:
         with self._lock:
             rows = self.connection.execute(
                 "SELECT terminal_id, session_id, accepted_sequence, attached_utc, detached_utc "
-                "FROM attachments WHERE session_id = ? ORDER BY terminal_id", (session_id,),
+                "FROM attachments WHERE session_id = ? ORDER BY terminal_id",
+                (session_id,),
             ).fetchall()
         return [Attachment(*row) for row in rows]
 
     def attached(self, session_id: str) -> list[Attachment]:
         return [item for item in self.list_attachments(session_id) if item.detached_utc is None]
 
-    def create_window(self, session_id: str, harness: str, cwd: str,
-                      checkpoint: str) -> CaptureWindow:
+    def create_window(
+        self, session_id: str, harness: str, cwd: str, checkpoint: str
+    ) -> CaptureWindow:
         with self._lock:
             self.connection.execute(
                 "INSERT OR IGNORE INTO capture_windows(session_id, harness, cwd, checkpoint) "
-                "VALUES (?, ?, ?, ?)", (session_id, harness, cwd, checkpoint),
+                "VALUES (?, ?, ?, ?)",
+                (session_id, harness, cwd, checkpoint),
             )
             row = self.connection.execute(
                 "SELECT session_id, harness, cwd, checkpoint FROM capture_windows "
@@ -282,7 +288,8 @@ class Registry:
         with self._lock:
             rows = self.connection.execute(
                 "SELECT session_id, harness, cwd, checkpoint FROM capture_windows "
-                "WHERE session_id = ? ORDER BY harness, cwd", (session_id,),
+                "WHERE session_id = ? ORDER BY harness, cwd",
+                (session_id,),
             ).fetchall()
         return [CaptureWindow(*row) for row in rows]
 
@@ -306,15 +313,27 @@ class Registry:
             self.connection.execute(
                 "INSERT INTO agent_launches(launch_id, session_id, terminal_id, harness, cwd, "
                 "command_json, started_utc) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (launch.launch_id, launch.session_id, launch.terminal_id, launch.harness,
-                 launch.cwd, json.dumps(launch.command), launch.started_utc),
+                (
+                    launch.launch_id,
+                    launch.session_id,
+                    launch.terminal_id,
+                    launch.harness,
+                    launch.cwd,
+                    json.dumps(launch.command),
+                    launch.started_utc,
+                ),
             )
 
     @staticmethod
     def _launch(row: tuple[object, ...]) -> AgentLaunch:
         return AgentLaunch(
-            str(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4]),
-            list(json.loads(str(row[5]))), str(row[6]),
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            list(json.loads(str(row[5]))),
+            str(row[6]),
             None if row[7] is None else str(row[7]),
             None if row[8] is None else int(row[8]),
         )
@@ -328,8 +347,9 @@ class Registry:
             ).fetchone()
         return self._launch(row) if row else None
 
-    def launches(self, session_id: str, harness: str | None = None,
-                 cwd: str | None = None) -> list[AgentLaunch]:
+    def launches(
+        self, session_id: str, harness: str | None = None, cwd: str | None = None
+    ) -> list[AgentLaunch]:
         query = (
             "SELECT launch_id, session_id, terminal_id, harness, cwd, command_json, "
             "started_utc, ended_utc, exit_code FROM agent_launches WHERE session_id = ?"
@@ -370,7 +390,8 @@ class Registry:
             )
             row = self.connection.execute(
                 "SELECT root, session_id, created_utc, state, revision "
-                "FROM active_sessions WHERE session_id = ?", (session_id,),
+                "FROM active_sessions WHERE session_id = ?",
+                (session_id,),
             ).fetchone()
         if row is None:
             raise KeyError(f"unknown active session: {session_id}")
@@ -383,10 +404,16 @@ class Registry:
 
     def remove(self, session_id: str) -> None:
         with self._lock:
-            self.connection.execute("DELETE FROM agent_launches WHERE session_id = ?", (session_id,))
-            self.connection.execute("DELETE FROM capture_windows WHERE session_id = ?", (session_id,))
+            self.connection.execute(
+                "DELETE FROM agent_launches WHERE session_id = ?", (session_id,)
+            )
+            self.connection.execute(
+                "DELETE FROM capture_windows WHERE session_id = ?", (session_id,)
+            )
             self.connection.execute("DELETE FROM attachments WHERE session_id = ?", (session_id,))
-            self.connection.execute("DELETE FROM active_sessions WHERE session_id = ?", (session_id,))
+            self.connection.execute(
+                "DELETE FROM active_sessions WHERE session_id = ?", (session_id,)
+            )
 
     def remove_stale(self, archive_root: Path) -> list[str]:
         removed = []

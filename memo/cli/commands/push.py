@@ -7,7 +7,6 @@ from typing import Any
 
 from ...daemon.client import push
 
-
 NAME = "push"
 
 

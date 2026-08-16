@@ -1,7 +1,10 @@
 from pathlib import Path
 
-from memo.daemon.server import (PUSH_INTERVAL_SECONDS, STEP_INTERVAL_SECONDS,
-                                WATCHER_DEBOUNCE_SECONDS)
+from memo.daemon.server import (
+    PUSH_INTERVAL_SECONDS,
+    STEP_INTERVAL_SECONDS,
+    WATCHER_DEBOUNCE_SECONDS,
+)
 from memo.recording.paths import StoragePaths
 from memo.recording.snapshots import MAX_FILE_SIZE_BYTES
 from memo.transport.config import S3Config
@@ -17,6 +20,20 @@ def test_paths_discovery_uses_only_memo_home(monkeypatch, tmp_path: Path) -> Non
     assert paths.archive == home / "archive"
     assert paths.runtime == home / "runtime"
     assert paths.spool == home / "runtime" / "sessions"
+
+
+def test_paths_accept_independent_storage_overrides(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    archive = tmp_path / "archive"
+    runtime = tmp_path / "runtime"
+
+    paths = StoragePaths(home, archive=archive, runtime=runtime)
+
+    assert paths.archive == archive
+    assert paths.runtime == runtime
+    assert paths.socket == runtime / "memo.sock"
+    assert paths.registry == runtime / "registry.sqlite"
+    assert paths.spool == runtime / "sessions"
 
 
 def test_transport_discovery_uses_retained_environment_surface(monkeypatch) -> None:

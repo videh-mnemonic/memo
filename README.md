@@ -15,7 +15,10 @@ Memo requires Python 3.11 or newer and Git.
 For development:
 
 ```console
-pip install -e .
+pip install -e '.[dev]'
+pytest
+ruff check memo tests
+ruff format --check memo tests
 ```
 
 For a user installation from this repository:
@@ -23,6 +26,22 @@ For a user installation from this repository:
 ```console
 pipx install .
 ```
+
+The source tree is organized by responsibility:
+
+```text
+memo/
+  agents/             Coding-agent capture, import, and run metadata
+    harnesses/        Provider-specific Claude and Codex integrations
+  cli/commands/       User-facing command implementations
+  daemon/             Background coordination and the active-session registry
+  export/             Trace export and filesystem replay
+  recording/          Local paths, metadata, snapshots, streams, and storage
+  transport/          Archive construction and S3-compatible transport
+```
+
+The `tests/` tree mirrors these areas, with cross-component behavior under
+`tests/integration/`.
 
 ## Start recording
 

@@ -10,7 +10,6 @@ from urllib.parse import urlsplit
 
 from .config import S3Config
 
-
 MULTIPART_PART_SIZE = 8 * 1024 * 1024
 METADATA_SIZE_LIMIT = 1024 * 1024
 STREAM_READ_SIZE = 64 * 1024
@@ -30,7 +29,10 @@ def _error_code(error: BaseException) -> str | None:
 
 def _is_not_found(error: BaseException) -> bool:
     return isinstance(error, KeyError) or _error_code(error) in {
-        "NoSuchKey", "NoSuchObject", "NotFound", "404",
+        "NoSuchKey",
+        "NoSuchObject",
+        "NotFound",
+        "404",
     }
 
 
@@ -47,8 +49,7 @@ def _close_response(response: Any) -> None:
 
 def _minio_client(config: S3Config) -> Any:
     from minio import Minio
-    from minio.credentials import (AWSConfigProvider, ChainedProvider,
-                                   EnvAWSProvider, IamAwsProvider)
+    from minio.credentials import AWSConfigProvider, ChainedProvider, EnvAWSProvider, IamAwsProvider
 
     endpoint = config.endpoint_url or "https://s3.amazonaws.com"
     parsed = urlsplit(endpoint if "://" in endpoint else f"https://{endpoint}")
@@ -120,12 +121,6 @@ class S3Store:
         finally:
             _close_response(response)
 
-    def read_optional(self, key: str, limit: int = METADATA_SIZE_LIMIT) -> bytes | None:
-        try:
-            return self.read_bytes(key, limit)
-        except FileNotFoundError:
-            return None
-
     def open(self, key: str) -> BinaryIO:
         try:
             return self.client.get_object(self.config.bucket, key)
@@ -139,7 +134,9 @@ class S3Store:
 
     def list(self, prefix: str) -> Iterator[str]:
         for item in self.client.list_objects(
-            self.config.bucket, prefix=prefix, recursive=True,
+            self.config.bucket,
+            prefix=prefix,
+            recursive=True,
         ):
             key = getattr(item, "object_name", None)
             if isinstance(key, str):

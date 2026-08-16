@@ -8,7 +8,6 @@ from typing import Any
 from ...export import terminal_ids, trace_json, write_traces
 from .common import require_local_session
 
-
 NAME = "traces"
 
 
@@ -17,8 +16,7 @@ def configure(subparsers: Any) -> None:
     command.add_argument("session_id")
     command.add_argument("--path", type=Path)
     command.add_argument("--terminals")
-    command.add_argument("--list-terminals", action="store_true",
-                         help="list terminal stream IDs")
+    command.add_argument("--list-terminals", action="store_true", help="list terminal stream IDs")
     command.add_argument("--raw", action="store_true", help="export native agent records")
     command.set_defaults(handler=run)
 

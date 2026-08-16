@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from memo.recording.paths import StoragePaths
 from memo.recording.ignore import IgnorePolicy
+from memo.recording.paths import StoragePaths
 
 
 def test_nested_gitignore_and_negation_apply_within_repository(tmp_path: Path) -> None:

@@ -18,7 +18,7 @@ class S3Config:
     upload_concurrency: int = 3
 
     @classmethod
-    def discover(cls, required: bool = False) -> "S3Config | None":
+    def discover(cls, required: bool = False) -> S3Config | None:
         bucket = os.environ.get("MEMO_S3_BUCKET", "").strip()
         if not bucket:
             if required:

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
-
+from typing import Any
 
 TRACE_SCHEMA_VERSION = 1
+RECORD_CONTAINER_KEYS = ("payload", "message", "meta", "session")
+SESSION_ID_KEYS = ("session_id", "sessionId", "conversation_id", "conversationId", "id")
 
 
 @dataclass(frozen=True)
@@ -65,20 +68,11 @@ class AgentHarness(ABC):
 
     def identify_cwd(self, records: Iterable[SourceRecord], path: Path) -> Path | None:
         keys = ("cwd", "project_path", "projectPath", "working_directory", "workspace")
-        containers = ("payload", "message", "meta", "session")
-        for source in records:
-            if not isinstance(source.value, dict):
-                continue
-            values = [source.value]
-            values.extend(
-                value for key in containers
-                if isinstance((value := source.value.get(key)), dict)
-            )
-            for value in values:
-                for key in keys:
-                    cwd = value.get(key)
-                    if isinstance(cwd, str) and cwd:
-                        return Path(cwd).expanduser().resolve(strict=False)
+        for value in record_containers(records):
+            for key in keys:
+                cwd = value.get(key)
+                if isinstance(cwd, str) and cwd:
+                    return Path(cwd).expanduser().resolve(strict=False)
         return None
 
     @abstractmethod
@@ -122,13 +116,19 @@ class AgentHarness(ABC):
         native_type = value.get("type") if isinstance(value, dict) else None
         native_version = _native_version(value)
         return self.event(
-            record, context, "unknown", content=None,
-            native_type=native_type, native_version=native_version,
+            record,
+            context,
+            "unknown",
+            content=None,
+            native_type=native_type,
+            native_version=native_version,
         )
 
     def parse_error(self, record: SourceRecord, context: ParseContext) -> TraceEvent:
         return self.event(
-            record, context, "parse_error",
+            record,
+            context,
+            "parse_error",
             content={"line": record.line, "error": record.error},
         )
 
@@ -144,20 +144,56 @@ def source_records(path: Path) -> Iterable[SourceRecord]:
             yield SourceRecord(seq=seq, value=value, line=line.rstrip("\n"))
 
 
-def model_context(records: Iterable[SourceRecord]) -> tuple[object | None, object | None]:
-    model = None
-    reasoning = None
+def record_containers(
+    records: Iterable[SourceRecord], nested: Sequence[str] = RECORD_CONTAINER_KEYS
+) -> Iterable[dict[str, Any]]:
+    """Yield top-level records and their commonly nested metadata objects."""
     for record in records:
         if not isinstance(record.value, dict):
             continue
-        values = [record.value]
-        values.extend(
-            value for key in ("payload", "message", "meta", "session")
-            if isinstance((value := record.value.get(key)), dict)
-        )
-        for value in values:
-            model = value.get("model", model)
-            reasoning = value.get("effort", value.get("reasoning", reasoning))
+        yield record.value
+        for key in nested:
+            value = record.value.get(key)
+            if isinstance(value, dict):
+                yield value
+
+
+def first_string(record: dict[str, Any], keys: Sequence[str]) -> str | None:
+    for key in keys:
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def filename_id(path: Path) -> str:
+    match = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F-]{27,})$", path.stem)
+    return match.group(1) if match else path.stem
+
+
+def identify_session(records: Iterable[SourceRecord], path: Path, nested: Sequence[str]) -> str:
+    for value in record_containers(records, nested):
+        session_id = first_string(value, SESSION_ID_KEYS)
+        if session_id:
+            return session_id
+    return filename_id(path)
+
+
+def flag_resume(args: Sequence[str]) -> str | None:
+    for flag in ("--resume", "-r"):
+        if flag in args:
+            index = args.index(flag)
+            if index + 1 < len(args):
+                return args[index + 1]
+    return None
+
+
+def model_context(records: Iterable[SourceRecord]) -> tuple[object | None, object | None]:
+    model = None
+    reasoning = None
+    for value in record_containers(records):
+        model = value.get("model", model)
+        reasoning = value.get("effort", value.get("reasoning", reasoning))
     return model, reasoning
 
 
@@ -179,6 +215,10 @@ def trace_events(harness: AgentHarness, path: Path, trace: str) -> list[dict[str
     result = []
     for record in source_records(path):
         context = ParseContext(trace=trace, seq=record.seq)
-        event = harness.parse_error(record, context) if record.error else harness.parse_record(record, context)
+        event = (
+            harness.parse_error(record, context)
+            if record.error
+            else harness.parse_record(record, context)
+        )
         result.append(event.to_dict())
     return result

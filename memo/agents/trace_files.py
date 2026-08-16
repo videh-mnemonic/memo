@@ -18,9 +18,12 @@ class TraceState:
     complete_size: int
 
     @classmethod
-    def from_stat(cls, value: os.stat_result, complete_size: int | None = None) -> "TraceState":
+    def from_stat(cls, value: os.stat_result, complete_size: int | None = None) -> TraceState:
         return cls(
-            value.st_dev, value.st_ino, value.st_mtime_ns, value.st_size,
+            value.st_dev,
+            value.st_ino,
+            value.st_mtime_ns,
+            value.st_size,
             value.st_size if complete_size is None else complete_size,
         )
 
@@ -37,7 +40,7 @@ class TraceCheckpoint:
         )
 
     @classmethod
-    def from_json(cls, value: str) -> "TraceCheckpoint":
+    def from_json(cls, value: str) -> TraceCheckpoint:
         raw = json.loads(value)
         return cls({path: TraceState(**state) for path, state in raw.items()})
 
@@ -69,9 +72,7 @@ def changed(roots: Sequence[Path], checkpoint: TraceCheckpoint) -> list[Path]:
         except (FileNotFoundError, PermissionError, OSError):
             continue
         previous = checkpoint.files.get(resolved)
-        if previous != state or (
-            previous is not None and previous.complete_size < previous.size
-        ):
+        if previous != state or (previous is not None and previous.complete_size < previous.size):
             result.append(path)
     return result
 

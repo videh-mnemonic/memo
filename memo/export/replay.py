@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from ..recording.paths import StoragePaths
 from ..recording.metadata import StepManifest
+from ..recording.paths import StoragePaths
 from ..recording.store import SessionStore
 from ..recording.streams import StreamEvent
 
@@ -24,8 +24,8 @@ def parse_step(value: str | int) -> int:
 
 
 def _timestamp(receipt_ns: int) -> str:
-    return datetime.fromtimestamp(receipt_ns / 1_000_000_000, timezone.utc).isoformat().replace(
-        "+00:00", "Z"
+    return (
+        datetime.fromtimestamp(receipt_ns / 1_000_000_000, UTC).isoformat().replace("+00:00", "Z")
     )
 
 
@@ -42,8 +42,10 @@ def render_prompts(events: list[StreamEvent], manifest: StepManifest) -> str:
     lines = [
         "# Recorded Terminal Inputs",
         "",
-        ("These are recorded terminal input events bounded by "
-         f"session step {manifest.step}; they are not inferred semantic prompts."),
+        (
+            "These are recorded terminal input events bounded by "
+            f"session step {manifest.step}; they are not inferred semantic prompts."
+        ),
         "",
     ]
     for terminal_id in sorted(grouped):
@@ -51,21 +53,30 @@ def render_prompts(events: list[StreamEvent], manifest: StepManifest) -> str:
         for event in grouped[terminal_id]:
             text = event.bytes().decode("utf-8", errors="replace")
             fence = _fence(text)
-            lines.extend([
-                (f"Sequence {event.sequence} | Timestamp {_timestamp(event.receipt_ns)} | "
-                 f"Receipt ns {event.receipt_ns}"),
-                "",
-                f"{fence}text",
-                text,
-                fence,
-                "",
-            ])
+            lines.extend(
+                [
+                    (
+                        f"Sequence {event.sequence} | Timestamp {_timestamp(event.receipt_ns)} | "
+                        f"Receipt ns {event.receipt_ns}"
+                    ),
+                    "",
+                    f"{fence}text",
+                    text,
+                    fence,
+                    "",
+                ]
+            )
     return "\n".join(lines)
 
 
-def replay_session(session_id: str, at: str | int, destination: Path,
-                   include_prompts: bool = False, force: bool = False,
-                   paths: StoragePaths | None = None) -> Path:
+def replay_session(
+    session_id: str,
+    at: str | int,
+    destination: Path,
+    include_prompts: bool = False,
+    force: bool = False,
+    paths: StoragePaths | None = None,
+) -> Path:
     store = SessionStore(paths or StoragePaths.discover())
     _, session = store.find(session_id)
     if session.capture_scope == "agent-only":

@@ -9,7 +9,6 @@ from pathlib import Path
 from ..recording.relay import run as run_relay
 from .commands import end, import_sessions, pull, push, replay, status, tidy, traces
 
-
 COMMAND_MODULES = (end, import_sessions, tidy, status, traces, replay, push, pull)
 COMMANDS = {module.NAME for module in COMMAND_MODULES}
 

@@ -1,14 +1,15 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from memo.recording.paths import StoragePaths
-from memo.recording.metadata import DirectorySession, SessionOrigin
-from memo.daemon.registry import Registry
-from memo.recording.store import SessionStore, atomic_write
 from memo.cli.commands.status import _age, _format_size, _session_size, render_status
+from memo.daemon.registry import Registry
+from memo.recording.filesystem import atomic_write
+from memo.recording.metadata import DirectorySession, SessionOrigin
+from memo.recording.paths import StoragePaths
 from memo.recording.snapshots import StepPublisher
+from memo.recording.store import SessionStore
 
 
 def _paths(tmp_path: Path) -> StoragePaths:
@@ -16,7 +17,7 @@ def _paths(tmp_path: Path) -> StoragePaths:
 
 
 def test_status_reports_operational_session_summary(tmp_path: Path, monkeypatch) -> None:
-    now = datetime(2026, 8, 15, 20, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 15, 20, 0, tzinfo=UTC)
     root = tmp_path / "root"
     root.mkdir()
     paths = _paths(tmp_path / "memo-home")
@@ -44,7 +45,6 @@ def test_status_reports_operational_session_summary(tmp_path: Path, monkeypatch)
     session.last_pushed_digest = "0" * 64
     session.remote_object = "generation"
     store.update_session(session)
-    assert paths.registry is not None
     with Registry(paths.registry) as registry:
         registry.create(root, session.created_utc, session.session_id)
         registry.allocate_attachment(session.session_id, session.created_utc, "terminal")
@@ -53,26 +53,49 @@ def test_status_reports_operational_session_summary(tmp_path: Path, monkeypatch)
     lines = render_status(paths, now=now).splitlines()
 
     assert lines[0].split() == [
-        "SESSION", "ROOT", "STATE", "SCOPE", "AGE", "LAST", "TERMINALS",
-        "STEPS", "SIZE", "ARCHIVED",
+        "SESSION",
+        "ROOT",
+        "STATE",
+        "SCOPE",
+        "AGE",
+        "LAST",
+        "TERMINALS",
+        "STEPS",
+        "SIZE",
+        "ARCHIVED",
     ]
     assert lines[1].split() == [
-        "abc123", str(root.resolve()), "active", "partial", "2h", "18s", "ago",
-        "1", "15", "284", "MiB", "13/15",
+        "abc123",
+        str(root.resolve()),
+        "active",
+        "partial",
+        "2h",
+        "18s",
+        "ago",
+        "1",
+        "15",
+        "284",
+        "MiB",
+        "13/15",
     ]
 
 
 def test_status_uses_count_based_steps_and_never_archived_marker(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
-    now = datetime(2026, 8, 15, 20, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 15, 20, 0, tzinfo=UTC)
     root = tmp_path / "root"
     root.mkdir()
     paths = _paths(tmp_path / "memo-home")
     store = SessionStore(paths)
     session = DirectorySession(
-        "session", str(root.resolve()), now.isoformat(), now.isoformat(),
-        SessionOrigin("1.0.0", "user", "host"), "complete",
+        "session",
+        str(root.resolve()),
+        now.isoformat(),
+        now.isoformat(),
+        SessionOrigin("1.0.0", "user", "host"),
+        "complete",
     )
     store.create(session)
     StepPublisher(store).publish(session)
@@ -85,8 +108,10 @@ def test_status_uses_count_based_steps_and_never_archived_marker(
 
 
 def test_relative_times_are_compact() -> None:
-    now = datetime(2026, 8, 15, 20, 0, tzinfo=timezone.utc)
-    value = lambda delta: (now - delta).isoformat().replace("+00:00", "Z")
+    now = datetime(2026, 8, 15, 20, 0, tzinfo=UTC)
+
+    def value(delta: timedelta) -> str:
+        return (now - delta).isoformat().replace("+00:00", "Z")
 
     assert _age(value(timedelta(seconds=2)), now, ago=True) == "just now"
     assert _age(value(timedelta(seconds=18)), now, ago=True) == "18s ago"
@@ -121,10 +146,16 @@ def test_status_can_select_one_exact_session(tmp_path: Path, monkeypatch) -> Non
     for session_id in ("one", "two"):
         root = tmp_path / session_id
         root.mkdir()
-        store.create(DirectorySession(
-            session_id, str(root.resolve()), "now", "now",
-            SessionOrigin("1.0.0", "user", "host"), "complete",
-        ))
+        store.create(
+            DirectorySession(
+                session_id,
+                str(root.resolve()),
+                "now",
+                "now",
+                SessionOrigin("1.0.0", "user", "host"),
+                "complete",
+            )
+        )
     monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
 
     lines = render_status(paths, session_id="two").splitlines()
@@ -139,7 +170,8 @@ def test_single_status_rejects_list_only_options(tmp_path: Path) -> None:
 
 
 def test_status_appends_remote_only_sessions_and_applies_combined_limit(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     paths = _paths(tmp_path / "memo-home")
     store = SessionStore(paths)
@@ -147,8 +179,12 @@ def test_status_appends_remote_only_sessions_and_applies_combined_limit(
         root = tmp_path / session_id
         root.mkdir()
         session = DirectorySession(
-            session_id, str(root.resolve()), "now", "now",
-            SessionOrigin("1.0.0", "user", "host"), "complete",
+            session_id,
+            str(root.resolve()),
+            "now",
+            "now",
+            SessionOrigin("1.0.0", "user", "host"),
+            "complete",
         )
         store.create(session)
     monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
@@ -164,15 +200,22 @@ def test_status_appends_remote_only_sessions_and_applies_combined_limit(
 
 
 def test_status_limit_can_be_satisfied_without_listing_archive(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     paths = _paths(tmp_path / "memo-home")
     root = tmp_path / "root"
     root.mkdir()
-    SessionStore(paths).create(DirectorySession(
-        "local", str(root.resolve()), "now", "now",
-        SessionOrigin("1.0.0", "user", "host"), "complete",
-    ))
+    SessionStore(paths).create(
+        DirectorySession(
+            "local",
+            str(root.resolve()),
+            "now",
+            "now",
+            SessionOrigin("1.0.0", "user", "host"),
+            "complete",
+        )
+    )
     monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
     monkeypatch.setattr(
         "memo.transport.list_archived_session_ids",

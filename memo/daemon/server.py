@@ -7,14 +7,19 @@ import os
 import sys
 import threading
 import time
+from contextlib import suppress
 from multiprocessing.connection import Client, Connection, Listener
 from pathlib import Path
 from typing import IO, Any
 
-from ..recording.snapshots import StepPublisher, utcnow
-from ..recording.paths import StoragePaths
-from ..transport.config import S3Config
+from ..agents.harnesses import get_harness
+from ..agents.ingestion import TraceIngester
+from ..agents.trace_files import capture
 from ..recording.metadata import DirectorySession, SessionOrigin
+from ..recording.paths import StoragePaths
+from ..recording.snapshots import StepPublisher, utcnow
+from ..recording.store import SessionStore
+from ..transport.config import S3Config
 from .protocol import (
     DisconnectedError,
     ProtocolError,
@@ -24,11 +29,6 @@ from .protocol import (
     send_message,
 )
 from .registry import ActiveSession, AgentLaunch, Registry
-from ..recording.store import SessionStore
-from ..agents.ingestion import TraceIngester
-from ..agents.harnesses import get_harness
-from ..agents.trace_files import capture
-
 
 STEP_INTERVAL_SECONDS = 15.0
 WATCHER_DEBOUNCE_SECONDS = 0.25
@@ -43,11 +43,10 @@ class MemoDaemon:
     def __init__(self, paths: StoragePaths | None = None, interval: float | None = None):
         self.paths = paths or StoragePaths.discover()
         self.paths.ensure_storage()
-        assert self.paths.registry is not None
-        assert self.paths.socket is not None
         self.registry = Registry(self.paths.registry)
         self.store = SessionStore(self.paths)
         from ..recording.streams import StreamStore
+
         self.streams = StreamStore(self.paths, self.registry)
         self.publisher = StepPublisher(
             self.store,
@@ -64,11 +63,9 @@ class MemoDaemon:
         self._session_locks: dict[str, threading.RLock] = {}
         self._root_locks: dict[str, threading.RLock] = {}
         self._push_thread: threading.Thread | None = None
-        self._server: Listener | None = None
         self._lock_handle: IO[str] | None = None
 
     def _acquire_daemon_lock(self) -> None:
-        assert self.paths.runtime is not None
         lock_path = self.paths.runtime / "daemon.lock"
         self._lock_handle = lock_path.open("a+")
         try:
@@ -132,7 +129,11 @@ class MemoDaemon:
             if self._stop.is_set():
                 return
             current = self.registry.lookup(active.root)
-            if current is None or current.session_id != active.session_id or current.state != "active":
+            if (
+                current is None
+                or current.session_id != active.session_id
+                or current.state != "active"
+            ):
                 return
             if request_event.is_set():
                 request_event.clear()
@@ -181,20 +182,31 @@ class MemoDaemon:
                 attached = self.registry.attached(active.session_id)
                 decision = payload.get("decision")
                 if not attached and decision is None:
-                    return {"decision_required": True, "session_id": active.session_id,
-                            "revision": active.revision, "root": str(active.root)}
+                    return {
+                        "decision_required": True,
+                        "session_id": active.session_id,
+                        "revision": active.revision,
+                        "root": str(active.root),
+                    }
                 expected = payload.get("expected_session_id")
                 revision = payload.get("expected_revision")
                 if decision is not None and (
                     expected != active.session_id or revision != active.revision
                 ):
-                    return {"stale": True, "session_id": active.session_id,
-                            "revision": active.revision,
-                            "attachments": len(self.registry.attached(active.session_id))}
+                    return {
+                        "stale": True,
+                        "session_id": active.session_id,
+                        "revision": active.revision,
+                        "attachments": len(self.registry.attached(active.session_id)),
+                    }
                 if decision == "replace":
                     if attached:
-                        return {"stale": True, "session_id": active.session_id,
-                                "revision": active.revision, "attachments": len(attached)}
+                        return {
+                            "stale": True,
+                            "session_id": active.session_id,
+                            "revision": active.revision,
+                            "attachments": len(attached),
+                        }
                     self._finish(active)
                     created = self._create(canonical)
                     active = self.registry.lookup_session(str(created["session_id"]))
@@ -205,10 +217,13 @@ class MemoDaemon:
             manifest = self.store.head(active.session_id)
             assert manifest is not None
             self._ensure_worker(active)
-            return {"session_id": active.session_id, "root": str(active.root),
-                    "terminal_id": attachment.terminal_id,
-                    "accepted_sequence": attachment.accepted_sequence,
-                    "step": manifest.step}
+            return {
+                "session_id": active.session_id,
+                "root": str(active.root),
+                "terminal_id": attachment.terminal_id,
+                "accepted_sequence": attachment.accepted_sequence,
+                "step": manifest.step,
+            }
 
     def _resolve_active(self, payload: dict[str, Any]) -> ActiveSession | None:
         session_id = payload.get("session_id")
@@ -248,17 +263,28 @@ class MemoDaemon:
                 others = [item for item in others if item.terminal_id != caller]
             expected = payload.get("expected_revision")
             if expected is not None and int(expected) != active.revision:
-                return {"stale": True, "session_id": active.session_id,
-                        "revision": active.revision, "other_terminals": len(others)}
+                return {
+                    "stale": True,
+                    "session_id": active.session_id,
+                    "revision": active.revision,
+                    "other_terminals": len(others),
+                }
             if others and (not payload.get("confirmed") or expected is None):
-                return {"confirmation_required": True, "session_id": active.session_id,
-                        "revision": active.revision, "other_terminals": len(others)}
+                return {
+                    "confirmation_required": True,
+                    "session_id": active.session_id,
+                    "revision": active.revision,
+                    "other_terminals": len(others),
+                }
             session = self.store.load_session(active.session_id)
             selected_scope = payload.get("capture_scope")
             if selected_scope is not None and selected_scope not in {"partial", "full"}:
                 raise ProtocolError("end capture scope must be partial or full")
-            if (session.capture_scope == "partial" and selected_scope is None
-                    and payload.get("prompt_scope")):
+            if (
+                session.capture_scope == "partial"
+                and selected_scope is None
+                and payload.get("prompt_scope")
+            ):
                 return {
                     "scope_confirmation_required": True,
                     "session_id": active.session_id,
@@ -291,13 +317,13 @@ class MemoDaemon:
 
         threading.Thread(target=upload, daemon=True).start()
 
-    def _finish(self, active: ActiveSession,
-                capture_scope: str | None = None) -> dict[str, Any]:
+    def _finish(self, active: ActiveSession, capture_scope: str | None = None) -> dict[str, Any]:
         with self._session_lock(active.session_id):
             return self._finish_locked(active, capture_scope)
 
-    def _finish_locked(self, active: ActiveSession,
-                       capture_scope: str | None = None) -> dict[str, Any]:
+    def _finish_locked(
+        self, active: ActiveSession, capture_scope: str | None = None
+    ) -> dict[str, Any]:
         session = self._session_model(active)
         if session.state == "complete":
             if active.state == "ending":
@@ -354,8 +380,10 @@ class MemoDaemon:
             started_utc = str(payload["started_utc"])
         except (KeyError, TypeError, OSError) as error:
             raise ProtocolError("invalid agent launch") from error
-        if not cwd.is_dir() or not isinstance(command, list) or not all(
-            isinstance(value, str) for value in command
+        if (
+            not cwd.is_dir()
+            or not isinstance(command, list)
+            or not all(isinstance(value, str) for value in command)
         ):
             raise ProtocolError("invalid agent launch")
         harness = get_harness(harness_name)
@@ -363,19 +391,32 @@ class MemoDaemon:
         attachment = self.registry.attachment(terminal_id)
         if active is None or active.state != "active":
             raise RuntimeError(f"recording is not active: {session_id}")
-        if (attachment is None or attachment.session_id != session_id
-                or attachment.detached_utc is not None):
+        if (
+            attachment is None
+            or attachment.session_id != session_id
+            or attachment.detached_utc is not None
+        ):
             raise RuntimeError(f"terminal is not attached to recording: {terminal_id}")
         with self._session_lock(session_id):
-            existing = [window for window in self.registry.windows(session_id)
-                        if window.harness == harness_name and window.cwd == str(cwd)]
+            existing = [
+                window
+                for window in self.registry.windows(session_id)
+                if window.harness == harness_name and window.cwd == str(cwd)
+            ]
             if not existing:
                 checkpoint = capture(harness.trace_roots()).to_json()
                 self.registry.create_window(session_id, harness_name, str(cwd), checkpoint)
-            self.registry.add_launch(AgentLaunch(
-                launch_id, session_id, terminal_id, harness_name, str(cwd),
-                list(command), started_utc,
-            ))
+            self.registry.add_launch(
+                AgentLaunch(
+                    launch_id,
+                    session_id,
+                    terminal_id,
+                    harness_name,
+                    str(cwd),
+                    list(command),
+                    started_utc,
+                )
+            )
         return {"launch_id": launch_id, "capture": "active"}
 
     def _agent_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -396,14 +437,17 @@ class MemoDaemon:
         return {"launch_id": launch_id, "capture": "complete"}
 
     def _push(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from ..transport import (PushSummary, prepare_generation,
-                                 publish_generation)
+        from ..transport import PushSummary, prepare_generation, publish_generation
+
         config = S3Config.discover(required=True)
         assert config is not None
         selected = payload.get("session_id")
         summary = PushSummary()
-        sessions = [session for _, session in self.store.list_sessions()
-                    if selected is None or session.session_id == selected]
+        sessions = [
+            session
+            for _, session in self.store.list_sessions()
+            if selected is None or session.session_id == selected
+        ]
         if selected and not sessions:
             summary.failed.append((str(selected), "directory session not found"))
         for session in sessions:
@@ -413,9 +457,7 @@ class MemoDaemon:
                     session = self.store.load_session(session.session_id)
                     manifest = self.store.head(session.session_id)
                     if manifest is None:
-                        raise ValueError(
-                            f"session has no published step: {session.session_id}"
-                        )
+                        raise ValueError(f"session has no published step: {session.session_id}")
                     if session.last_pushed_step == manifest.step:
                         result = {"status": "skipped"}
                     else:
@@ -426,8 +468,10 @@ class MemoDaemon:
                     )
                     with self._session_lock(session.session_id):
                         current = self.store.load_session(session.session_id)
-                        if (current.last_pushed_step is None
-                                or current.last_pushed_step <= prepared.step):
+                        if (
+                            current.last_pushed_step is None
+                            or current.last_pushed_step <= prepared.step
+                        ):
                             current.last_pushed_step = prepared.step
                             current.last_pushed_digest = prepared.digest
                             current.remote_object = str(result["object"])
@@ -439,8 +483,7 @@ class MemoDaemon:
             finally:
                 if prepared is not None:
                     prepared.cleanup()
-        return {"pushed": summary.pushed, "skipped": summary.skipped,
-                "failed": summary.failed}
+        return {"pushed": summary.pushed, "skipped": summary.skipped, "failed": summary.failed}
 
     def _remove_archived(self, payload: dict[str, Any]) -> dict[str, Any]:
         excluded = payload.get("exclude", [])
@@ -499,8 +542,8 @@ class MemoDaemon:
         if message.operation == "detach":
             terminal_id = str(message.payload["terminal_id"])
             attachment = self.registry.attachment(terminal_id)
-            active = None if attachment is None else self.registry.lookup_session(
-                attachment.session_id
+            active = (
+                None if attachment is None else self.registry.lookup_session(attachment.session_id)
             )
             if active is not None:
                 with self._root_lock(active.root):
@@ -535,10 +578,8 @@ class MemoDaemon:
                 return
             except Exception as error:
                 response = Response(False, {}, str(error))
-            try:
+            with suppress(BrokenPipeError, ConnectionResetError):
                 send_message(connection, response)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
 
     def serve_forever(self) -> None:
         self._acquire_daemon_lock()
@@ -554,7 +595,6 @@ class MemoDaemon:
                 self.registry.remove(active.session_id)
         self.socket_path.unlink(missing_ok=True)
         server = Listener(str(self.socket_path), family="AF_UNIX", backlog=32)
-        self._server = server
         try:
             os.chmod(self.socket_path, 0o600)
             for active in self.registry.list_active():

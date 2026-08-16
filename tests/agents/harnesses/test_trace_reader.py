@@ -23,12 +23,15 @@ def test_source_records_represent_every_physical_line(tmp_path: Path) -> None:
 
 def test_trace_events_include_unknown_and_parse_errors(tmp_path: Path) -> None:
     path = tmp_path / "mixed.jsonl"
-    path.write_text('[1]\nnull\n\n{broken\n')
+    path.write_text("[1]\nnull\n\n{broken\n")
 
     events = trace_events(get_harness("claude"), path, "007")
 
     assert [item["event"]["type"] for item in events] == [
-        "unknown", "unknown", "parse_error", "parse_error",
+        "unknown",
+        "unknown",
+        "parse_error",
+        "parse_error",
     ]
     assert [item["position"] for item in events] == [
         {"trace": "007", "seq": index} for index in range(4)

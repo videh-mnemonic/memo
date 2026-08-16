@@ -45,10 +45,18 @@ def test_end_prefers_shell_session_identity(monkeypatch, tmp_path: Path, capsys)
 
 def test_end_decline_leaves_recording_unchanged(monkeypatch, capsys) -> None:
     calls = []
-    monkeypatch.setattr("memo.cli.commands.end.end", lambda *args, **kwargs: calls.append(kwargs) or {
-        "confirmation_required": True, "session_id": "session",
-        "revision": 4, "other_terminals": 2,
-    })
+    monkeypatch.setattr(
+        "memo.cli.commands.end.end",
+        lambda *args, **kwargs: (
+            calls.append(kwargs)
+            or {
+                "confirmation_required": True,
+                "session_id": "session",
+                "revision": 4,
+                "other_terminals": 2,
+            }
+        ),
+    )
     monkeypatch.setattr("builtins.input", lambda _: "n")
 
     assert main(["end", "."]) == 0
@@ -56,12 +64,20 @@ def test_end_decline_leaves_recording_unchanged(monkeypatch, capsys) -> None:
     assert "recording unchanged" in capsys.readouterr().out
 
 
-def test_public_push_and_pull_subcommands_route_results(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_public_push_and_pull_subcommands_route_results(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
     from memo.cli.commands import pull, push
 
-    monkeypatch.setattr(push, "push", lambda session_id: {
-        "pushed": [session_id], "skipped": [], "failed": [],
-    })
+    monkeypatch.setattr(
+        push,
+        "push",
+        lambda session_id: {
+            "pushed": [session_id],
+            "skipped": [],
+            "failed": [],
+        },
+    )
     assert main(["push", "session"]) == 0
     assert capsys.readouterr().out == "pushed: session\n"
 
@@ -90,8 +106,7 @@ def test_tidy_imports_pushes_then_removes_archived(monkeypatch, capsys) -> None:
         calls.append(("remove", exclude))
         return {
             "removed": ["complete"],
-            "retained": [("active", "recording is not complete"),
-                         ("failed", "push failed")],
+            "retained": [("active", "recording is not complete"), ("failed", "push failed")],
             "failed": [],
         }
 
@@ -116,8 +131,12 @@ def test_read_commands_ensure_session_is_local(monkeypatch, tmp_path: Path, caps
         "memo.cli.commands.status.render_status",
         lambda **kwargs: f"{kwargs['session_id']}\n",
     )
-    monkeypatch.setattr("memo.cli.commands.traces.trace_json", lambda session_id, *args, **kwargs: "[]\n")
-    monkeypatch.setattr("memo.cli.commands.replay.replay_session", lambda *args, **kwargs: tmp_path / "out")
+    monkeypatch.setattr(
+        "memo.cli.commands.traces.trace_json", lambda session_id, *args, **kwargs: "[]\n"
+    )
+    monkeypatch.setattr(
+        "memo.cli.commands.replay.replay_session", lambda *args, **kwargs: tmp_path / "out"
+    )
 
     assert main(["status", "one"]) == 0
     assert main(["traces", "two"]) == 0
@@ -168,8 +187,7 @@ def test_end_prompts_for_scope_when_daemon_requests_it(monkeypatch, capsys) -> N
     def fake_end(*args, **kwargs):
         calls.append(kwargs)
         if len(calls) == 1:
-            return {"scope_confirmation_required": True, "revision": 1,
-                    "other_terminals": 0}
+            return {"scope_confirmation_required": True, "revision": 1, "other_terminals": 0}
         return {"session_id": "session", "step": 2, "already_complete": False}
 
     monkeypatch.setattr("memo.cli.commands.end.end", fake_end)

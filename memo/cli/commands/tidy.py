@@ -8,7 +8,6 @@ from typing import Any
 from ...agents.session_import import import_native_sessions
 from ...daemon.client import push, remove_archived
 
-
 NAME = "tidy"
 
 

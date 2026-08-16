@@ -8,10 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from memo.recording.paths import StoragePaths
 from memo.export import replay_session, terminal_ids, trace_json, write_traces
+from memo.recording.filesystem import atomic_write
 from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
-from memo.recording.store import SessionStore, atomic_write
+from memo.recording.paths import StoragePaths
+from memo.recording.store import SessionStore
 from memo.recording.streams import StreamEvent
 
 
@@ -23,15 +24,26 @@ def _write_stream(session_path: Path, terminal_id: str, events: list[StreamEvent
     terminal = session_path / "streams" / "terminals" / terminal_id
     chunk = terminal / "chunks" / "events.jsonl.gz"
     chunk.parent.mkdir(parents=True)
-    atomic_write(chunk, gzip.compress(b"".join(
-        json.dumps(event.to_dict()).encode() + b"\n" for event in events
-    ), mtime=0))
-    atomic_write(terminal / "stream.json", (json.dumps({
-        "schema_version": 1,
-        "terminal_id": terminal_id,
-        "highest_sequence": events[-1].sequence,
-        "chunks": ["chunks/events.jsonl.gz"],
-    }) + "\n").encode())
+    atomic_write(
+        chunk,
+        gzip.compress(
+            b"".join(json.dumps(event.to_dict()).encode() + b"\n" for event in events), mtime=0
+        ),
+    )
+    atomic_write(
+        terminal / "stream.json",
+        (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "terminal_id": terminal_id,
+                    "highest_sequence": events[-1].sequence,
+                    "chunks": ["chunks/events.jsonl.gz"],
+                }
+            )
+            + "\n"
+        ).encode(),
+    )
 
 
 def _fixture(tmp_path: Path) -> tuple[StoragePaths, SessionStore, DirectorySession]:
@@ -39,8 +51,14 @@ def _fixture(tmp_path: Path) -> tuple[StoragePaths, SessionStore, DirectorySessi
     root.mkdir()
     paths = _paths(tmp_path / "home")
     store = SessionStore(paths)
-    session = DirectorySession("session", str(root.resolve()), "start", "now",
-                               SessionOrigin("1.0.0", "user", "host"), "complete")
+    session = DirectorySession(
+        "session",
+        str(root.resolve()),
+        "start",
+        "now",
+        SessionOrigin("1.0.0", "user", "host"),
+        "complete",
+    )
     session_path = store.create(session)
     events = {
         "z": [StreamEvent("z", 1, "output", base64.b64encode(b"z").decode(), 10)],
@@ -58,8 +76,12 @@ def _fixture(tmp_path: Path) -> tuple[StoragePaths, SessionStore, DirectorySessi
         prepared = Path(tempfile.mkdtemp(dir=session_path))
         (prepared / "note.txt").write_text(content)
         manifest = StepManifest(
-            "session", step, f"time-{step}", f"snapshots/{step}",
-            [SnapshotEntry("note.txt", "file", 0o644, len(content))], high_water,
+            "session",
+            step,
+            f"time-{step}",
+            f"snapshots/{step}",
+            [SnapshotEntry("note.txt", "file", 0o644, len(content))],
+            high_water,
         )
         store.publish(session, manifest, prepared)
     return paths, store, session
@@ -84,7 +106,9 @@ def test_trace_export_defaults_to_all_terminals_and_matches_file(tmp_path: Path)
     output = trace_json("session", paths=paths)
     exported = json.loads(output)
     assert [(item["terminal_id"], item["sequence"]) for item in exported] == [
-        ("a", 1), ("z", 1), ("a", 2),
+        ("a", 1),
+        ("z", 1),
+        ("a", 2),
     ]
     assert exported[-1]["data"] == "later\ufffd"
     destination = tmp_path / "exports" / "traces.json"

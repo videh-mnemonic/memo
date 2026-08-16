@@ -9,8 +9,8 @@ import termios
 import time
 from pathlib import Path
 
-from memo.recording.paths import StoragePaths
 from memo.daemon.protocol import request
+from memo.recording.paths import StoragePaths
 
 
 def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> None:
@@ -24,8 +24,16 @@ def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> No
     original = termios.tcgetattr(slave)
     environment = {**os.environ, "MEMO_HOME": str(home), "SHELL": str(shell)}
     process = subprocess.Popen(
-        [sys.executable, "-c", "from memo.recording.relay import run; from pathlib import Path; raise SystemExit(run(Path(r'%s')))" % root],
-        stdin=slave, stdout=slave, stderr=slave, env=environment, close_fds=True,
+        [
+            sys.executable,
+            "-c",
+            f"from memo.recording.relay import run; from pathlib import Path; raise SystemExit(run(Path({str(root)!r})))",
+        ],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=environment,
+        close_fds=True,
     )
     try:
         deadline = time.monotonic() + 5
@@ -49,7 +57,11 @@ def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> No
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
-        paths = StoragePaths.discover() if os.environ.get("MEMO_HOME") == str(home) else StoragePaths(home)
+        paths = (
+            StoragePaths.discover()
+            if os.environ.get("MEMO_HOME") == str(home)
+            else StoragePaths(home)
+        )
         if paths.socket and paths.socket.exists():
             request(str(paths.socket), "shutdown")
         os.close(master)

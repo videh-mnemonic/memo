@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import shutil
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
@@ -15,15 +14,19 @@ from urllib.parse import quote
 
 import zstandard
 
+from ..agents.run_metadata import AgentRunMetadata
+from ..recording.filesystem import atomic_write
 from ..recording.metadata import DirectorySession, SessionOrigin
 from ..recording.paths import StoragePaths
-from ..recording.store import (SessionNotFoundError, SessionStore, atomic_write,
-                               validate_session_id)
-from .archive import (PreparedGeneration, atomic_install_directory,
-                      prepare_generation, safe_extract_tar_zst_stream)
+from ..recording.store import SessionNotFoundError, SessionStore, validate_session_id
+from .archive import (
+    PreparedGeneration,
+    atomic_install_directory,
+    prepare_generation,
+    safe_extract_tar_zst_stream,
+)
 from .config import S3Config
-from .s3 import METADATA_SIZE_LIMIT, STREAM_READ_SIZE, S3Store
-
+from .s3 import METADATA_SIZE_LIMIT, S3Store
 
 GENERATION_NAME = re.compile(r"^(\d{8,})-([0-9a-f]{64})\.tar\.zst$")
 COMPLETION_NAME = re.compile(r"^(\d{8,})-([0-9a-f]{64})\.json$")
@@ -55,16 +58,22 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _valid_digest(value: object) -> bool:
-    return (isinstance(value, str) and len(value) == 64
-            and all(character in "0123456789abcdef" for character in value))
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
-def _session_base(config: S3Config, origin: SessionOrigin | dict[str, str],
-                  session_id: str) -> str:
+def _session_base(config: S3Config, origin: SessionOrigin | dict[str, str], session_id: str) -> str:
     username = origin.username if isinstance(origin, SessionOrigin) else origin["username"]
     hostname = origin.hostname if isinstance(origin, SessionOrigin) else origin["hostname"]
     return _key(
-        config, _component(username), _component(hostname), "sessions", session_id,
+        config,
+        _component(username),
+        _component(hostname),
+        "sessions",
+        session_id,
     )
 
 
@@ -93,11 +102,16 @@ def _index_record(config: S3Config, session: DirectorySession) -> tuple[str, byt
 
 
 def _validate_index(index: object, session_id: str) -> dict[str, str]:
-    if (not isinstance(index, dict) or index.get("schema_version") != 1
-            or index.get("session_id") != session_id):
+    if (
+        not isinstance(index, dict)
+        or index.get("schema_version") != 1
+        or index.get("session_id") != session_id
+    ):
         raise ValueError("remote session index is invalid")
-    if any(not isinstance(index.get(key), str) or not index.get(key)
-           for key in ("memo_version_id", "username", "hostname")):
+    if any(
+        not isinstance(index.get(key), str) or not index.get(key)
+        for key in ("memo_version_id", "username", "hostname")
+    ):
         raise ValueError("remote session index has invalid origin")
     return index  # type: ignore[return-value]
 
@@ -106,7 +120,7 @@ def _load_index(store: S3Store, config: S3Config, session_id: str) -> dict[str, 
     prefix = _key(config, "index", "sessions", session_id) + "/"
     records: list[dict[str, str]] = []
     for key in store.list(prefix):
-        relative = key[len(prefix):]
+        relative = key[len(prefix) :]
         match = INDEX_NAME.fullmatch(relative)
         if match is None:
             continue
@@ -124,7 +138,7 @@ def _load_index(store: S3Store, config: S3Config, session_id: str) -> dict[str, 
 def _list_generations(store: S3Store, prefix: str) -> dict[int, tuple[str, str]]:
     generations: dict[int, tuple[str, str]] = {}
     for key in store.list(prefix):
-        match = GENERATION_NAME.fullmatch(key[len(prefix):])
+        match = GENERATION_NAME.fullmatch(key[len(prefix) :])
         if match is None:
             continue
         step, digest = int(match.group(1)), match.group(2)
@@ -138,7 +152,7 @@ def _list_generations(store: S3Store, prefix: str) -> dict[int, tuple[str, str]]
 def _list_completions(store: S3Store, prefix: str) -> list[tuple[int, str, str]]:
     completions: list[tuple[int, str, str]] = []
     for key in store.list(prefix):
-        match = COMPLETION_NAME.fullmatch(key[len(prefix):])
+        match = COMPLETION_NAME.fullmatch(key[len(prefix) :])
         if match is not None:
             completions.append((int(match.group(1)), match.group(2), key))
     if len(completions) > 1:
@@ -146,8 +160,9 @@ def _list_completions(store: S3Store, prefix: str) -> list[tuple[int, str, str]]
     return completions
 
 
-def _select_generation(store: S3Store, config: S3Config, base: str,
-                       session_id: str) -> tuple[int, str, str]:
+def _select_generation(
+    store: S3Store, config: S3Config, base: str, session_id: str
+) -> tuple[int, str, str]:
     generation_prefix = f"{base}/generations/"
     generations = _list_generations(store, generation_prefix)
     completions = _list_completions(store, f"{base}/completions/")
@@ -163,18 +178,27 @@ def _select_generation(store: S3Store, config: S3Config, base: str,
     if generation != (expected_key, digest):
         raise ValueError("remote completion record references a missing generation")
     completion = json.loads(store.read_bytes(completion_key))
-    if (not isinstance(completion, dict) or completion.get("schema_version") != 1
-            or completion.get("session_id") != session_id
-            or completion.get("final_step") != step
-            or completion.get("generation") != expected_key
-            or completion.get("sha256") != digest):
+    if (
+        not isinstance(completion, dict)
+        or completion.get("schema_version") != 1
+        or completion.get("session_id") != session_id
+        or completion.get("final_step") != step
+        or completion.get("generation") != expected_key
+        or completion.get("sha256") != digest
+    ):
         raise ValueError("remote completion record is invalid")
     return step, expected_key, digest
 
 
-def publish_generation(store: SessionStore, session: DirectorySession,
-                       prepared: PreparedGeneration, config: S3Config,
-                       client: Any | None = None, *, update_local: bool = True) -> dict[str, object]:
+def publish_generation(
+    store: SessionStore,
+    session: DirectorySession,
+    prepared: PreparedGeneration,
+    config: S3Config,
+    client: Any | None = None,
+    *,
+    update_local: bool = True,
+) -> dict[str, object]:
     """Publish an append-only generation and its discovery records."""
     remote = _store(config, client)
     base = _session_base(config, session.origin, session.session_id)
@@ -198,13 +222,15 @@ def publish_generation(store: SessionStore, session: DirectorySession,
         existing_completions = _list_completions(remote, f"{base}/completions/")
         if existing_completions and existing_completions[0][2] != completion_key:
             raise ValueError("remote session has conflicting completion records")
-        completion = _canonical_json({
-            "schema_version": 1,
-            "session_id": session.session_id,
-            "final_step": prepared.step,
-            "generation": generation,
-            "sha256": prepared.digest,
-        })
+        completion = _canonical_json(
+            {
+                "schema_version": 1,
+                "session_id": session.session_id,
+                "final_step": prepared.step,
+                "generation": generation,
+                "sha256": prepared.digest,
+            }
+        )
         remote.put_bytes(completion_key, completion)
 
     if update_local:
@@ -221,8 +247,9 @@ def publish_generation(store: SessionStore, session: DirectorySession,
     }
 
 
-def push_session(store: SessionStore, session: DirectorySession, config: S3Config,
-                 client: Any | None = None) -> dict[str, object]:
+def push_session(
+    store: SessionStore, session: DirectorySession, config: S3Config, client: Any | None = None
+) -> dict[str, object]:
     """Package and publish a session unless its current step was already pushed."""
     manifest = store.head(session.session_id)
     if manifest is None:
@@ -241,8 +268,9 @@ def push_session(store: SessionStore, session: DirectorySession, config: S3Confi
         prepared.cleanup()
 
 
-def list_archived_session_ids(config: S3Config | None = None,
-                              client: Any | None = None) -> list[str]:
+def list_archived_session_ids(
+    config: S3Config | None = None, client: Any | None = None
+) -> list[str]:
     """List session IDs advertised by the remote archive index."""
     config = config or S3Config.discover(required=True)
     assert config is not None
@@ -250,7 +278,7 @@ def list_archived_session_ids(config: S3Config | None = None,
     prefix = _key(config, "index", "sessions") + "/"
     session_ids: set[str] = set()
     for key in remote.list(prefix):
-        remainder = key[len(prefix):]
+        remainder = key[len(prefix) :]
         parts = remainder.split("/")
         if len(parts) != 2 or INDEX_NAME.fullmatch(parts[1]) is None:
             continue
@@ -261,14 +289,21 @@ def list_archived_session_ids(config: S3Config | None = None,
     return sorted(session_ids)
 
 
-def _same_origin_remote_session_ids(origin: SessionOrigin, config: S3Config,
-                                    store: S3Store) -> list[str]:
-    prefix = _key(
-        config, _component(origin.username), _component(origin.hostname), "sessions",
-    ) + "/"
+def _same_origin_remote_session_ids(
+    origin: SessionOrigin, config: S3Config, store: S3Store
+) -> list[str]:
+    prefix = (
+        _key(
+            config,
+            _component(origin.username),
+            _component(origin.hostname),
+            "sessions",
+        )
+        + "/"
+    )
     session_ids: set[str] = set()
     for key in store.list(prefix):
-        session_id = key[len(prefix):].split("/", 1)[0]
+        session_id = key[len(prefix) :].split("/", 1)[0]
         try:
             session_ids.add(validate_session_id(session_id))
         except ValueError:
@@ -276,12 +311,11 @@ def _same_origin_remote_session_ids(origin: SessionOrigin, config: S3Config,
     return sorted(session_ids)
 
 
-def _stream_agent_run_metadata(store: S3Store, generation: str) -> list[dict[str, Any]]:
-    """Read run metadata, and legacy trace digests when needed, from an archive prefix."""
+def _stream_agent_run_metadata(store: S3Store, generation: str) -> list[AgentRunMetadata]:
+    """Read agent-run metadata from the beginning of an archive stream."""
     body = store.open(generation)
     reader = zstandard.ZstdDecompressor().stream_reader(body, closefd=False)
-    result: list[dict[str, Any]] = []
-    legacy: dict[str, dict[str, Any]] = {}
+    result: list[AgentRunMetadata] = []
     try:
         with tarfile.open(fileobj=reader, mode="r|") as archive:
             for member in archive:
@@ -293,34 +327,8 @@ def _stream_agent_run_metadata(store: S3Store, generation: str) -> list[dict[str
                     value = json.loads(extracted.read(METADATA_SIZE_LIMIT + 1))
                     if not isinstance(value, dict):
                         raise ValueError("remote agent metadata is invalid")
-                    result.append(value)
-                    trace_file = value.get("trace_file")
-                    if (not isinstance(value.get("trace_complete_size"), int)
-                            or not _valid_digest(value.get("trace_digest"))):
-                        if isinstance(trace_file, str) and Path(trace_file).name == trace_file:
-                            legacy[trace_file] = value
-                elif name.startswith("agents/traces/"):
-                    if not legacy:
-                        break
-                    trace_name = Path(name).name
-                    value = legacy.get(trace_name)
-                    if value is None or not member.isfile():
-                        continue
-                    extracted = archive.extractfile(member)
-                    if extracted is None:
-                        raise ValueError("remote agent trace is invalid")
-                    hashing = hashlib.sha256()
-                    size = 0
-                    while True:
-                        chunk = extracted.read(STREAM_READ_SIZE)
-                        if not chunk:
-                            break
-                        hashing.update(chunk)
-                        size += len(chunk)
-                    value["trace_complete_size"] = size
-                    value["trace_digest"] = hashing.hexdigest()
-                    legacy.pop(trace_name, None)
-                elif name.startswith("snapshots/") or name.startswith("steps/"):
+                    result.append(AgentRunMetadata.from_dict(value))
+                elif name.startswith("agents/traces/") or name.startswith("snapshots/"):
                     break
     finally:
         try:
@@ -330,9 +338,9 @@ def _stream_agent_run_metadata(store: S3Store, generation: str) -> list[dict[str
     return result
 
 
-def inspect_archived_agent_runs(origin: SessionOrigin, config: S3Config | None = None,
-                                client: Any | None = None
-                                ) -> tuple[list[dict[str, object]], set[str]]:
+def inspect_archived_agent_runs(
+    origin: SessionOrigin, config: S3Config | None = None, client: Any | None = None
+) -> tuple[list[dict[str, object]], set[str]]:
     """Inspect same-origin agent metadata without downloading filesystem snapshots."""
     config = config or S3Config.discover(required=True)
     assert config is not None
@@ -346,30 +354,25 @@ def inspect_archived_agent_runs(origin: SessionOrigin, config: S3Config | None =
         except FileNotFoundError:
             continue
         for metadata in _stream_agent_run_metadata(remote, generation):
-            harness = metadata.get("harness")
-            native_id = metadata.get("agent_session_id")
-            size = metadata.get("trace_complete_size")
-            digest = metadata.get("trace_digest")
-            if (not isinstance(harness, str) or not isinstance(native_id, str)
-                    or not isinstance(size, int) or size < 0
-                    or not _valid_digest(digest)):
-                continue
-            runs.append({
-                "session_id": session_id,
-                "capture_scope": (
-                    "agent-only" if metadata.get("imported_agent_only") is True else "partial"
-                ),
-                "harness": harness,
-                "native_id": native_id,
-                "complete_size": size,
-                "digest": str(digest),
-            })
+            runs.append(
+                {
+                    "session_id": session_id,
+                    "capture_scope": ("agent-only" if metadata.imported_agent_only else "partial"),
+                    "harness": metadata.harness,
+                    "native_id": metadata.agent_session_id,
+                    "complete_size": metadata.trace_complete_size,
+                    "digest": metadata.trace_digest,
+                }
+            )
     return runs, session_ids
 
 
-def ensure_local_session(session_id: str, paths: StoragePaths | None = None,
-                         config: S3Config | None = None,
-                         client: Any | None = None) -> Path:
+def ensure_local_session(
+    session_id: str,
+    paths: StoragePaths | None = None,
+    config: S3Config | None = None,
+    client: Any | None = None,
+) -> Path:
     """Return a local session, pulling it from the archive when absent."""
     session_id = validate_session_id(session_id)
     paths = paths or StoragePaths.discover()
@@ -381,9 +384,13 @@ def ensure_local_session(session_id: str, paths: StoragePaths | None = None,
         return pull_session(session_id, paths, config, client=client)
 
 
-def pull_session(session_id: str, paths: StoragePaths | None = None,
-                 config: S3Config | None = None, force: bool = False,
-                 client: Any | None = None) -> Path:
+def pull_session(
+    session_id: str,
+    paths: StoragePaths | None = None,
+    config: S3Config | None = None,
+    force: bool = False,
+    client: Any | None = None,
+) -> Path:
     """Download, verify, and atomically install a remote session."""
     session_id = validate_session_id(session_id)
     paths = paths or StoragePaths.discover()
@@ -398,13 +405,13 @@ def pull_session(session_id: str, paths: StoragePaths | None = None,
     if destination.exists() and not force:
         local = store.head(session_id)
         if local and local.step >= step:
-            raise FileExistsError(
-                f"local step {local.step} is not older than remote step {step}"
-            )
+            raise FileExistsError(f"local step {local.step} is not older than remote step {step}")
         raise FileExistsError(f"local session exists: {session_id}; use --force to replace it")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{session_id}.pull-", dir=destination.parent))
-    try:
+    with tempfile.TemporaryDirectory(
+        prefix=f".{session_id}.pull-", dir=destination.parent
+    ) as temporary_name:
+        temporary = Path(temporary_name)
         body = remote.open(object_key)
         try:
             actual_digest = safe_extract_tar_zst_stream(body, temporary)
@@ -417,12 +424,14 @@ def pull_session(session_id: str, paths: StoragePaths | None = None,
         if not manifests:
             raise ValueError("downloaded session has no published steps")
         manifest = manifests[-1]
-        if (pulled.session_id != session_id
-                or pulled.origin.memo_version_id != origin["memo_version_id"]
-                or pulled.origin.username != origin["username"]
-                or pulled.origin.hostname != origin["hostname"]
-                or manifest.session_id != session_id
-                or manifest.step != step):
+        if (
+            pulled.session_id != session_id
+            or pulled.origin.memo_version_id != origin["memo_version_id"]
+            or pulled.origin.username != origin["username"]
+            or pulled.origin.hostname != origin["hostname"]
+            or manifest.session_id != session_id
+            or manifest.step != step
+        ):
             raise ValueError("downloaded session does not match remote generation")
         pulled.last_pushed_step = manifest.step
         pulled.last_pushed_digest = digest
@@ -432,7 +441,4 @@ def pull_session(session_id: str, paths: StoragePaths | None = None,
             (json.dumps(pulled.to_dict(), indent=2, sort_keys=True) + "\n").encode(),
         )
         atomic_install_directory(temporary, destination, force=force)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
     return destination

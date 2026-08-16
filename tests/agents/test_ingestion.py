@@ -4,21 +4,27 @@ import json
 from pathlib import Path
 
 from memo.agents.ingestion import TraceIngester
-from memo.recording.paths import StoragePaths
-from memo.recording.metadata import DirectorySession, SessionOrigin
-from memo.daemon.registry import AgentLaunch, Registry
-from memo.recording.store import SessionStore
-from memo.agents.shim import ensure_shims, run as run_shim
+from memo.agents.shim import ensure_shims
+from memo.agents.shim import run as run_shim
 from memo.agents.trace_files import TraceCheckpoint, capture, changed, snapshot_complete
+from memo.daemon.registry import AgentLaunch, Registry
+from memo.recording.metadata import DirectorySession, SessionOrigin
+from memo.recording.paths import StoragePaths
+from memo.recording.store import SessionStore
 
 
 def _record(session_id: str, cwd: Path, content: str) -> str:
-    return json.dumps({
-        "session_id": session_id,
-        "cwd": str(cwd.resolve()),
-        "type": "user",
-        "content": content,
-    }) + "\n"
+    return (
+        json.dumps(
+            {
+                "session_id": session_id,
+                "cwd": str(cwd.resolve()),
+                "type": "user",
+                "content": content,
+            }
+        )
+        + "\n"
+    )
 
 
 def test_checkpoint_finds_every_change_and_round_trips(tmp_path: Path) -> None:
@@ -59,10 +65,15 @@ def test_ingester_archives_all_matching_sessions_and_updates_resume(
     paths = StoragePaths(tmp_path / "home")
     paths.ensure_storage()
     store = SessionStore(paths)
-    store.create(DirectorySession(
-        "memo-session", str(project.resolve()), "start", "start",
-        SessionOrigin("1.0.0", "user", "host"),
-    ))
+    store.create(
+        DirectorySession(
+            "memo-session",
+            str(project.resolve()),
+            "start",
+            "start",
+            SessionOrigin("1.0.0", "user", "host"),
+        )
+    )
     registry = Registry(paths.registry)
     registry.create(project, "start", "memo-session")
     registry.allocate_attachment("memo-session", "start", "terminal")
@@ -72,14 +83,28 @@ def test_ingester_archives_all_matching_sessions_and_updates_resume(
     old.write_text(_record("old", project, "before launch"))
     checkpoint = capture((trace_root,)).to_json()
     registry.create_window("memo-session", "claude", str(project.resolve()), checkpoint)
-    registry.add_launch(AgentLaunch(
-        "one", "memo-session", "terminal", "claude", str(project.resolve()),
-        ["claude"], "one",
-    ))
-    registry.add_launch(AgentLaunch(
-        "two", "memo-session", "terminal-two", "claude", str(project.resolve()),
-        ["claude", "--model", "other"], "one-and-a-half",
-    ))
+    registry.add_launch(
+        AgentLaunch(
+            "one",
+            "memo-session",
+            "terminal",
+            "claude",
+            str(project.resolve()),
+            ["claude"],
+            "one",
+        )
+    )
+    registry.add_launch(
+        AgentLaunch(
+            "two",
+            "memo-session",
+            "terminal-two",
+            "claude",
+            str(project.resolve()),
+            ["claude", "--model", "other"],
+            "one-and-a-half",
+        )
+    )
     first = trace_root / "first.jsonl"
     second = trace_root / "second.jsonl"
     unrelated = trace_root / "unrelated.jsonl"
@@ -93,11 +118,13 @@ def test_ingester_archives_all_matching_sessions_and_updates_resume(
     run_files = sorted((store.session_path("memo-session") / "agents/runs").glob("*.json"))
     assert len(run_files) == 2
     assert {json.loads(path.read_text())["agent_session_id"] for path in run_files} == {
-        "native-one", "native-two",
+        "native-one",
+        "native-two",
     }
-    assert all("before launch" not in path.read_text() for path in (
-        store.session_path("memo-session") / "agents/traces"
-    ).glob("*.jsonl"))
+    assert all(
+        "before launch" not in path.read_text()
+        for path in (store.session_path("memo-session") / "agents/traces").glob("*.jsonl")
+    )
 
     registry.finish_launch("one", "two", 0)
     registry.finish_launch("two", "two", 0)
@@ -109,20 +136,31 @@ def test_ingester_archives_all_matching_sessions_and_updates_resume(
     registry.create_window(
         "memo-session", "claude", str(project.resolve()), capture((trace_root,)).to_json()
     )
-    registry.add_launch(AgentLaunch(
-        "resume", "memo-session", "terminal", "claude", str(project.resolve()),
-        ["claude", "--resume", "native-one"], "three",
-    ))
+    registry.add_launch(
+        AgentLaunch(
+            "resume",
+            "memo-session",
+            "terminal",
+            "claude",
+            str(project.resolve()),
+            ["claude", "--resume", "native-one"],
+            "three",
+        )
+    )
     first.write_text(first.read_text() + _record("native-one", project, "resumed"))
     ingester.ingest("memo-session")
     assert len(list((store.session_path("memo-session") / "agents/runs").glob("*.json"))) == 2
     metadata = next(
-        json.loads(path.read_text()) for path in run_files
+        json.loads(path.read_text())
+        for path in run_files
         if json.loads(path.read_text())["agent_session_id"] == "native-one"
     )
-    assert "resumed" in (
-        store.session_path("memo-session") / "agents/traces" / metadata["trace_file"]
-    ).read_text()
+    assert (
+        "resumed"
+        in (
+            store.session_path("memo-session") / "agents/traces" / metadata["trace_file"]
+        ).read_text()
+    )
     registry.close()
 
 

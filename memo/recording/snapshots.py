@@ -6,20 +6,19 @@ import os
 import shutil
 import stat
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from .paths import StoragePaths
 from .ignore import IgnorePolicy
 from .metadata import DirectorySession, SnapshotEntry, StepManifest
+from .paths import StoragePaths
 from .store import SessionStore
-
 
 MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
 
 
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -56,8 +55,14 @@ def _stable_copy(source: Path, target: Path, before: os.stat_result) -> bool:
     return True
 
 
-def scan_tree(root: Path, destination: Path, *, previous: Path | None = None,
-              paths: StoragePaths | None = None, max_file_size: int | None = None) -> list[SnapshotEntry]:
+def scan_tree(
+    root: Path,
+    destination: Path,
+    *,
+    previous: Path | None = None,
+    paths: StoragePaths | None = None,
+    max_file_size: int | None = None,
+) -> list[SnapshotEntry]:
     entries: list[SnapshotEntry] = []
     seen: set[str] = set()
     policy = IgnorePolicy(root, paths)
@@ -77,12 +82,19 @@ def scan_tree(root: Path, destination: Path, *, previous: Path | None = None,
                 continue
             decision = policy.decision(source, is_dir=True)
             if decision.ignored:
-                entries.append(SnapshotEntry(relative.as_posix(), "ignored-policy",
-                                             stat.S_IMODE(source_stat.st_mode), detail=decision.source))
+                entries.append(
+                    SnapshotEntry(
+                        relative.as_posix(),
+                        "ignored-policy",
+                        stat.S_IMODE(source_stat.st_mode),
+                        detail=decision.source,
+                    )
+                )
                 seen.add(relative.as_posix())
             elif not stat.S_ISDIR(source_stat.st_mode):
-                entries.append(SnapshotEntry(relative.as_posix(), "special",
-                                             stat.S_IMODE(source_stat.st_mode)))
+                entries.append(
+                    SnapshotEntry(relative.as_posix(), "special", stat.S_IMODE(source_stat.st_mode))
+                )
                 seen.add(relative.as_posix())
             else:
                 kept.append(name)
@@ -96,8 +108,11 @@ def scan_tree(root: Path, destination: Path, *, previous: Path | None = None,
                 continue
             (destination / relative_dir).mkdir()
             os.chmod(destination / relative_dir, stat.S_IMODE(source_stat.st_mode))
-            entries.append(SnapshotEntry(relative_dir.as_posix(), "directory",
-                                         stat.S_IMODE(source_stat.st_mode)))
+            entries.append(
+                SnapshotEntry(
+                    relative_dir.as_posix(), "directory", stat.S_IMODE(source_stat.st_mode)
+                )
+            )
             seen.add(relative_dir.as_posix())
         for name in files:
             source = current_path / name
@@ -111,34 +126,72 @@ def scan_tree(root: Path, destination: Path, *, previous: Path | None = None,
                 continue
             decision = policy.decision(source)
             if decision.ignored:
-                entries.append(SnapshotEntry(relative_name, "ignored-policy",
-                                             stat.S_IMODE(source_stat.st_mode), source_stat.st_size,
-                                             decision.source))
+                entries.append(
+                    SnapshotEntry(
+                        relative_name,
+                        "ignored-policy",
+                        stat.S_IMODE(source_stat.st_mode),
+                        source_stat.st_size,
+                        decision.source,
+                    )
+                )
             elif not stat.S_ISREG(source_stat.st_mode):
-                entries.append(SnapshotEntry(relative_name, "special",
-                                             stat.S_IMODE(source_stat.st_mode), detail="non-regular"))
+                entries.append(
+                    SnapshotEntry(
+                        relative_name,
+                        "special",
+                        stat.S_IMODE(source_stat.st_mode),
+                        detail="non-regular",
+                    )
+                )
             else:
                 target = destination / relative
                 if source_stat.st_size > size_limit:
                     retained = _retain(previous, relative, target)
-                    entries.append(SnapshotEntry(relative_name, "oversized",
-                                                 stat.S_IMODE(source_stat.st_mode), source_stat.st_size,
-                                                 f"limit={size_limit}", retained))
+                    entries.append(
+                        SnapshotEntry(
+                            relative_name,
+                            "oversized",
+                            stat.S_IMODE(source_stat.st_mode),
+                            source_stat.st_size,
+                            f"limit={size_limit}",
+                            retained,
+                        )
+                    )
                 elif _stable_copy(source, target, source_stat):
-                    entries.append(SnapshotEntry(relative_name, "file",
-                                                 stat.S_IMODE(source_stat.st_mode), source_stat.st_size))
+                    entries.append(
+                        SnapshotEntry(
+                            relative_name,
+                            "file",
+                            stat.S_IMODE(source_stat.st_mode),
+                            source_stat.st_size,
+                        )
+                    )
                 else:
                     retained = _retain(previous, relative, target)
-                    entries.append(SnapshotEntry(relative_name, "unstable",
-                                                 stat.S_IMODE(source_stat.st_mode), source_stat.st_size,
-                                                 "changed-during-read", retained))
+                    entries.append(
+                        SnapshotEntry(
+                            relative_name,
+                            "unstable",
+                            stat.S_IMODE(source_stat.st_mode),
+                            source_stat.st_size,
+                            "changed-during-read",
+                            retained,
+                        )
+                    )
             seen.add(relative_name)
     if previous is not None:
         for old in sorted(previous.rglob("*")):
             relative = old.relative_to(previous)
             if old.is_file() and relative.as_posix() not in seen:
-                entries.append(SnapshotEntry(relative.as_posix(), "missing",
-                                             stat.S_IMODE(old.stat().st_mode), old.stat().st_size))
+                entries.append(
+                    SnapshotEntry(
+                        relative.as_posix(),
+                        "missing",
+                        stat.S_IMODE(old.stat().st_mode),
+                        old.stat().st_size,
+                    )
+                )
     return entries
 
 
@@ -148,23 +201,30 @@ class StepPublisher:
         self.seal_streams = seal_streams or (lambda _session: {})
 
     def publish(self, session: DirectorySession) -> StepManifest:
-        return self._publish_once(session)
-
-    def _publish_once(self, session: DirectorySession) -> StepManifest:
         high_water = self.seal_streams(session)
         previous_manifest = self.store.head(session.session_id)
-        previous = None if previous_manifest is None else (
-            self.store.session_path(session.session_id) / previous_manifest.snapshot
+        previous = (
+            None
+            if previous_manifest is None
+            else (self.store.session_path(session.session_id) / previous_manifest.snapshot)
         )
         step = self.store.next_step(session.session_id)
         session_path = self.store.session_path(session.session_id)
         agent_runs = sorted(path.stem for path in (session_path / "agents" / "runs").glob("*.json"))
-        temporary = Path(tempfile.mkdtemp(prefix=f".{step}.", dir=session_path / "snapshots"))
-        try:
-            entries = scan_tree(Path(session.root), temporary, previous=previous, paths=self.store.paths)
-            manifest = StepManifest(session.session_id, step, utcnow(), f"snapshots/{step}",
-                                    entries, high_water, agent_runs=agent_runs)
+        with tempfile.TemporaryDirectory(
+            prefix=f".{step}.", dir=session_path / "snapshots"
+        ) as temporary_name:
+            temporary = Path(temporary_name)
+            entries = scan_tree(
+                Path(session.root), temporary, previous=previous, paths=self.store.paths
+            )
+            manifest = StepManifest(
+                session.session_id,
+                step,
+                utcnow(),
+                f"snapshots/{step}",
+                entries,
+                high_water,
+                agent_runs=agent_runs,
+            )
             return self.store.publish(session, manifest, temporary)
-        except BaseException:
-            shutil.rmtree(temporary, ignore_errors=True)
-            raise

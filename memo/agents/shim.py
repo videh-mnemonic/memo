@@ -11,18 +11,17 @@ import sys
 import uuid
 from pathlib import Path
 
-from ..recording.paths import StoragePaths
 from ..daemon.client import ensure_daemon
-from .harnesses import get_harness, registered_harnesses
 from ..daemon.protocol import request
-from ..recording.store import atomic_write
+from ..recording.filesystem import atomic_write
+from ..recording.paths import StoragePaths
 from ..recording.snapshots import utcnow
+from .harnesses import get_harness, registered_harnesses
 
 
 def ensure_shims(paths: StoragePaths | None = None) -> Path:
     paths = paths or StoragePaths.discover()
     paths.ensure_storage()
-    assert paths.runtime is not None
     directory = paths.runtime / "shims"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory.chmod(0o700)
@@ -34,7 +33,7 @@ def ensure_shims(paths: StoragePaths | None = None) -> Path:
         names.add(name)
         body = (
             "#!/bin/sh\n"
-            f"exec {shlex.quote(sys.executable)} -m memo.agents.shim {shlex.quote(harness.name)} \"$@\"\n"
+            f'exec {shlex.quote(sys.executable)} -m memo.agents.shim {shlex.quote(harness.name)} "$@"\n'
         ).encode()
         destination = directory / name
         atomic_write(destination, body)
@@ -70,16 +69,19 @@ def run(harness_name: str, args: list[str]) -> int:
     if session_id and terminal_id:
         try:
             ensure_daemon(paths)
-            assert paths.socket is not None
-            request(str(paths.socket), "agent_launch", {
-                "launch_id": launch_id,
-                "session_id": session_id,
-                "terminal_id": terminal_id,
-                "harness": harness.name,
-                "cwd": str(Path.cwd()),
-                "command": [harness.executable, *args],
-                "started_utc": utcnow(),
-            })
+            request(
+                str(paths.socket),
+                "agent_launch",
+                {
+                    "launch_id": launch_id,
+                    "session_id": session_id,
+                    "terminal_id": terminal_id,
+                    "harness": harness.name,
+                    "cwd": str(Path.cwd()),
+                    "command": [harness.executable, *args],
+                    "started_utc": utcnow(),
+                },
+            )
             notified = True
         except Exception as error:
             print(f"memo: agent capture unavailable: {error}", file=sys.stderr)
@@ -92,12 +94,16 @@ def run(harness_name: str, args: list[str]) -> int:
     finally:
         if notified:
             try:
-                assert paths.socket is not None
-                request(str(paths.socket), "agent_complete", {
-                    "launch_id": launch_id,
-                    "ended_utc": utcnow(),
-                    "exit_code": process.returncode,
-                }, timeout=60.0)
+                request(
+                    str(paths.socket),
+                    "agent_complete",
+                    {
+                        "launch_id": launch_id,
+                        "ended_utc": utcnow(),
+                        "exit_code": process.returncode,
+                    },
+                    timeout=60.0,
+                )
             except Exception as error:
                 print(f"memo: agent completion capture failed: {error}", file=sys.stderr)
     return 128 - exit_code if exit_code < 0 else exit_code

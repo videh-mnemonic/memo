@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+from .base import AgentHarness
 from .claude import ClaudeHarness
 from .codex import CodexHarness
-from .base import AgentHarness
-
 
 _HARNESSES: dict[str, AgentHarness] = {
     harness.name: harness for harness in (ClaudeHarness(), CodexHarness())

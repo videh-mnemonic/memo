@@ -9,18 +9,25 @@ import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .harnesses import registered_harnesses
-from .harnesses.base import AgentHarness, SourceRecord, model_context, source_records
-from .trace_files import files, snapshot_complete
-from ..recording.paths import StoragePaths
-from ..transport.config import S3Config
 from ..recording.metadata import DirectorySession, SessionOrigin, StepManifest
-from ..recording.store import SessionStore, atomic_write, validate_session_id
+from ..recording.paths import StoragePaths
 from ..recording.snapshots import utcnow
+from ..recording.store import SessionStore, validate_session_id
+from ..transport.config import S3Config
+from .harnesses import registered_harnesses
+from .harnesses.base import (
+    AgentHarness,
+    SourceRecord,
+    model_context,
+    record_containers,
+    source_records,
+)
+from .run_metadata import AgentRunMetadata
+from .trace_files import files, snapshot_complete
 
 
 @dataclass
@@ -52,52 +59,50 @@ class KnownRun:
 
 
 def _digest(path: Path, limit: int | None = None) -> str:
+    if limit is None:
+        with path.open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
     hashing = hashlib.sha256()
     remaining = limit
     with path.open("rb") as handle:
-        while remaining is None or remaining > 0:
-            size = 1024 * 1024 if remaining is None else min(1024 * 1024, remaining)
+        while remaining > 0:
+            size = min(1024 * 1024, remaining)
             chunk = handle.read(size)
             if not chunk:
                 break
             hashing.update(chunk)
-            if remaining is not None:
-                remaining -= len(chunk)
+            remaining -= len(chunk)
     return hashing.hexdigest()
 
 
 def _is_prefix(source: Path, size: int, digest: str | None) -> bool:
-    return size >= 0 and source.stat().st_size >= size and (
-        digest is None or _digest(source, size) == digest
+    return (
+        size >= 0
+        and source.stat().st_size >= size
+        and (digest is None or _digest(source, size) == digest)
     )
 
 
 def _timestamps(records: tuple[SourceRecord, ...], source: Path) -> tuple[str, str]:
     values: list[datetime] = []
-    for record in records:
-        if not isinstance(record.value, dict):
+    for value in record_containers(records):
+        raw = value.get("timestamp") or value.get("created_at")
+        if not isinstance(raw, str):
             continue
-        containers = [record.value]
-        containers.extend(
-            value for key in ("payload", "message", "meta", "session")
-            if isinstance((value := record.value.get(key)), dict)
-        )
-        for value in containers:
-            raw = value.get("timestamp") or value.get("created_at")
-            if not isinstance(raw, str):
-                continue
-            try:
-                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            values.append(parsed.astimezone(timezone.utc))
-            break
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        values.append(parsed.astimezone(UTC))
     if not values:
-        fallback = datetime.fromtimestamp(source.stat().st_mtime, timezone.utc)
+        fallback = datetime.fromtimestamp(source.stat().st_mtime, UTC)
         values = [fallback]
-    render = lambda value: value.isoformat().replace("+00:00", "Z")
+
+    def render(value: datetime) -> str:
+        return value.isoformat().replace("+00:00", "Z")
+
     return render(min(values)), render(max(values))
 
 
@@ -140,25 +145,26 @@ def _local_runs(store: SessionStore) -> tuple[list[KnownRun], set[str]]:
         session_ids.add(session.session_id)
         for metadata_path in (session_path / "agents" / "runs").glob("*.json"):
             try:
-                metadata = json.loads(metadata_path.read_text())
-                harness = str(metadata["harness"])
-                native_id = str(metadata["agent_session_id"])
-                trace_file = metadata.get("trace_file")
-                trace = session_path / "agents" / "traces" / str(trace_file)
-                complete_size = int(metadata.get("trace_complete_size", trace.stat().st_size))
-                digest = metadata.get("trace_digest")
-                if digest is None and trace.is_file():
-                    digest = _digest(trace, complete_size)
-                runs.append(KnownRun(
-                    session.session_id, session.capture_scope, harness, native_id,
-                    complete_size, str(digest) if digest else None, True,
-                ))
+                metadata = AgentRunMetadata.load(metadata_path)
+                runs.append(
+                    KnownRun(
+                        session.session_id,
+                        session.capture_scope,
+                        metadata.harness,
+                        metadata.agent_session_id,
+                        metadata.trace_complete_size,
+                        metadata.trace_digest,
+                        True,
+                    )
+                )
             except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
                 continue
     return runs, session_ids
 
 
-def _choose_candidate(candidates: list[Candidate], temporary: Path) -> tuple[Candidate, Path, int, str]:
+def _choose_candidate(
+    candidates: list[Candidate], temporary: Path
+) -> tuple[Candidate, Path, int, str]:
     snapshots: list[tuple[Candidate, Path, int, str]] = []
     for index, candidate in enumerate(candidates):
         target = temporary / f"candidate-{index}.jsonl"
@@ -182,106 +188,126 @@ def _choose_candidate(candidates: list[Candidate], temporary: Path) -> tuple[Can
     return chosen
 
 
-def _metadata(candidate: Candidate, run_id: str, trace_name: str,
-              boundary: int, digest: str) -> dict[str, Any]:
+def _metadata(
+    candidate: Candidate, run_id: str, trace_name: str, boundary: int, digest: str
+) -> AgentRunMetadata:
     started, ended = _timestamps(candidate.records, candidate.source)
     model, reasoning = model_context(candidate.records)
-    return {
-        "run_id": run_id,
-        "harness": candidate.harness.name,
-        "model": model,
-        "reasoning": reasoning,
-        "command": None,
-        "cwd": str(candidate.cwd),
-        "started_utc": started,
-        "ended_utc": ended,
-        "exit_code": None,
-        "agent_session_id": candidate.native_id,
-        "trace_file": trace_name,
-        "trace_complete_size": boundary,
-        "trace_digest": digest,
-        "imported_agent_only": True,
-    }
+    return AgentRunMetadata(
+        run_id=run_id,
+        harness=candidate.harness.name,
+        model=model,
+        reasoning=reasoning,
+        command=None,
+        cwd=str(candidate.cwd),
+        started_utc=started,
+        ended_utc=ended,
+        exit_code=None,
+        agent_session_id=candidate.native_id,
+        trace_file=trace_name,
+        trace_complete_size=boundary,
+        trace_digest=digest,
+        imported_agent_only=True,
+    )
 
 
 def _publish_empty_step(store: SessionStore, session: DirectorySession) -> None:
     step = store.next_step(session.session_id)
     session_path = store.session_path(session.session_id)
     runs = sorted(path.stem for path in (session_path / "agents" / "runs").glob("*.json"))
-    prepared = Path(tempfile.mkdtemp(prefix=f".{step}.", dir=session_path / "snapshots"))
-    manifest = StepManifest(
-        session.session_id, step, utcnow(), f"snapshots/{step}", agent_runs=runs,
-    )
-    store.publish(session, manifest, prepared)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{step}.", dir=session_path / "snapshots"
+    ) as temporary:
+        manifest = StepManifest(
+            session.session_id,
+            step,
+            utcnow(),
+            f"snapshots/{step}",
+            agent_runs=runs,
+        )
+        store.publish(session, manifest, Path(temporary))
 
 
-def _create(store: SessionStore, candidate: Candidate, snapshot: Path,
-            boundary: int, digest: str) -> str:
+def _create(
+    store: SessionStore, candidate: Candidate, snapshot: Path, boundary: int, digest: str
+) -> str:
     destination = store.session_path(candidate.native_id)
     if destination.exists():
         raise ValueError("native session ID collides with an existing Memo session")
     started, ended = _timestamps(candidate.records, candidate.source)
     session = DirectorySession(
-        candidate.native_id, str(candidate.cwd), started, ended, SessionOrigin.current(),
-        state="active", capture_scope="agent-only",
+        candidate.native_id,
+        str(candidate.cwd),
+        started,
+        ended,
+        SessionOrigin.current(),
+        state="active",
+        capture_scope="agent-only",
     )
-    assert store.paths.archive is not None
-    staging_archive = Path(tempfile.mkdtemp(prefix=".import-", dir=store.paths.archive))
-    staging_paths = StoragePaths(
-        store.paths.home, archive=staging_archive, runtime=store.paths.runtime,
-        socket=store.paths.socket, registry=store.paths.registry, spool=store.paths.spool,
-    )
-    staging_store = SessionStore(staging_paths)
-    session_path = staging_store.create(session)
-    try:
+    with tempfile.TemporaryDirectory(prefix=".import-", dir=store.paths.archive) as staging_name:
+        staging_archive = Path(staging_name)
+        staging_paths = StoragePaths(
+            store.paths.home,
+            archive=staging_archive,
+            runtime=store.paths.runtime,
+            socket=store.paths.socket,
+            registry=store.paths.registry,
+            spool=store.paths.spool,
+        )
+        staging_store = SessionStore(staging_paths)
+        session_path = staging_store.create(session)
         run_id = uuid.uuid4().hex
         trace_name = f"{run_id}.jsonl"
         shutil.copyfile(snapshot, session_path / "agents" / "traces" / trace_name)
         metadata = _metadata(candidate, run_id, trace_name, boundary, digest)
-        atomic_write(
-            session_path / "agents" / "runs" / f"{run_id}.json",
-            (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode(),
-        )
+        metadata.write(session_path / "agents" / "runs" / f"{run_id}.json")
         _publish_empty_step(staging_store, session)
         os.replace(session_path, destination)
         return session.session_id
-    except BaseException:
-        raise
-    finally:
-        shutil.rmtree(staging_archive, ignore_errors=True)
 
 
-def _refresh(store: SessionStore, session_id: str, candidate: Candidate,
-             snapshot: Path, boundary: int, digest: str) -> str:
+def _refresh(
+    store: SessionStore,
+    session_id: str,
+    candidate: Candidate,
+    snapshot: Path,
+    boundary: int,
+    digest: str,
+) -> str:
     session_path, session = store.find(session_id)
     if session.capture_scope != "agent-only":
         raise ValueError("only agent-only sessions can be refreshed")
     metadata_path = next(
-        path for path in (session_path / "agents" / "runs").glob("*.json")
-        if (value := json.loads(path.read_text())).get("harness") == candidate.harness.name
-        and value.get("agent_session_id") == candidate.native_id
+        path
+        for path in (session_path / "agents" / "runs").glob("*.json")
+        if (value := AgentRunMetadata.load(path)).harness == candidate.harness.name
+        and value.agent_session_id == candidate.native_id
     )
-    metadata = json.loads(metadata_path.read_text())
-    trace = session_path / "agents" / "traces" / metadata["trace_file"]
+    metadata = AgentRunMetadata.load(metadata_path)
+    trace = session_path / "agents" / "traces" / metadata.trace_file
     temporary = trace.with_name(f".{trace.name}.{uuid.uuid4().hex}")
     try:
         shutil.copyfile(snapshot, temporary)
         os.replace(temporary, trace)
     finally:
         temporary.unlink(missing_ok=True)
-    metadata.update(_metadata(
-        candidate, str(metadata["run_id"]), str(metadata["trace_file"]), boundary, digest,
-    ))
-    atomic_write(metadata_path, (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode())
+    metadata = _metadata(
+        candidate,
+        metadata.run_id,
+        metadata.trace_file,
+        boundary,
+        digest,
+    )
+    metadata.write(metadata_path)
     session.updated_utc = _timestamps(candidate.records, candidate.source)[1]
     store.update_session(session)
     _publish_empty_step(store, session)
     return session_id
 
 
-def import_native_sessions(paths: StoragePaths | None = None, *,
-                           config: S3Config | None = None,
-                           client: Any | None = None) -> ImportSummary:
+def import_native_sessions(
+    paths: StoragePaths | None = None, *, config: S3Config | None = None, client: Any | None = None
+) -> ImportSummary:
     paths = paths or StoragePaths.discover()
     store = SessionStore(paths)
     summary = ImportSummary()
@@ -292,27 +318,32 @@ def import_native_sessions(paths: StoragePaths | None = None, *,
         from ..transport import inspect_archived_agent_runs
 
         remote_runs, remote_ids = inspect_archived_agent_runs(
-            SessionOrigin.current(), config, client=client,
+            SessionOrigin.current(),
+            config,
+            client=client,
         )
         known.extend(KnownRun(**value, local=False) for value in remote_runs)
         session_ids.update(remote_ids)
 
-    assert paths.runtime is not None
-    work = Path(tempfile.mkdtemp(prefix="memo-import-", dir=paths.runtime))
-    try:
+    with tempfile.TemporaryDirectory(prefix="memo-import-", dir=paths.runtime) as work_name:
+        work = Path(work_name)
         for key, candidates in sorted(discovered.items()):
             label = f"{key[0]}:{key[1]}"
             try:
                 candidate, snapshot, boundary, digest = _choose_candidate(candidates, work)
                 matches = [run for run in known if (run.harness, run.native_id) == key]
-                covering = [run for run in matches
-                            if run.complete_size == boundary and run.digest == digest]
+                covering = [
+                    run for run in matches if run.complete_size == boundary and run.digest == digest
+                ]
                 if covering:
                     summary.skipped.append(label)
                     continue
-                prefixes = [run for run in matches
-                            if run.complete_size < boundary
-                            and _is_prefix(snapshot, run.complete_size, run.digest)]
+                prefixes = [
+                    run
+                    for run in matches
+                    if run.complete_size < boundary
+                    and _is_prefix(snapshot, run.complete_size, run.digest)
+                ]
                 divergent = [run for run in matches if run not in prefixes]
                 if divergent:
                     raise ValueError("native log diverges from an archived trace")
@@ -333,6 +364,4 @@ def import_native_sessions(paths: StoragePaths | None = None, *,
                     session_ids.add(candidate.native_id)
             except (OSError, ValueError, StopIteration, json.JSONDecodeError) as error:
                 summary.failed.append((label, str(error)))
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
     return summary

@@ -7,21 +7,19 @@ from pathlib import Path
 
 import pytest
 
-from memo.recording.paths import StoragePaths
 from memo.daemon.registry import Registry
+from memo.recording.paths import StoragePaths
 from memo.recording.streams import StreamStore, merged_timeline
 
 
 def _event(sequence: int, data: bytes = b"x") -> dict[str, object]:
-    return {"sequence": sequence, "direction": "output",
-            "data": base64.b64encode(data).decode()}
+    return {"sequence": sequence, "direction": "output", "data": base64.b64encode(data).decode()}
 
 
 def _store(tmp_path: Path) -> tuple[StreamStore, Registry, str]:
     home = tmp_path / "home"
     paths = StoragePaths(home)
     paths.ensure_storage()
-    assert paths.registry is not None
     registry = Registry(paths.registry)
     root = tmp_path / "root"
     root.mkdir()
@@ -75,9 +73,7 @@ def test_merged_timeline_has_stable_tie_breakers(tmp_path: Path) -> None:
         registry.close()
 
 
-def test_end_drain_waits_for_admitted_event_acknowledgement(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_end_drain_waits_for_admitted_event_acknowledgement(tmp_path: Path, monkeypatch) -> None:
     store, registry, terminal_id = _store(tmp_path)
     (tmp_path / "home/archive/session/streams/terminals").mkdir(parents=True)
     reached_ack = threading.Event()
