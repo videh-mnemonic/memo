@@ -77,7 +77,11 @@ class StreamStore:
             raise ValueError("event batch exceeds backpressure limit")
         with self._lock(terminal_id):
             attachment = self.registry.attachment(terminal_id)
-            assert attachment is not None
+            if attachment is None or attachment.session_id != session_id:
+                raise RuntimeError(f"recording ended: {session_id}")
+            active = self.registry.lookup_session(session_id)
+            if active is None or active.state != "active" or attachment.detached_utc is not None:
+                raise RuntimeError(f"recording ended: {session_id}")
             expected = attachment.accepted_sequence
             events = []
             for value in values:
@@ -104,6 +108,17 @@ class StreamStore:
                 os.fsync(handle.fileno())
             self.registry.accept_sequence(terminal_id, attachment.accepted_sequence, expected)
             return expected
+
+    def drain_and_detach(self, session_id: str, detached_utc: str) -> list[str]:
+        detached = []
+        for attachment in self.registry.attached(session_id):
+            self.detach(attachment.terminal_id, detached_utc)
+            detached.append(attachment.terminal_id)
+        return detached
+
+    def detach(self, terminal_id: str, detached_utc: str) -> None:
+        with self._lock(terminal_id):
+            self.registry.detach(terminal_id, detached_utc)
 
     def events(self, session_id: str, terminal_id: str) -> list[StreamEvent]:
         spool = self._spool(session_id, terminal_id)
@@ -168,9 +183,9 @@ class StreamStore:
                 )
         return recovered
 
-    def seal_session(self, namespace: str, session_id: str) -> dict[str, int]:
+    def seal_session(self, session_id: str) -> dict[str, int]:
         assert self.paths.archive is not None
-        session_path = self.paths.archive / namespace / session_id
+        session_path = self.paths.archive / session_id
         high_water: dict[str, int] = {}
         for attachment in self.registry.list_attachments(session_id):
             with self._lock(attachment.terminal_id):

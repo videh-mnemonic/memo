@@ -18,7 +18,7 @@ def inspect_session(session_id: str, paths: Paths | None = None) -> str:
     paths = paths or Paths.discover()
     store = SessionStore(paths)
     location, session = store.find(session_id)
-    head = store.step(session.archive_namespace, session_id, -1)
+    head = store.step(session_id, -1)
     streams = sorted(head.stream_high_water)
     lines = [
         f"Session: {session.session_id}",
@@ -26,7 +26,6 @@ def inspect_session(session_id: str, paths: Paths | None = None) -> str:
         f"State: {session.state}",
         f"Source: {location}",
         f"Root: {session.root}",
-        f"Namespace: {session.archive_namespace}",
         f"Created: {session.created_utc}",
         f"Updated: {session.updated_utc}",
         f"Step: {head.step}",
@@ -69,9 +68,9 @@ def trace_json(session_id: str, terminal_ids: list[str] | None = None,
                paths: Paths | None = None, raw: bool = False) -> str:
     store = SessionStore(paths or Paths.discover())
     session = _session(store, session_id)
-    manifest = store.step(session.archive_namespace, session_id, -1)
+    manifest = store.step(session_id, -1)
     if manifest.agent_runs and terminal_ids is None:
-        session_path = store.session_path(session.archive_namespace, session_id)
+        session_path = store.session_path(session_id)
         result = []
         for run_id in manifest.agent_runs:
             metadata = json.loads(
@@ -85,11 +84,9 @@ def trace_json(session_id: str, terminal_ids: list[str] | None = None,
                 result.extend(record.value for record in source_records(trace_path)
                               if record.error is None)
             else:
-                result.extend(trace_events(get_harness(metadata["provider"]), trace_path, run_id))
+                result.extend(trace_events(get_harness(metadata["harness"]), trace_path, run_id))
         return json.dumps(result, indent=2, sort_keys=True) + "\n"
-    events = store.stream_events_for_manifest(
-        session.archive_namespace, session_id, manifest, terminal_ids
-    )
+    events = store.stream_events_for_manifest(session_id, manifest, terminal_ids)
     return json.dumps([_decoded_event(event) for event in events], indent=2, sort_keys=True) + "\n"
 
 
@@ -145,11 +142,9 @@ def replay_session(session_id: str, at: str | int, destination: Path,
                    paths: Paths | None = None) -> Path:
     store = SessionStore(paths or Paths.discover())
     session = _session(store, session_id)
-    manifest = store.step(session.archive_namespace, session_id, parse_step(at))
-    store.restore_manifest(session.archive_namespace, session_id, manifest, destination, force)
+    manifest = store.step(session_id, parse_step(at))
+    store.restore_manifest(session_id, manifest, destination, force)
     if include_prompts:
-        events = store.stream_events_for_manifest(
-            session.archive_namespace, session_id, manifest
-        )
+        events = store.stream_events_for_manifest(session_id, manifest)
         (destination / ".prompts.md").write_text(render_prompts(events, manifest))
     return destination

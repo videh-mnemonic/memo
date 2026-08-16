@@ -12,12 +12,13 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable
+from urllib.parse import quote
 
 import zstandard
 
 from .config import Paths, TransportConfig
 from .models import DirectorySession, StepManifest
-from .session_store import SessionStore, atomic_write
+from .session_store import SessionStore, atomic_write, validate_session_id
 
 
 MULTIPART_PART_SIZE = 8 * 1024 * 1024
@@ -306,11 +307,11 @@ def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Pa
 
 
 def package_history(store: SessionStore, session: DirectorySession) -> tuple[bytes, str, StepManifest]:
-    manifests = store.steps(session.archive_namespace, session.session_id)
+    manifests = store.steps(session.session_id)
     if not manifests:
         raise ValueError(f"session has no published step: {session.session_id}")
     manifest = manifests[-1]
-    root = store.session_path(session.archive_namespace, session.session_id)
+    root = store.session_path(session.session_id)
     data = deterministic_archive(root, _history_paths(root, manifests))
     return data, digest_bytes(data), manifest
 
@@ -318,11 +319,11 @@ def package_history(store: SessionStore, session: DirectorySession) -> tuple[byt
 def _multipart_package_history(store: SessionStore, session: DirectorySession,
                                config: TransportConfig, client: Any,
                                temporary: str) -> tuple[str, StepManifest]:
-    manifests = store.steps(session.archive_namespace, session.session_id)
+    manifests = store.steps(session.session_id)
     if not manifests:
         raise ValueError(f"session has no published step: {session.session_id}")
     manifest = manifests[-1]
-    root = store.session_path(session.archive_namespace, session.session_id)
+    root = store.session_path(session.session_id)
     response = client.create_multipart_upload(Bucket=config.bucket, Key=temporary)
     upload_id = response["UploadId"]
     try:
@@ -359,16 +360,21 @@ def _key(config: TransportConfig, *parts: object) -> str:
     return f"{config.prefix}/{suffix}" if config.prefix else suffix
 
 
+def _component(value: str) -> str:
+    return quote(value, safe="")
+
+
 def push_session(store: SessionStore, session: DirectorySession, config: TransportConfig,
                  client: Any | None = None) -> dict[str, object]:
-    manifest = store.head(session.archive_namespace, session.session_id)
+    manifest = store.head(session.session_id)
     if manifest is None:
         raise ValueError(f"session has no published step: {session.session_id}")
     if session.last_pushed_step == manifest.step:
         return {"session_id": session.session_id, "step": manifest.step,
                 "digest": session.last_pushed_digest, "status": "skipped"}
     client = client or config.client()
-    base = _key(config, session.archive_namespace, session.session_id)
+    base = _key(config, _component(session.origin.username),
+                _component(session.origin.hostname), "sessions", session.session_id)
     temporary = f"{base}/tmp/{uuid.uuid4().hex}.tar.zst"
     digest, manifest = _multipart_package_history(store, session, config, client, temporary)
     version = f"{base}/steps/{manifest.step}-{digest}.tar.zst"
@@ -385,12 +391,22 @@ def push_session(store: SessionStore, session: DirectorySession, config: Transpo
             pass
         raise
     client.delete_object(Bucket=config.bucket, Key=temporary)
-    pointer = json.dumps({"schema_version": 2, "session_id": session.session_id,
-                          "namespace": session.archive_namespace,
+    pointer_value = {"schema_version": 3, "session_id": session.session_id,
+                          "origin": session.origin.to_dict(),
                           "step": manifest.step, "digest": digest,
-                          "object": version, "checksum": checksum},
-                         sort_keys=True).encode()
+                          "object": version, "checksum": checksum}
+    pointer = json.dumps(pointer_value, sort_keys=True).encode()
     final_key = f"{base}/latest.json"
+    index_key = _key(config, "index", "sessions", f"{session.session_id}.json")
+    index = json.dumps({
+        "schema_version": 1,
+        "session_id": session.session_id,
+        "memo_version_id": session.origin.memo_version_id,
+        "username": session.origin.username,
+        "hostname": session.origin.hostname,
+        "latest": final_key,
+    }, sort_keys=True).encode()
+    client.put_object(Bucket=config.bucket, Key=index_key, Body=index)
     client.put_object(Bucket=config.bucket, Key=final_key, Body=pointer)
     session.last_pushed_step = manifest.step
     session.last_pushed_digest = digest
@@ -398,27 +414,6 @@ def push_session(store: SessionStore, session: DirectorySession, config: Transpo
     store.update_session(session)
     return {"session_id": session.session_id, "step": manifest.step,
             "digest": digest, "object": final_key, "status": "pushed"}
-
-
-def push_sessions(paths: Paths | None = None, config: TransportConfig | None = None,
-                  session_id: str | None = None, client: Any | None = None) -> PushSummary:
-    paths = paths or Paths.discover()
-    config = config or TransportConfig.discover(required=True)
-    assert config is not None
-    store = SessionStore(paths)
-    summary = PushSummary()
-    sessions = [session for _, session in store.list_sessions()
-                if session_id is None or session.session_id == session_id]
-    if session_id and not sessions:
-        summary.failed.append((session_id, "directory session not found"))
-    for session in sessions:
-        try:
-            result = push_session(store, session, config, client)
-            target = summary.skipped if result["status"] == "skipped" else summary.pushed
-            target.append(session.session_id)
-        except Exception as error:
-            summary.failed.append((session.session_id, str(error)))
-    return summary
 
 
 def _bounded_body(response: dict[str, Any], limit: int = METADATA_SIZE_LIMIT) -> bytes:
@@ -447,17 +442,20 @@ def _bounded_body(response: dict[str, Any], limit: int = METADATA_SIZE_LIMIT) ->
 def _validate_pointer(pointer: object, session_id: str, pointer_key: str) -> dict[str, Any]:
     if not isinstance(pointer, dict):
         raise ValueError("remote pointer must be a JSON object")
-    if pointer.get("schema_version") != 2:
+    if pointer.get("schema_version") != 3:
         raise ValueError("unsupported remote pointer schema")
     if pointer.get("session_id") != session_id:
         raise ValueError("remote pointer session identity mismatch")
-    namespace = pointer.get("namespace")
+    origin = pointer.get("origin")
     step = pointer.get("step")
     digest = pointer.get("digest")
     object_key = pointer.get("object")
     checksum_key = pointer.get("checksum")
-    if not isinstance(namespace, str) or not namespace:
-        raise ValueError("remote pointer has invalid namespace")
+    if not isinstance(origin, dict) or any(
+        not isinstance(origin.get(key), str) or not origin.get(key)
+        for key in ("memo_version_id", "username", "hostname")
+    ):
+        raise ValueError("remote pointer has invalid origin")
     if not isinstance(step, int) or isinstance(step, bool) or step < 0:
         raise ValueError("remote pointer has invalid step")
     if (not isinstance(digest, str) or len(digest) != 64
@@ -468,7 +466,10 @@ def _validate_pointer(pointer: object, session_id: str, pointer_key: str) -> dic
     if not isinstance(checksum_key, str) or checksum_key != f"{object_key}.sha256":
         raise ValueError("remote pointer has invalid checksum object")
     base = pointer_key.removesuffix("/latest.json")
-    expected_suffix = f"{namespace}/{session_id}"
+    expected_suffix = "/".join((
+        _component(origin["username"]), _component(origin["hostname"]),
+        "sessions", session_id,
+    ))
     if (base.strip("/") != expected_suffix
             and not base.strip("/").endswith(f"/{expected_suffix}")):
         raise ValueError("remote pointer object identity mismatch")
@@ -480,21 +481,39 @@ def _validate_pointer(pointer: object, session_id: str, pointer_key: str) -> dic
 def pull_session(session_id: str, paths: Paths | None = None,
                  config: TransportConfig | None = None, force: bool = False,
                  client: Any | None = None) -> Path:
+    session_id = validate_session_id(session_id)
     paths = paths or Paths.discover()
     config = config or TransportConfig.discover(required=True)
     assert config is not None
     client = client or config.client()
-    prefix = _key(config, "")
-    listing = client.list_objects_v2(Bucket=config.bucket, Prefix=prefix)
-    keys = [item["Key"] for item in listing.get("Contents", [])
-            if item["Key"].endswith(f"/{session_id}/latest.json")]
-    if len(keys) != 1:
-        raise FileNotFoundError(f"remote session lookup returned {len(keys)} matches: {session_id}")
+    index_key = _key(config, "index", "sessions", f"{session_id}.json")
+    try:
+        index = json.loads(_bounded_body(
+            client.get_object(Bucket=config.bucket, Key=index_key)
+        ))
+    except Exception as error:
+        raise FileNotFoundError(f"remote session not found: {session_id}") from error
+    if (not isinstance(index, dict) or index.get("schema_version") != 1
+            or index.get("session_id") != session_id
+            or not isinstance(index.get("latest"), str)):
+        raise ValueError("remote session index is invalid")
+    latest_key = str(index["latest"])
     pointer = _validate_pointer(
-        json.loads(_bounded_body(client.get_object(Bucket=config.bucket, Key=keys[0]))),
+        json.loads(_bounded_body(client.get_object(Bucket=config.bucket, Key=latest_key))),
         session_id,
-        keys[0],
+        latest_key,
     )
+    origin = pointer["origin"]
+    expected_latest = _key(
+        config, _component(origin["username"]), _component(origin["hostname"]),
+        "sessions", session_id, "latest.json",
+    )
+    if latest_key != expected_latest:
+        raise ValueError("remote index points outside the session origin hierarchy")
+    if any(index.get(key) != origin.get(key) for key in (
+        "memo_version_id", "username", "hostname"
+    )):
+        raise ValueError("remote index and session pointer origin disagree")
     checksum = _bounded_body(
         client.get_object(Bucket=config.bucket, Key=pointer["checksum"])
     ).decode()
@@ -502,9 +521,9 @@ def pull_session(session_id: str, paths: Paths | None = None,
     if sidecar_digest != pointer["digest"]:
         raise ValueError("remote pointer and checksum disagree")
     store = SessionStore(paths)
-    destination = store.session_path(pointer["namespace"], session_id)
+    destination = store.session_path(session_id)
     if destination.exists() and not force:
-        local = store.head(pointer["namespace"], session_id)
+        local = store.head(session_id)
         if local and local.step >= int(pointer["step"]):
             raise FileExistsError(
                 f"local step {local.step} is not older than remote step {pointer['step']}"
@@ -533,20 +552,20 @@ def pull_session(session_id: str, paths: Paths | None = None,
                 f"checksum mismatch: expected {pointer['digest']}, got {actual_digest}"
             )
         pulled = DirectorySession.load(temporary / "session.json")
-        manifests = SessionStore._validate_history(
-            temporary, str(pointer["namespace"]), session_id
-        )
+        manifests = SessionStore._validate_history(temporary, session_id)
         if not manifests:
             raise ValueError("downloaded session has no published steps")
         manifest = manifests[-1]
         if (pulled.session_id != session_id
-                or pulled.archive_namespace != pointer["namespace"]
+                or pulled.origin.memo_version_id != origin["memo_version_id"]
+                or pulled.origin.username != origin["username"]
+                or pulled.origin.hostname != origin["hostname"]
                 or manifest.session_id != session_id
                 or manifest.step != int(pointer["step"])):
             raise ValueError("downloaded session does not match remote pointer")
         pulled.last_pushed_step = manifest.step
         pulled.last_pushed_digest = pointer["digest"]
-        pulled.remote_object = keys[0]
+        pulled.remote_object = latest_key
         atomic_write(temporary / "session.json",
                      (json.dumps(pulled.to_dict(), indent=2, sort_keys=True) + "\n").encode())
         atomic_install_directory(temporary, destination, force=force)

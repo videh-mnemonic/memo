@@ -4,7 +4,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-NAMESPACE_MAX_LENGTH = 120
 STEP_INTERVAL_SECONDS = 15.0
 MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
 WATCHER_DEBOUNCE_SECONDS = 0.25

@@ -1,102 +1,307 @@
-# memo
+# Memo
 
-`memo` continuously records a directory and its attached terminals. A per-user daemon publishes complete, immutable steps to a local archive so recorded work can be inspected, exported, replayed, and transported.
+Memo records work as it happens: changes to a project directory, input and output from attached terminal shells, and native Claude or Codex traces created from those shells. A recording can be inspected, replayed, exported, and moved through S3-compatible storage.
 
-Memo requires Python 3.11+ and Git. Install for development with `pip install -e .`, or as a user application with `pipx install .`.
+The most useful mental model is:
 
-## Record a directory
+> A Memo recording belongs to one directory, can have several recorded shells, and remains alive until you explicitly end it.
 
-Start or join the recording for the current directory and open your configured shell:
+Memo runs a per-user daemon in the background, but there is no separate background-recording mode. Running `memo` always opens a normal interactive shell connected to a recording.
+
+## Installation
+
+Memo requires Python 3.11 or newer and Git.
+
+For development:
+
+```console
+pip install -e .
+```
+
+For a user installation from this repository:
+
+```console
+pipx install .
+```
+
+## Start recording
+
+From the directory you want to record:
 
 ```console
 memo
 ```
 
-Pass a path to record another directory:
+Or name another directory:
 
 ```console
 memo /path/to/project
 ```
 
-Several terminals can join the same canonical directory. Each terminal has an independently ordered input/output stream. To record without opening a shell, use `background`:
+Memo creates a recording and opens your configured shell in that directory. Use the shell normally: run commands, edit files, start development servers, invoke Claude or Codex, and change directories as needed.
 
-```console
-memo background [PATH]
+The directory passed to `memo` is the recording's identity and filesystem root. Memo recursively snapshots that directory for the lifetime of the recording.
+
+Changing directory inside the shell does not stop terminal recording. All input and output in the Memo shell continues to be recorded. Filesystem snapshots, however, remain rooted at the original directory; files outside that tree are not added merely because the shell changed into another directory.
+
+## Recordings and shells are different things
+
+A recording is not the same as a shell process.
+
+- One recording represents the history of one canonical directory.
+- Each invocation of `memo` opens a new shell with its own terminal ID and ordered event stream.
+- Several Memo shells can be attached to the same recording at once.
+- Closing a shell detaches only that shell. It does not end the recording or affect other shells.
+- A detached terminal stream is permanent and cannot later receive more events.
+- Opening another shell always creates a new terminal stream, including when resuming an existing recording.
+
+If a recording already has attached shells, another `memo` invocation joins it automatically. Memo does not offer to replace a recording while other shells are attached.
+
+If the last shell has closed, the recording remains active. Running `memo` again presents:
+
+```text
+A Memo recording already exists for this directory.
+
+1. Resume existing recording
+2. Start a new recording
 ```
 
-The lifecycle commands default to the current directory when their path is omitted:
+Resume keeps the existing history and creates a new terminal stream. Start new completes the old recording first—including its final filesystem, terminal, and agent state—then creates a separate recording.
+
+Memo rejects simultaneously active recording roots that are the same directory or that contain one another. Sibling project directories can be recorded independently.
+
+## End a recording
+
+Recordings end explicitly:
+
+```console
+memo end
+```
+
+Inside a Memo shell, pathless `memo end` uses that shell's recording identity. It still targets the right recording if you have changed directories.
+
+Outside Memo, pathless `memo end` targets the current directory. You can always provide a directory explicitly:
+
+```console
+memo end /path/to/project
+```
+
+If no other shells are attached, Memo ends the recording immediately. If ending it would invalidate other attached shells, Memo asks first:
+
+```text
+This recording has 2 other attached terminals.
+End the recording for all terminals? [y/N]
+```
+
+Declining leaves the recording untouched. If attachment membership changes while the question is open, Memo reports the change and asks again rather than acting on a stale answer.
+
+When another terminal ends a recording, affected Memo shells terminate cleanly with a `memo: recording ended` message.
+
+A recording ends only through `memo end` or by choosing Start new when it has no attached terminals. Exiting every shell is not enough.
+
+## What a step means
+
+Memo periodically publishes numbered steps, beginning with step `0`. A step is a consistent, durable boundary containing:
+
+- A recursive snapshot of the recorded directory.
+- A high-water mark for every terminal stream.
+- References to safely installed agent runs and traces.
+
+`HEAD` identifies the latest completely published step. A failed or interrupted publication does not make a partial step visible.
+
+Terminal streams remain independently ordered. A step's high-water marks define exactly which events belong to that step, so replay and export do not accidentally include later terminal activity.
+
+Native agent runs are recording-level sidecars. When the same native Claude or Codex session is resumed, Memo updates the existing archived run and trace. Consequently, an older step that references that run can expose the run's later trace content; agent traces are not byte-bounded independently for every historical step.
+
+## Filesystem capture policy
+
+Memo applies `.gitignore` rules within each Git repository. A nested repository, worktree, or submodule represented by its own `.git` file starts a new ignore scope instead of inheriting every rule from an outer repository.
+
+Memo's local archive and runtime directories are excluded if they happen to be inside the recorded tree.
+
+Files larger than the configured limit—100 MiB by default—are not copied into a new snapshot. When possible, Memo retains the previously captured version and marks the entry accordingly. Files that change while being copied are treated similarly rather than publishing an inconsistent copy.
+
+The default publication interval is 15 seconds, with filesystem activity able to request earlier publication after a short debounce. An active recording continues publishing filesystem steps even when it has no attached terminals.
+
+## Claude and Codex capture
+
+Run supported agents normally inside a Memo shell:
+
+```console
+claude
+codex
+codex resume <native-session-id>
+```
+
+There are no `memo claude` or `memo codex` commands.
+
+Memo prepends a private shim directory to the `PATH` of each Memo shell. The generated shim:
+
+1. Notifies Memo that a supported agent is starting.
+2. Runs the real executable with the original arguments and terminal behavior.
+3. Reports its completion and exit status.
+4. Lets Memo collect every matching native JSONL trace through a complete-record boundary.
+
+The shim is local to Memo shells and does not modify global shell configuration or `PATH`. Invoking an agent through an absolute executable path, or through an alias that bypasses `PATH`, bypasses automatic capture.
+
+Capture is scoped by provider and the directory in which the agent was launched. An agent started after `cd` still belongs to the original Memo recording, while its launch directory is used to match its native trace.
+
+Memo can capture several agents running concurrently, several distinct native sessions, and later resumes of the same native session. It identifies a run by provider plus the provider's native session ID.
+
+Memo does not continuously scan all Claude and Codex history. A capture window begins only when a supported shim runs. During that window, another process from the same provider and launch directory may be indistinguishable and may also be archived. Conversely, a direct executable invocation that bypasses the shim is not expected to be captured.
+
+Native trace files can still be growing when Memo publishes. Memo copies only through the last complete newline observed at a fixed byte boundary. An incomplete final JSON record remains pending for a later collection pass.
+
+## Inspect recordings
+
+List local recordings:
 
 ```console
 memo status
-memo end [PATH]
 ```
 
-Sessions live at `$MEMO_HOME/archive/<namespace>/<id>/`. Each recording begins at step `0`; later publications increment the step by one. Immutable step manifests and snapshots become visible through an atomically updated numeric `HEAD`.
-
-## Inspect, export, and replay
-
-Inspect the latest published state of a recording:
+Inspect the latest published state and discover its terminal IDs:
 
 ```console
-memo inspect <id>
+memo inspect <session-id>
 ```
 
-Export terminal events from the latest published step. Output goes to standard output unless `--path` names a file. Use `--terminals` with a comma-separated list to select terminal streams.
+Local recordings use the globally unique session ID as their archive key:
+
+```text
+$MEMO_HOME/archive/<session-id>/
+  session.json
+  HEAD
+  steps/
+  snapshots/
+  streams/
+  agents/
+    runs/
+    traces/
+```
+
+`MEMO_HOME` defaults to `~/memo`.
+
+Each `session.json` records the Memo version, username, and hostname from the computer that originally created the recording. That origin does not change when another computer pulls or re-uploads it.
+
+## Export traces
+
+Export traces from the latest published step to standard output:
 
 ```console
-memo traces <id>
-memo traces <id> --path <file.json>
-memo traces <id> --terminals <terminal-id>,<terminal-id>
+memo traces <session-id>
 ```
 
-Trace records are deterministic and bounded by the latest step's terminal high-water marks.
-
-Replay a recorded filesystem state into a directory:
+Write them to a file:
 
 ```console
-memo replay <id> 0 <dir>
-memo replay <id> -1 <dir>
-memo replay <id> 3 <dir>
+memo traces <session-id> --path traces.json
 ```
 
-Step `0` is the initial state, `-1` selects the latest published state, and any other nonnegative integer selects that step. Memo refuses to replace a non-empty destination unless `--force` is supplied.
-
-Add `--include-prompts` to write `<dir>/.prompts.md`. The document contains decoded terminal input events from the selected step boundary, grouped by terminal with timestamps and metadata. It records terminal input rather than inferred application-specific prompts.
+If the step contains captured agent runs, the default export is the normalized agent trace. Use `--raw` to export the provider-native agent records instead:
 
 ```console
-memo replay <id> -1 <dir> --include-prompts
+memo traces <session-id> --raw
 ```
 
-## Capture policy
+To export terminal events explicitly, select one or more terminal IDs shown by `memo inspect`:
 
-Memo applies `.gitignore` rules within each Git repository. Nested repositories, including worktrees and submodules represented by a `.git` file, begin a new ignore scope instead of inheriting rules from an outer repository. Memo's own archive and runtime directories are always excluded when they are inside a recorded tree.
+```console
+memo traces <session-id> --terminals <terminal-id>
+memo traces <session-id> --terminals <terminal-id>,<terminal-id>
+```
 
-Operational defaults such as the step interval, maximum file size, watcher debounce, and push interval are editable constants in `memo/config.py`.
+If a recording has no agent runs, the default trace export contains all terminal streams.
 
-## S3 transport
+## Replay filesystem state
 
-Set `MEMO_S3_BUCKET` to enable S3-compatible transport. Credentials come from the standard AWS SDK credential chain and are never written to session metadata.
+Restore a recorded filesystem step into a destination directory:
+
+```console
+memo replay <session-id> 0 <destination>
+memo replay <session-id> 3 <destination>
+memo replay <session-id> -1 <destination>
+```
+
+Step `0` selects the initial published state. A nonnegative integer selects that exact step, and `-1` selects the latest published step.
+
+Memo refuses to replace a non-empty destination unless explicitly requested:
+
+```console
+memo replay <session-id> -1 <destination> --force
+```
+
+To add a `.prompts.md` file containing terminal input events through the selected step boundary:
+
+```console
+memo replay <session-id> -1 <destination> --include-prompts
+```
+
+This file contains recorded terminal input, grouped by terminal with sequence and timing information. Memo does not infer which terminal input was an application-level prompt.
+
+## S3-compatible transport
+
+Set a bucket to enable manual and automatic transport:
+
+```console
+export MEMO_S3_BUCKET=my-memo-bucket
+```
+
+Push all local recordings or one recording:
 
 ```console
 memo push
-memo push <id>
-memo pull <id>
-memo pull <id> --force
+memo push <session-id>
 ```
 
-Push packages the complete published history: all step manifests, snapshots, and bounded terminal stream data needed for historical replay. Data and checksum objects publish before `latest.json`. Pull verifies package integrity, rejects unsafe archive entries, and installs atomically. Existing local state is not replaced without `--force`.
+Pull a recording by its globally unique ID:
 
-Automatic push runs whenever S3 transport is configured.
+```console
+memo pull <session-id>
+memo pull <session-id> --force
+```
+
+Memo uses the standard AWS SDK credential chain and does not write credentials into recordings. Packages are deterministic, checksummed, validated before installation, and installed atomically. Pull rejects unsafe archive paths and does not replace existing local data without `--force`.
+
+Remote objects are organized by the recording's original identity:
+
+```text
+s3://<bucket>/<prefix>/<username>/<hostname>/sessions/<session-id>/
+  latest.json
+  steps/
+
+s3://<bucket>/<prefix>/index/sessions/<session-id>.json
+```
+
+The direct index lets `memo pull <session-id>` locate a recording without listing the bucket. Username and hostname are encoded safely for object keys, but remain intentionally visible to anyone who can inspect the bucket.
+
+When S3 is configured, the daemon also attempts an automatic push every 15 minutes.
 
 ## Configuration
 
-Memo reads only location and deployment settings from the environment:
+Memo reads these location and deployment settings from the environment:
 
 - `MEMO_HOME`: local storage root; defaults to `~/memo`.
-- `MEMO_S3_BUCKET`: bucket name; setting it enables transport and automatic push.
+- `MEMO_S3_BUCKET`: S3 bucket; setting it enables transport and automatic push.
 - `MEMO_S3_PREFIX`: object-key prefix; defaults to `memo`.
 - `MEMO_S3_ENDPOINT`: optional endpoint for an S3-compatible service.
 - `MEMO_S3_REGION`: optional AWS region.
 - `MEMO_S3_PROFILE`: optional AWS SDK profile.
 
-Run `memo --help` or `memo <command> --help` for the complete command-specific argument list.
+Memo sets `MEMO_SESSION_ID` and `MEMO_TERMINAL_ID` inside recorded shells. They identify the recording and attached terminal and are used internally by commands such as pathless `memo end`.
+
+Run `memo --help` or `memo <command> --help` for command-specific syntax.
+
+## Privacy and operational expectations
+
+Memo is designed to preserve detailed working context. That means a recording may contain:
+
+- Source files and other non-ignored files under the recorded root.
+- Terminal input, including commands and pasted text.
+- Terminal output, including logs and command results.
+- Native Claude and Codex traces, including prompts, responses, tool calls, and tool results.
+- The originating username and hostname.
+
+Treat Memo archives and S3 buckets as sensitive data. Review ignore rules and storage permissions, avoid recording secrets when possible, and restrict access to remote objects appropriately.
+
+Memo records observed state; it is not a transactional backup system for external services, databases, processes, or files outside the recorded root. Replay restores captured filesystem content and optionally renders terminal inputs. It does not recreate running processes or undo actions performed against external systems.

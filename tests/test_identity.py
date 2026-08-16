@@ -1,13 +1,10 @@
-from pathlib import Path
+from memo import __version__
+from memo.models import SessionOrigin
 
-from memo.identity import local_namespace
 
+def test_version_and_live_origin(monkeypatch) -> None:
+    monkeypatch.setattr("memo.models.getpass.getuser", lambda: "alice")
+    monkeypatch.setattr("memo.models.socket.gethostname", lambda: "laptop")
 
-def test_local_namespaces_use_full_path(tmp_path: Path) -> None:
-    one = tmp_path / "one" / "same"
-    two = tmp_path / "two" / "same"
-    one.mkdir(parents=True)
-    two.mkdir(parents=True)
-    assert local_namespace(one) != local_namespace(two)
-    assert local_namespace(one) == local_namespace(one)
-    assert len(local_namespace(one)) <= 120
+    assert __version__ == "1.0.0"
+    assert SessionOrigin.current() == SessionOrigin("1.0.0", "alice", "laptop")

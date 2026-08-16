@@ -61,6 +61,24 @@ class AgentHarness(ABC):
     def identify_session(self, records: Iterable[SourceRecord], path: Path) -> str:
         raise NotImplementedError
 
+    def identify_cwd(self, records: Iterable[SourceRecord], path: Path) -> Path | None:
+        keys = ("cwd", "project_path", "projectPath", "working_directory", "workspace")
+        containers = ("payload", "message", "meta", "session")
+        for source in records:
+            if not isinstance(source.value, dict):
+                continue
+            values = [source.value]
+            values.extend(
+                value for key in containers
+                if isinstance((value := source.value.get(key)), dict)
+            )
+            for value in values:
+                for key in keys:
+                    cwd = value.get(key)
+                    if isinstance(cwd, str) and cwd:
+                        return Path(cwd).expanduser().resolve(strict=False)
+        return None
+
     @abstractmethod
     def parse_record(self, record: SourceRecord, context: ParseContext) -> TraceEvent:
         raise NotImplementedError
@@ -144,28 +162,4 @@ def trace_events(harness: AgentHarness, path: Path, trace: str) -> list[dict[str
         context = ParseContext(trace=trace, seq=record.seq)
         event = harness.parse_error(record, context) if record.error else harness.parse_record(record, context)
         result.append(event.to_dict())
-    return result
-
-
-def all_traces(
-    harness: AgentHarness,
-    unpacked: Path,
-    raw: bool = False,
-    through_leg: int | None = None,
-    trace_files: Sequence[str] | None = None,
-) -> list[Any]:
-    result: list[Any] = []
-    paths = (
-        [unpacked / "traces" / name for name in trace_files]
-        if trace_files is not None
-        else sorted((unpacked / "traces").glob("leg-*.jsonl"))
-    )
-    for path in paths:
-        trace = path.stem.removeprefix("leg-")
-        if through_leg is not None and int(trace) > through_leg:
-            continue
-        if raw:
-            result.extend(record.value for record in source_records(path) if record.error is None)
-        else:
-            result.extend(trace_events(harness, path, trace))
     return result

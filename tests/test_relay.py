@@ -29,7 +29,7 @@ def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> No
     )
     try:
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and not list(home.glob("archive/*/*")):
+        while time.monotonic() < deadline and not list(home.glob("archive/*")):
             time.sleep(0.05)
         os.write(master, b"hello\n")
         output = bytearray()
@@ -41,9 +41,9 @@ def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> No
         assert b"reply:hello" in output
         assert process.wait(timeout=5) == 7
         assert termios.tcgetattr(slave) == original
-        session = next(home.glob("archive/*/*"))
+        session = next(path for path in home.glob("archive/*") if path.is_dir())
         socket_path = home / "runtime" / "memo.sock"
-        request(str(socket_path), "step", {"path": str(root)})
+        request(str(socket_path), "end", {"path": str(root)})
         assert list(session.glob("streams/terminals/*"))
     finally:
         if process.poll() is None:
