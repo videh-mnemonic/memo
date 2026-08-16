@@ -119,3 +119,66 @@ def test_session_id_is_the_flat_archive_key(tmp_path: Path) -> None:
     assert loaded == session
     with pytest.raises(SessionNotFoundError):
         store.find("missing")
+
+
+def test_remove_archived_requires_complete_fully_pushed_head(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(_paths(tmp_path / "home"))
+    session = _session(root)
+    directory = store.create(session)
+    head = _publish(store, session, 0)
+
+    with pytest.raises(ValueError, match="not complete"):
+        store.remove_archived("session")
+    assert directory.is_dir()
+
+    session.state = "complete"
+    store.update_session(session)
+    with pytest.raises(ValueError, match="not archived"):
+        store.remove_archived("session")
+    assert directory.is_dir()
+
+    session.last_pushed_step = head.step
+    session.last_pushed_digest = "invalid"
+    session.remote_object = "sessions/session/generations/00000000.tar.zst"
+    store.update_session(session)
+    with pytest.raises(ValueError, match="metadata is incomplete"):
+        store.remove_archived("session")
+    assert directory.is_dir()
+
+    session.last_pushed_digest = "0" * 64
+    store.update_session(session)
+    store.remove_archived("session")
+
+    assert not directory.exists()
+
+
+def test_remove_archived_renames_before_recursive_removal(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(_paths(tmp_path / "home"))
+    session = _session(root)
+    directory = store.create(session)
+    head = _publish(store, session, 0)
+    session.state = "complete"
+    session.last_pushed_step = head.step
+    session.last_pushed_digest = "0" * 64
+    session.remote_object = "remote"
+    store.update_session(session)
+    destinations: list[Path] = []
+
+    def fail_removal(path: Path) -> None:
+        destinations.append(path)
+        raise OSError("injected removal failure")
+
+    monkeypatch.setattr("memo.session_store.shutil.rmtree", fail_removal)
+    with pytest.raises(OSError, match="injected"):
+        store.remove_archived("session")
+
+    assert not directory.exists()
+    assert len(destinations) == 1
+    assert destinations[0].parent == store.paths.archive / ".removing"
+    assert destinations[0].is_dir()

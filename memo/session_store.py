@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
@@ -219,6 +220,33 @@ class SessionStore:
         path = self.session_path(session_id)
         manifests = self._validate_history(path, session_id)
         return manifests[-1] if manifests else None
+
+    def remove_archived(self, session_id: str) -> None:
+        """Remove a complete session whose latest local step is recorded as pushed."""
+        path = self.session_path(session_id)
+        session = self.load_session(session_id)
+        head = self.check_integrity(session_id)
+        if session.state != "complete":
+            raise ValueError("recording is not complete")
+        if head is None:
+            raise ValueError("recording has no published step")
+        if (not isinstance(session.last_pushed_step, int)
+                or isinstance(session.last_pushed_step, bool)
+                or session.last_pushed_step != head.step):
+            raise ValueError("latest local step is not archived")
+        digest = session.last_pushed_digest
+        remote_object = session.remote_object
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(value not in "0123456789abcdef" for value in digest.lower())
+                or not isinstance(remote_object, str) or not remote_object):
+            raise ValueError("remote archive metadata is incomplete")
+
+        assert self.paths.archive is not None
+        removing = self.paths.archive / ".removing"
+        removing.mkdir(mode=0o700, exist_ok=True)
+        destination = removing / f"{session_id}-{uuid.uuid4().hex}"
+        path.replace(destination)
+        shutil.rmtree(destination)
 
     @classmethod
     def _validate_history(cls, path: Path, session_id: str) -> list[StepManifest]:

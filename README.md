@@ -310,6 +310,17 @@ memo push
 memo push <session-id>
 ```
 
+To import native sessions, push all recordings, and then remove local recordings
+that are complete and fully archived:
+
+```console
+memo tidy
+```
+
+`memo tidy` retains active recordings, recordings whose latest step was not
+successfully pushed, and anything else whose remote recoverability is uncertain.
+Removed recordings remain available from the cloud with `memo pull`.
+
 Pull a recording by its globally unique ID:
 
 ```console

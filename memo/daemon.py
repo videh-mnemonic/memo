@@ -437,6 +437,29 @@ class MemoDaemon:
         return {"pushed": summary.pushed, "skipped": summary.skipped,
                 "failed": summary.failed}
 
+    def _remove_archived(self, payload: dict[str, Any]) -> dict[str, Any]:
+        excluded = payload.get("exclude", [])
+        if not isinstance(excluded, list) or not all(isinstance(value, str) for value in excluded):
+            raise ProtocolError("remove_archived exclude must be a list of session IDs")
+        excluded_ids = set(excluded)
+        removed: list[str] = []
+        retained: list[tuple[str, str]] = []
+        failed: list[tuple[str, str]] = []
+        for _, listed in self.store.list_sessions():
+            session_id = listed.session_id
+            if session_id in excluded_ids:
+                retained.append((session_id, "push failed"))
+                continue
+            with self._session_lock(session_id):
+                try:
+                    self.store.remove_archived(session_id)
+                    removed.append(session_id)
+                except ValueError as error:
+                    retained.append((session_id, str(error)))
+                except OSError as error:
+                    failed.append((session_id, str(error)))
+        return {"removed": removed, "retained": retained, "failed": failed}
+
     def _automatic_push_loop(self) -> None:
         interval = PUSH_INTERVAL_SECONDS
         while not self._stop.wait(interval):
@@ -482,6 +505,8 @@ class MemoDaemon:
             return self._end(message.payload)
         if message.operation == "push":
             return self._push(message.payload)
+        if message.operation == "remove_archived":
+            return self._remove_archived(message.payload)
         if message.operation == "agent_launch":
             return self._agent_launch(message.payload)
         if message.operation == "agent_complete":
@@ -620,6 +645,16 @@ def push(session_id: str | None = None, paths: Paths | None = None) -> dict[str,
     assert paths.socket is not None
     payload = {"session_id": session_id} if session_id else {}
     return request(str(paths.socket), "push", payload, timeout=300.0)
+
+
+def remove_archived(exclude: list[str] | None = None,
+                    paths: Paths | None = None) -> dict[str, Any]:
+    paths = paths or Paths.discover()
+    ensure_daemon(paths)
+    assert paths.socket is not None
+    return request(
+        str(paths.socket), "remove_archived", {"exclude": exclude or []}, timeout=60.0
+    )
 
 
 def main() -> int:

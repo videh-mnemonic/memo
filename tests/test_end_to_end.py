@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from memo.cli import main, parser
 from memo.config import Paths
@@ -68,6 +69,42 @@ def test_public_push_and_pull_subcommands_route_results(tmp_path: Path, monkeypa
     monkeypatch.setattr(transport, "pull_session", lambda session_id, force=False: destination)
     assert main(["pull", "session", "--force"]) == 0
     assert capsys.readouterr().out == f"pulled: session path={destination}\n"
+
+
+def test_tidy_imports_pushes_then_removes_archived(monkeypatch, capsys) -> None:
+    calls: list[object] = []
+
+    def fake_import():
+        calls.append("import")
+        return SimpleNamespace(imported=["native"], refreshed=[], skipped=[], failed=[])
+
+    def fake_push(session_id=None):
+        calls.append(("push", session_id))
+        return {
+            "pushed": ["complete"],
+            "skipped": ["active"],
+            "failed": [("failed", "offline")],
+        }
+
+    def fake_remove(exclude):
+        calls.append(("remove", exclude))
+        return {
+            "removed": ["complete"],
+            "retained": [("active", "recording is not complete"),
+                         ("failed", "push failed")],
+            "failed": [],
+        }
+
+    monkeypatch.setattr("memo.importer.import_native_sessions", fake_import)
+    monkeypatch.setattr("memo.cli.push", fake_push)
+    monkeypatch.setattr("memo.cli.remove_archived", fake_remove)
+
+    assert main(["tidy"]) == 1
+    assert calls == ["import", ("push", None), ("remove", ["failed"])]
+    captured = capsys.readouterr()
+    assert "removed: complete" in captured.out
+    assert "retained: active: recording is not complete" in captured.out
+    assert "failed: failed: offline" in captured.err
 
 
 def test_read_commands_ensure_session_is_local(monkeypatch, tmp_path: Path, capsys) -> None:

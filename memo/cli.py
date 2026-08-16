@@ -5,13 +5,13 @@ import os
 import sys
 from pathlib import Path
 
-from .daemon import end, push
+from .daemon import end, push, remove_archived
 from .load import replay_session, terminal_ids, trace_json, write_traces
 from .relay import run as run_relay
 from .status import render_status
 
 
-COMMANDS = {"end", "status", "traces", "replay", "push", "pull", "import"}
+COMMANDS = {"end", "status", "traces", "replay", "push", "pull", "import", "tidy"}
 
 
 def _positive_int(value: str) -> int:
@@ -34,6 +34,9 @@ def parser() -> argparse.ArgumentParser:
     finish.add_argument("path", nargs="?", type=Path)
     finish.add_argument("--scope", choices=("partial", "full"))
     subparsers.add_parser("import", help="recover native Claude and Codex sessions")
+    subparsers.add_parser(
+        "tidy", help="import, push, and remove safely archived recordings"
+    )
     status = subparsers.add_parser("status", help="list recordings")
     status.add_argument("session_id", nargs="?", help="show one recording")
     status.add_argument("--include-archive", action="store_true",
@@ -154,6 +157,33 @@ def main(argv: list[str] | None = None) -> int:
             for source, error in summary.failed:
                 print(f"unimportable: {source}: {error}", file=sys.stderr)
             return 1 if summary.failed else 0
+        elif args.command == "tidy":
+            from .importer import import_native_sessions
+
+            imported = import_native_sessions()
+            print(f"imported: {len(imported.imported)}")
+            print(f"refreshed: {len(imported.refreshed)}")
+            print(f"already captured: {len(imported.skipped)}")
+            print(f"unimportable: {len(imported.failed)}")
+            for source, error in imported.failed:
+                print(f"unimportable: {source}: {error}", file=sys.stderr)
+
+            pushed = push()
+            for session_id in pushed["pushed"]:
+                print(f"pushed: {session_id}")
+            for session_id in pushed["skipped"]:
+                print(f"skipped: unchanged: {session_id}")
+            for session_id, error in pushed["failed"]:
+                print(f"failed: {session_id}: {error}", file=sys.stderr)
+
+            removed = remove_archived([session_id for session_id, _ in pushed["failed"]])
+            for session_id in removed["removed"]:
+                print(f"removed: {session_id}")
+            for session_id, reason in removed["retained"]:
+                print(f"retained: {session_id}: {reason}")
+            for session_id, error in removed["failed"]:
+                print(f"failed to remove: {session_id}: {error}", file=sys.stderr)
+            return 1 if imported.failed or pushed["failed"] or removed["failed"] else 0
         elif args.command == "push":
             response = push(args.session_id)
             for session_id in response["pushed"]:
