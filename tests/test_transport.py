@@ -10,6 +10,7 @@ import tarfile
 import tempfile
 import tracemalloc
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import zstandard
@@ -20,11 +21,10 @@ from memo.export import replay_session
 from memo.recording.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.recording.store import SessionStore, atomic_write
 from memo.recording.streams import StreamEvent
-from memo.transport import (MULTIPART_PART_SIZE, MultipartUploadWriter,
-                            ensure_local_session, inspect_archived_agent_runs,
+from memo.transport import (ensure_local_session, inspect_archived_agent_runs,
                             list_archived_session_ids,
-                            package_history, pull_session, push_session,
-                            safe_extract_bytes)
+                            prepare_generation, pull_session, push_session)
+from memo.transport.s3 import MULTIPART_PART_SIZE
 
 
 class TrackingBody(io.BytesIO):
@@ -48,91 +48,60 @@ class TrackingBody(io.BytesIO):
         super().close()
 
 
-class FakeS3Error(Exception):
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.response = {"Error": {"Code": code}}
-
-
 class FakeS3:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.operations: list[tuple[str, str]] = []
         self.fail_key: str | None = None
         self.fail_operation: tuple[str, object] | None = None
-        self.uploads: dict[str, dict[str, object]] = {}
-        self.aborted: set[str] = set()
         self.response_bodies: list[tuple[str, TrackingBody]] = []
         self.part_sizes: list[int] = []
+        self.upload_options: dict[str, object] = {}
 
     @staticmethod
     def _bytes(value) -> bytes:
         return value.read() if hasattr(value, "read") else bytes(value)
 
-    def put_object(self, *, Bucket: str, Key: str, Body,
-                   IfNoneMatch: str | None = None) -> None:
-        self.operations.append(("put", Key))
-        if (Key == self.fail_key or self.fail_operation == ("put", Key)
-                or (self.fail_operation == ("put_checksum", None) and Key.endswith(".sha256"))):
+    def put_object(self, bucket: str, key: str, data, length: int,
+                   content_type: str | None = None) -> None:
+        self.operations.append(("put", key))
+        if key == self.fail_key or self.fail_operation == ("put", key):
             raise OSError("injected upload failure")
-        if IfNoneMatch == "*" and Key in self.objects:
-            raise FakeS3Error("PreconditionFailed")
-        self.objects[Key] = self._bytes(Body)
+        value = data.read(length + 1)
+        assert len(value) == length
+        self.objects[key] = value
 
-    def create_multipart_upload(self, *, Bucket: str, Key: str) -> dict[str, str]:
-        self.operations.append(("create_multipart", Key))
-        if self.fail_operation == ("create_multipart", None):
-            raise OSError("injected multipart initiation failure")
-        upload_id = f"upload-{len(self.uploads) + 1}"
-        self.uploads[upload_id] = {"key": Key, "parts": {}}
-        return {"UploadId": upload_id}
+    def fput_object(self, bucket: str, key: str, file_path: str, **kwargs) -> None:
+        self.operations.append(("upload", key))
+        self.upload_options = kwargs
+        if key == self.fail_key or self.fail_operation == ("upload", None):
+            raise OSError("injected upload failure")
+        chunks = []
+        with Path(file_path).open("rb") as handle:
+            while chunk := handle.read(MULTIPART_PART_SIZE):
+                self.part_sizes.append(len(chunk))
+                chunks.append(chunk)
+        self.objects[key] = b"".join(chunks)
 
-    def upload_part(self, *, Bucket: str, Key: str, UploadId: str,
-                    PartNumber: int, Body) -> dict[str, str]:
-        self.operations.append(("upload_part", f"{Key}:{PartNumber}"))
-        if self.fail_operation == ("upload_part", PartNumber):
-            raise OSError("injected part upload failure")
-        data = self._bytes(Body)
-        self.part_sizes.append(len(data))
-        parts = self.uploads[UploadId]["parts"]
-        assert isinstance(parts, dict)
-        parts[PartNumber] = data
-        return {"ETag": hashlib.md5(data).hexdigest()}
+    def stat_object(self, bucket: str, key: str) -> object:
+        self.operations.append(("stat", key))
+        if key not in self.objects:
+            raise KeyError(key)
+        return SimpleNamespace(size=len(self.objects[key]))
 
-    def complete_multipart_upload(self, *, Bucket: str, Key: str, UploadId: str,
-                                  MultipartUpload: dict[str, object],
-                                  IfNoneMatch: str | None = None) -> None:
-        self.operations.append(("complete_multipart", Key))
-        if self.fail_operation == ("complete_multipart", None):
-            raise OSError("injected multipart completion failure")
-        if IfNoneMatch == "*" and Key in self.objects:
-            raise FakeS3Error("PreconditionFailed")
-        requested = MultipartUpload["Parts"]
-        assert isinstance(requested, list)
-        numbers = [part["PartNumber"] for part in requested]
-        assert numbers == sorted(numbers)
-        parts = self.uploads[UploadId]["parts"]
-        assert isinstance(parts, dict)
-        self.objects[Key] = b"".join(parts[number] for number in numbers)
+    def get_object(self, bucket: str, key: str) -> TrackingBody:
+        self.operations.append(("get", key))
+        body = TrackingBody(self.objects[key])
+        self.response_bodies.append((key, body))
+        return body
 
-    def abort_multipart_upload(self, *, Bucket: str, Key: str, UploadId: str) -> None:
-        self.operations.append(("abort_multipart", Key))
-        if self.fail_operation == ("abort_multipart", None):
-            raise OSError("injected multipart abort failure")
-        self.aborted.add(UploadId)
-
-    def get_object(self, *, Bucket: str, Key: str) -> dict[str, TrackingBody]:
-        self.operations.append(("get", Key))
-        body = TrackingBody(self.objects[Key])
-        self.response_bodies.append((Key, body))
-        return {"Body": body}
-
-    def list_objects_v2(self, *, Bucket: str, Prefix: str,
-                        ContinuationToken: str | None = None) -> dict[str, object]:
-        self.operations.append(("list", Prefix))
-        return {"Contents": [
-            {"Key": key} for key in sorted(self.objects) if key.startswith(Prefix)
-        ]}
+    def list_objects(self, bucket: str, prefix: str,
+                     recursive: bool = True):
+        self.operations.append(("list", prefix))
+        return (
+            SimpleNamespace(object_name=key)
+            for key in sorted(self.objects) if key.startswith(prefix)
+        )
 
 
 def _paths(root: Path) -> StoragePaths:
@@ -141,9 +110,10 @@ def _paths(root: Path) -> StoragePaths:
 
 def test_list_archived_session_ids_uses_index_and_filters_invalid_keys() -> None:
     client = FakeS3()
+    digest = "a" * 64
     client.objects.update({
-        "prefix/index/sessions/b.json": b"{}",
-        "prefix/index/sessions/a.json": b"{}",
+        f"prefix/index/sessions/b/{digest}.json": b"{}",
+        f"prefix/index/sessions/a/{digest}.json": b"{}",
         "prefix/index/sessions/nested/session.json": b"{}",
         "prefix/index/sessions/readme.txt": b"",
         "prefix/unrelated.json": b"{}",
@@ -304,33 +274,46 @@ def _tar_zst(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
 
 
 def _replace_remote_package(client: FakeS3, package: bytes) -> dict[str, object]:
-    completion_key = "prefix/user/host/sessions/session/completion.json"
-    pointer = json.loads(client.objects[completion_key])
+    completion_key = next(key for key in client.objects if "/completions/" in key)
+    pointer = json.loads(client.objects.pop(completion_key))
+    old_generation = str(pointer["generation"])
+    client.objects.pop(old_generation)
     digest = hashlib.sha256(package).hexdigest()
     pointer["sha256"] = digest
-    client.objects[completion_key] = json.dumps(pointer).encode()
-    generation = str(pointer["generation"])
-    checksum = generation.removesuffix(".tar.zst") + ".sha256"
-    client.objects[checksum] = f"{digest}  {Path(generation).name}\n".encode()
+    generation = str(Path(old_generation).with_name(f"{pointer['final_step']:08d}-{digest}.tar.zst"))
+    pointer["generation"] = generation
+    completion_key = str(Path(completion_key).with_name(
+        f"{pointer['final_step']:08d}-{digest}.json"
+    ))
+    client.objects[completion_key] = json.dumps(
+        pointer, sort_keys=True, separators=(",", ":")
+    ).encode()
     client.objects[generation] = package
     return pointer
 
 
 def _archive_names(data: bytes) -> set[str]:
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-        return {member.name for member in archive.getmembers()}
+    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(data)) as reader:
+        with tarfile.open(fileobj=reader, mode="r|") as archive:
+            return {member.name for member in archive}
 
 
 def test_package_is_deterministic_and_contains_complete_history(tmp_path: Path) -> None:
     root = tmp_path / "work"
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
-    first, first_digest, manifest = package_history(store, session)
-    second, second_digest, _ = package_history(store, session)
-    assert first == second
-    assert first_digest == second_digest
-    assert manifest.step == 1
-    names = _archive_names(first)
+    first = prepare_generation(store, session)
+    second = prepare_generation(store, session)
+    try:
+        first_data = first.path.read_bytes()
+        second_data = second.path.read_bytes()
+    finally:
+        first.cleanup()
+        second.cleanup()
+    assert first_data == second_data
+    assert first.digest == second.digest
+    assert first.step == 1
+    names = _archive_names(first_data)
     assert {
         "steps/0.json", "steps/1.json", "snapshots/0/file.txt",
         "snapshots/1/file.txt", "streams/terminals/terminal/stream.json",
@@ -349,12 +332,13 @@ def test_push_publishes_immutable_generation_index_and_completion_and_skips_unch
     config = S3Config("bucket", "prefix")
     result = push_session(store, session, config, client)
     assert result["status"] == "pushed"
-    generation = "prefix/user/host/sessions/session/generations/00000001.tar.zst"
-    checksum = "prefix/user/host/sessions/session/generations/00000001.sha256"
-    completion_key = "prefix/user/host/sessions/session/completion.json"
-    assert client.operations[-2:] == [
-        ("put", "prefix/index/sessions/session.json"), ("put", completion_key)
-    ]
+    digest = str(result["digest"])
+    generation = f"prefix/user/host/sessions/session/generations/00000001-{digest}.tar.zst"
+    completion_key = f"prefix/user/host/sessions/session/completions/00000001-{digest}.json"
+    index_key = next(key for key in client.objects if key.startswith(
+        "prefix/index/sessions/session/"
+    ))
+    assert client.operations[-1] == ("put", completion_key)
     completion = json.loads(client.objects[completion_key])
     package = client.objects[generation]
     assert hashlib.sha256(package).hexdigest() == completion["sha256"]
@@ -362,11 +346,13 @@ def test_push_publishes_immutable_generation_index_and_completion_and_skips_unch
         "schema_version": 1, "session_id": "session", "final_step": 1,
         "generation": generation, "sha256": result["digest"],
     }
-    assert client.operations.index(("complete_multipart", generation)) < \
-        client.operations.index(("put", checksum)) < \
+    assert client.operations.index(("upload", generation)) < \
+        client.operations.index(("put", index_key)) < \
         client.operations.index(("put", completion_key))
     assert not any(operation in {"copy", "delete"} for operation, _ in client.operations)
-    index = json.loads(client.objects["prefix/index/sessions/session.json"])
+    index_data = client.objects[index_key]
+    assert Path(index_key).stem == hashlib.sha256(index_data).hexdigest()
+    index = json.loads(index_data)
     assert index == {
         "schema_version": 1, "session_id": "session", "memo_version_id": "1.0.0",
         "username": "user", "hostname": "host",
@@ -393,19 +379,7 @@ def test_push_publishes_immutable_generation_index_and_completion_and_skips_unch
     assert client.operations == before
 
 
-def test_multipart_writer_uploads_full_parts_and_short_final_part() -> None:
-    client = FakeS3()
-    upload_id = client.create_multipart_upload(Bucket="bucket", Key="key")["UploadId"]
-    writer = MultipartUploadWriter(client, "bucket", "key", upload_id, part_size=5)
-    writer.write(b"abcdefghijkl")
-    parts = writer.finish()
-    assert [part["PartNumber"] for part in parts] == [1, 2, 3]
-    uploaded = client.uploads[upload_id]["parts"]
-    assert isinstance(uploaded, dict)
-    assert [len(uploaded[number]) for number in sorted(uploaded)] == [5, 5, 2]
-
-
-def test_push_uses_multiple_fixed_size_multipart_parts(tmp_path: Path) -> None:
+def test_push_delegates_large_file_upload_to_client(tmp_path: Path) -> None:
     root = tmp_path / "work"
     root.mkdir()
     store, session = _published(
@@ -413,31 +387,23 @@ def test_push_uses_multiple_fixed_size_multipart_parts(tmp_path: Path) -> None:
     )
     client = FakeS3()
     push_session(store, session, S3Config("bucket", "prefix"), client)
-    upload = next(iter(client.uploads.values()))
-    parts = upload["parts"]
-    assert isinstance(parts, dict)
-    assert len(parts) >= 2
-    assert len(parts[1]) == MULTIPART_PART_SIZE
-    assert 0 < len(parts[max(parts)]) < MULTIPART_PART_SIZE
+    assert len(client.part_sizes) >= 2
+    assert client.part_sizes[0] == MULTIPART_PART_SIZE
+    assert 0 < client.part_sizes[-1] < MULTIPART_PART_SIZE
+    assert client.upload_options["part_size"] == MULTIPART_PART_SIZE
+    assert client.upload_options["num_parallel_uploads"] == 3
 
 
-@pytest.mark.parametrize(
-    ("failure", "message"),
-    [(('upload_part', 1), "part upload"), (('complete_multipart', None), "completion")],
-)
-def test_multipart_failure_aborts_without_publication(
-    tmp_path: Path, failure: tuple[str, object], message: str
-) -> None:
+def test_upload_failure_does_not_publish_or_advance_local_state(tmp_path: Path) -> None:
     root = tmp_path / "work"
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    client.fail_operation = failure
+    client.fail_operation = ("upload", None)
 
-    with pytest.raises(OSError, match=message):
+    with pytest.raises(OSError, match="injected"):
         push_session(store, session, S3Config("bucket", "prefix"), client)
 
-    assert client.aborted == {"upload-1"}
     assert not client.objects
     assert store.load_session("session").last_pushed_step is None
 
@@ -450,60 +416,23 @@ def test_failed_completion_marker_does_not_advance_local_state(
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
     config = S3Config("bucket", "prefix")
-    completion = "prefix/user/host/sessions/session/completion.json"
-    client.fail_key = completion
+    original_put = client.put_object
+
+    def fail_completion(bucket: str, key: str, data, length: int,
+                        content_type: str | None = None) -> None:
+        if "/completions/" in key:
+            raise OSError("injected completion failure")
+        original_put(bucket, key, data, length, content_type)
+
+    client.put_object = fail_completion  # type: ignore[method-assign]
 
     with pytest.raises(OSError, match="injected"):
         push_session(store, session, config, client)
-    assert completion not in client.objects
+    assert not any("/completions/" in key for key in client.objects)
     assert any(key.endswith(".tar.zst") for key in client.objects)
-    assert any(key.endswith(".sha256") for key in client.objects)
+    assert any("/index/sessions/session/" in key for key in client.objects)
     refreshed = store.load_session("session")
     assert refreshed.last_pushed_step is None
-
-
-@pytest.mark.parametrize(
-    ("failure", "abort_expected", "generation_expected"),
-    [
-        (("create_multipart", None), False, False),
-        (("upload_part", 1), True, False),
-        (("complete_multipart", None), True, False),
-        (("put_checksum", None), False, True),
-    ],
-)
-def test_push_failure_boundaries_preserve_local_state(
-    tmp_path: Path, failure: tuple[str, object], abort_expected: bool,
-    generation_expected: bool,
-) -> None:
-    root = tmp_path / "work"
-    root.mkdir()
-    store, session = _published(_paths(tmp_path / "home"), root)
-    client = FakeS3()
-    client.fail_operation = failure
-
-    with pytest.raises(OSError, match="injected"):
-        push_session(store, session, S3Config("bucket", "prefix"), client)
-
-    assert store.load_session("session").last_pushed_step is None
-    assert bool(client.aborted) is abort_expected
-    generation_keys = [key for key in client.objects if key.endswith(".tar.zst")]
-    assert bool(generation_keys) is generation_expected
-
-
-def test_abort_failure_preserves_part_upload_failure(tmp_path: Path) -> None:
-    root = tmp_path / "work"
-    root.mkdir()
-    store, session = _published(_paths(tmp_path / "home"), root)
-    client = FakeS3()
-    def fail_part_and_abort(**kwargs):
-        client.operations.append(("upload_part", f"{kwargs['Key']}:{kwargs['PartNumber']}"))
-        client.fail_operation = ("abort_multipart", None)
-        raise OSError("injected part upload failure")
-
-    client.upload_part = fail_part_and_abort  # type: ignore[method-assign]
-    with pytest.raises(OSError, match="part upload"):
-        push_session(store, session, S3Config("bucket", "prefix"), client)
-    assert any(operation == "abort_multipart" for operation, _ in client.operations)
 
 
 def test_index_failure_leaves_generation_but_not_local_state(tmp_path: Path) -> None:
@@ -511,15 +440,21 @@ def test_index_failure_leaves_generation_but_not_local_state(tmp_path: Path) -> 
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    index = "prefix/index/sessions/session.json"
-    client.fail_key = index
+    original_put = client.put_object
+
+    def fail_index(bucket: str, key: str, data, length: int,
+                   content_type: str | None = None) -> None:
+        if "/index/sessions/session/" in f"/{key}":
+            raise OSError("injected index failure")
+        original_put(bucket, key, data, length, content_type)
+
+    client.put_object = fail_index  # type: ignore[method-assign]
 
     with pytest.raises(OSError, match="injected"):
         push_session(store, session, S3Config("bucket", "prefix"), client)
 
     assert any(key.endswith(".tar.zst") for key in client.objects)
-    assert any(key.endswith(".sha256") for key in client.objects)
-    assert index not in client.objects
+    assert not any("/index/sessions/session/" in key for key in client.objects)
     assert store.load_session("session").last_pushed_step is None
 
 
@@ -529,86 +464,74 @@ def test_retry_verifies_existing_objects_and_finishes_publication(tmp_path: Path
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
     config = S3Config("bucket", "prefix")
-    completion = "prefix/user/host/sessions/session/completion.json"
-    client.fail_key = completion
+    original_put = client.put_object
+
+    def fail_completion(bucket: str, key: str, data, length: int,
+                        content_type: str | None = None) -> None:
+        if "/completions/" in key:
+            raise OSError("injected completion failure")
+        original_put(bucket, key, data, length, content_type)
+
+    client.put_object = fail_completion  # type: ignore[method-assign]
     with pytest.raises(OSError, match="injected"):
         push_session(store, session, config, client)
 
-    client.fail_key = None
+    client.put_object = original_put  # type: ignore[method-assign]
     result = push_session(store, store.load_session("session"), config, client)
 
     assert result["status"] == "pushed"
-    assert completion in client.objects
-    assert any(operation == "get" and key.endswith(".tar.zst")
+    assert any("/completions/" in key for key in client.objects)
+    assert any(operation == "stat" and key.endswith(".tar.zst")
                for operation, key in client.operations)
     assert store.load_session("session").last_pushed_step == 1
 
 
-def test_retry_recovers_generation_without_checksum(tmp_path: Path) -> None:
+def test_push_rejects_a_different_digest_for_the_same_step(tmp_path: Path) -> None:
     root = tmp_path / "work"
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    config = S3Config("bucket", "prefix")
-    client.fail_operation = ("put_checksum", None)
-    with pytest.raises(OSError, match="injected"):
-        push_session(store, session, config, client)
-    assert any(key.endswith(".tar.zst") for key in client.objects)
-    assert not any(key.endswith(".sha256") for key in client.objects)
+    conflicting = (
+        "prefix/user/host/sessions/session/generations/"
+        f"00000001-{'0' * 64}.tar.zst"
+    )
+    client.objects[conflicting] = b"other"
 
-    client.fail_operation = None
-    push_session(store, store.load_session("session"), config, client)
-
-    assert any(key.endswith(".sha256") for key in client.objects)
-    assert "prefix/user/host/sessions/session/completion.json" in client.objects
-
-
-def test_retry_rejects_existing_generation_with_different_content(tmp_path: Path) -> None:
-    root = tmp_path / "work"
-    root.mkdir()
-    store, session = _published(_paths(tmp_path / "home"), root)
-    client = FakeS3()
-    generation = "prefix/user/host/sessions/session/generations/00000001.tar.zst"
-    client.objects[generation] = b"poisoned"
-
-    with pytest.raises(ValueError, match="integrity conflict"):
+    with pytest.raises(ValueError, match="generation fork"):
         push_session(store, session, S3Config("bucket", "prefix"), client)
 
-    assert client.objects[generation] == b"poisoned"
     assert store.load_session("session").last_pushed_step is None
 
 
-def test_retry_rejects_conflicting_write_once_index(tmp_path: Path) -> None:
+def test_push_rejects_conflicting_content_addressed_index(tmp_path: Path) -> None:
     root = tmp_path / "work"
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    index = "prefix/index/sessions/session.json"
+    index = f"prefix/index/sessions/session/{'0' * 64}.json"
     client.objects[index] = b'{"session_id":"someone-else"}'
 
-    with pytest.raises(ValueError, match="integrity conflict"):
+    with pytest.raises(ValueError, match="index conflict"):
         push_session(store, session, S3Config("bucket", "prefix"), client)
 
     assert client.objects[index] == b'{"session_id":"someone-else"}'
 
 
-@pytest.mark.parametrize("conflict_key", [
-    "prefix/user/host/sessions/session/generations/00000001.sha256",
-    "prefix/user/host/sessions/session/completion.json",
-])
-def test_retry_rejects_conflicting_checksum_or_completion(
-    tmp_path: Path, conflict_key: str,
-) -> None:
+def test_push_rejects_conflicting_completion(tmp_path: Path) -> None:
     root = tmp_path / "work"
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
-    client.objects[conflict_key] = b"poisoned"
+    conflict_key = (
+        "prefix/user/host/sessions/session/completions/"
+        f"00000000-{'0' * 64}.json"
+    )
+    client.objects[conflict_key] = b"{}"
 
-    with pytest.raises(ValueError, match="integrity conflict"):
+    with pytest.raises(ValueError, match="conflicting completion"):
         push_session(store, session, S3Config("bucket", "prefix"), client)
 
-    assert client.objects[conflict_key] == b"poisoned"
+    assert client.objects[conflict_key] == b"{}"
     assert store.load_session("session").last_pushed_step is None
 
 
@@ -654,7 +577,7 @@ def test_active_session_pull_uses_highest_complete_generation(tmp_path: Path) ->
     config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
 
-    assert "prefix/user/host/sessions/session/completion.json" not in client.objects
+    assert not any("/completions/" in key for key in client.objects)
     pulled_path = pull_session(
         "session", _paths(tmp_path / "pulled-home"), config, client=client
     )
@@ -669,40 +592,15 @@ def test_completion_marker_pins_pull_to_final_generation(tmp_path: Path) -> None
     config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
     base = "prefix/user/host/sessions/session/generations/"
-    client.objects[f"{base}00000099.tar.zst"] = client.objects[f"{base}00000001.tar.zst"]
-    client.objects[f"{base}00000099.sha256"] = client.objects[f"{base}00000001.sha256"]
+    generation = next(key for key in client.objects if key.startswith(base))
+    digest = Path(generation).name.split("-", 1)[1].removesuffix(".tar.zst")
+    client.objects[f"{base}00000099-{digest}.tar.zst"] = client.objects[generation]
 
     pulled_path = pull_session(
         "session", _paths(tmp_path / "pulled-home"), config, client=client
     )
 
     assert SessionStore._validate_history(pulled_path, "session")[-1].step == 1
-
-
-def test_pull_paginates_generation_listing(tmp_path: Path) -> None:
-    source_root = tmp_path / "source"
-    source_root.mkdir()
-    store, session = _published(_paths(tmp_path / "source-home"), source_root)
-    session.state = "active"
-    store.update_session(session)
-    client = FakeS3()
-    config = S3Config("bucket", "prefix")
-    push_session(store, session, config, client)
-    original_list = client.list_objects_v2
-
-    def paginated_list(*, Bucket: str, Prefix: str,
-                       ContinuationToken: str | None = None) -> dict[str, object]:
-        all_items = original_list(Bucket=Bucket, Prefix=Prefix)["Contents"]
-        assert isinstance(all_items, list)
-        if ContinuationToken is None:
-            return {"Contents": all_items[:1], "IsTruncated": True,
-                    "NextContinuationToken": "next"}
-        assert ContinuationToken == "next"
-        return {"Contents": all_items[1:], "IsTruncated": False}
-
-    client.list_objects_v2 = paginated_list  # type: ignore[method-assign]
-    pulled = pull_session("session", _paths(tmp_path / "pulled-home"), config, client=client)
-    assert SessionStore._validate_history(pulled, "session")[-1].step == 1
 
 
 def test_pull_verifies_checksum_and_remote_history_before_install(tmp_path: Path) -> None:
@@ -712,10 +610,9 @@ def test_pull_verifies_checksum_and_remote_history_before_install(tmp_path: Path
     client = FakeS3()
     config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
-    completion_key = "prefix/user/host/sessions/session/completion.json"
+    completion_key = next(key for key in client.objects if "/completions/" in key)
     completion = json.loads(client.objects[completion_key])
     generation = completion["generation"]
-    checksum = generation.removesuffix(".tar.zst") + ".sha256"
 
     original = client.objects[generation]
     client.objects[generation] = original + b"corrupt"
@@ -734,13 +631,9 @@ def test_pull_verifies_checksum_and_remote_history_before_install(tmp_path: Path
                     if member.name == "steps/0.json":
                         continue
                     target.addfile(member, source.extractfile(member) if member.isfile() else None)
-    from memo.transport import digest_bytes
     broken = raw.getvalue()
-    digest = digest_bytes(broken)
-    client.objects[generation] = broken
-    client.objects[checksum] = f"{digest}  {Path(generation).name}\n".encode()
-    completion["sha256"] = digest
-    client.objects[completion_key] = json.dumps(completion).encode()
+    assert hashlib.sha256(broken).hexdigest()
+    _replace_remote_package(client, broken)
     incomplete_paths = _paths(tmp_path / "incomplete-home")
     with pytest.raises(ValueError, match="not contiguous"):
         pull_session("session", incomplete_paths, config, client=client)
@@ -759,7 +652,7 @@ def test_atomic_install_failure_restores_existing_session(tmp_path: Path, monkey
     destination.mkdir(parents=True)
     (destination / "local.txt").write_text("keep")
 
-    from memo.transport import s3
+    from memo.transport import archive
     original_replace = os.replace
     calls = 0
     def fail_install(source: Path, target: Path) -> None:
@@ -768,7 +661,7 @@ def test_atomic_install_failure_restores_existing_session(tmp_path: Path, monkey
         if calls == 3:
             raise OSError("injected install failure")
         original_replace(source, target)
-    monkeypatch.setattr(s3.os, "replace", fail_install)
+    monkeypatch.setattr(archive.os, "replace", fail_install)
     with pytest.raises(OSError, match="injected install failure"):
         pull_session("session", paths, config, force=True, client=client)
     assert (destination / "local.txt").read_text() == "keep"
@@ -784,41 +677,34 @@ def test_pull_streams_bounded_reads_and_closes_all_response_bodies(tmp_path: Pat
 
     pull_session("session", _paths(tmp_path / "clean-home"), config, client=client)
 
-    assert len(client.response_bodies) == 4
+    assert len(client.response_bodies) == 3
     assert all(body.was_closed for _, body in client.response_bodies)
     assert all(body.read_sizes and max(body.read_sizes) <= 64 * 1024
                for _, body in client.response_bodies)
-    completion_key = "prefix/user/host/sessions/session/completion.json"
+    index_key = next(key for key in client.objects if "/index/sessions/session/" in key)
+    completion_key = next(key for key in client.objects if "/completions/" in key)
     completion = json.loads(client.objects[completion_key])
     generation = completion["generation"]
-    checksum = generation.removesuffix(".tar.zst") + ".sha256"
     assert [key for operation, key in client.operations if operation == "get"] == [
-        "prefix/index/sessions/session.json", completion_key,
-        checksum, generation,
+        index_key, completion_key, generation,
     ]
 
 
-def test_pull_closes_metadata_body_when_sidecar_disagrees(tmp_path: Path) -> None:
+def test_pull_rejects_index_with_invalid_content_digest(tmp_path: Path) -> None:
     source_root = tmp_path / "source"
     source_root.mkdir()
     store, session = _published(_paths(tmp_path / "source-home"), source_root)
     client = FakeS3()
     config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
-    completion = json.loads(
-        client.objects["prefix/user/host/sessions/session/completion.json"]
-    )
-    generation = completion["generation"]
-    checksum = generation.removesuffix(".tar.zst") + ".sha256"
-    client.objects[checksum] = b"0" * 64 + b"  package.tar.zst\n"
+    index_key = next(key for key in client.objects if "/index/sessions/session/" in key)
+    client.objects[index_key] = b"{}"
 
-    with pytest.raises(ValueError, match="completion marker and checksum disagree"):
+    with pytest.raises(ValueError, match="index checksum"):
         pull_session("session", _paths(tmp_path / "clean-home"), config, client=client)
 
-    assert len(client.response_bodies) == 3
+    assert len(client.response_bodies) == 1
     assert all(body.was_closed for _, body in client.response_bodies)
-    assert not any(key == generation for operation, key in client.operations
-                   if operation == "get")
 
 
 @pytest.mark.parametrize(
@@ -838,10 +724,14 @@ def test_pull_rejects_invalid_index_before_package_request(
     client = FakeS3()
     config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
-    index_key = "prefix/index/sessions/session.json"
-    index = json.loads(client.objects[index_key])
+    index_key = next(key for key in client.objects if "/index/sessions/session/" in key)
+    index = json.loads(client.objects.pop(index_key))
     index[field] = value
-    client.objects[index_key] = json.dumps(index).encode()
+    index_data = json.dumps(index, sort_keys=True, separators=(",", ":")).encode()
+    index_key = str(Path(index_key).with_name(
+        f"{hashlib.sha256(index_data).hexdigest()}.json"
+    ))
+    client.objects[index_key] = index_data
 
     with pytest.raises(ValueError, match=message):
         pull_session("session", _paths(tmp_path / "clean-home"), config, client=client)
@@ -857,16 +747,8 @@ def test_pull_malformed_package_closes_body_and_removes_staging(tmp_path: Path) 
     client = FakeS3()
     config = S3Config("bucket", "prefix")
     push_session(store, session, config, client)
-    completion_key = "prefix/user/host/sessions/session/completion.json"
-    completion = json.loads(client.objects[completion_key])
-    generation = completion["generation"]
-    checksum = generation.removesuffix(".tar.zst") + ".sha256"
     malformed = b"not a zstandard stream"
-    digest = hashlib.sha256(malformed).hexdigest()
-    completion["sha256"] = digest
-    client.objects[completion_key] = json.dumps(completion).encode()
-    client.objects[checksum] = f"{digest}  {Path(generation).name}\n".encode()
-    client.objects[generation] = malformed
+    _replace_remote_package(client, malformed)
     destination_paths = _paths(tmp_path / "clean-home")
 
     with pytest.raises(zstandard.ZstdError):
@@ -958,16 +840,6 @@ def test_large_package_has_bounded_parts_reads_and_memory(tmp_path: Path) -> Non
     assert peak < 5 * MULTIPART_PART_SIZE
 
 
-def test_safe_extract_rejects_traversal(tmp_path: Path) -> None:
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w:gz") as archive:
-        info = tarfile.TarInfo("../escape")
-        info.size = 3
-        archive.addfile(info, io.BytesIO(b"bad"))
-    with pytest.raises(ValueError, match="unsafe archive path"):
-        safe_extract_bytes(raw.getvalue(), tmp_path / "target")
-
-
 def test_origin_values_are_encoded_and_preserved_across_pull_and_repush(tmp_path: Path) -> None:
     root = tmp_path / "source"
     root.mkdir()
@@ -981,8 +853,9 @@ def test_origin_values_are_encoded_and_preserved_across_pull_and_repush(tmp_path
     push_session(store, session, config, client)
 
     base = "prefix/user%2Fname/host%20name/sessions/session"
-    assert f"{base}/completion.json" in client.objects
-    index = json.loads(client.objects["prefix/index/sessions/session.json"])
+    assert any(key.startswith(f"{base}/completions/") for key in client.objects)
+    index_key = next(key for key in client.objects if "/index/sessions/session/" in key)
+    index = json.loads(client.objects[index_key])
     assert index["username"] == "user/name"
     assert index["hostname"] == "host name"
     pulled_paths = _paths(tmp_path / "pulled-home")
@@ -997,4 +870,4 @@ def test_origin_values_are_encoded_and_preserved_across_pull_and_repush(tmp_path
     pulled_store.update_session(pulled)
     second = FakeS3()
     push_session(pulled_store, pulled, config, second)
-    assert f"{base}/completion.json" in second.objects
+    assert any(key.startswith(f"{base}/completions/") for key in second.objects)

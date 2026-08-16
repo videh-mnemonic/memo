@@ -25,10 +25,23 @@ def test_transport_discovery_uses_retained_environment_surface(monkeypatch) -> N
     monkeypatch.setenv("MEMO_S3_ENDPOINT", "http://localhost:9000")
     monkeypatch.setenv("MEMO_S3_REGION", "region")
     monkeypatch.setenv("MEMO_S3_PROFILE", "profile")
+    monkeypatch.setenv("MEMO_S3_UPLOAD_CONCURRENCY", "7")
 
     assert S3Config.discover() == S3Config(
-        "bucket", "prefix", "http://localhost:9000", "region", "profile"
+        "bucket", "prefix", "http://localhost:9000", "region", "profile", 7
     )
+
+
+def test_transport_rejects_nonpositive_upload_concurrency(monkeypatch) -> None:
+    monkeypatch.setenv("MEMO_S3_BUCKET", "bucket")
+    monkeypatch.setenv("MEMO_S3_UPLOAD_CONCURRENCY", "0")
+
+    try:
+        S3Config.discover()
+    except ValueError as error:
+        assert "must be positive" in str(error)
+    else:
+        raise AssertionError("expected invalid upload concurrency to fail")
 
 
 def test_operational_defaults_are_fixed_code_values() -> None:

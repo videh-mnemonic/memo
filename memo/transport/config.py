@@ -15,6 +15,7 @@ class S3Config:
     endpoint_url: str | None = None
     region: str | None = None
     profile: str | None = None
+    upload_concurrency: int = 3
 
     @classmethod
     def discover(cls, required: bool = False) -> "S3Config | None":
@@ -23,10 +24,14 @@ class S3Config:
             if required:
                 raise ValueError("S3 transport requires MEMO_S3_BUCKET")
             return None
+        concurrency = int(os.environ.get("MEMO_S3_UPLOAD_CONCURRENCY", "3"))
+        if concurrency <= 0:
+            raise ValueError("MEMO_S3_UPLOAD_CONCURRENCY must be positive")
         return cls(
             bucket=bucket,
             prefix=os.environ.get("MEMO_S3_PREFIX", "memo").strip("/"),
             endpoint_url=os.environ.get("MEMO_S3_ENDPOINT") or None,
             region=os.environ.get("MEMO_S3_REGION") or None,
             profile=os.environ.get("MEMO_S3_PROFILE") or None,
+            upload_concurrency=concurrency,
         )

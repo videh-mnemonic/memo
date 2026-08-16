@@ -328,25 +328,25 @@ memo pull <session-id>
 memo pull <session-id> --force
 ```
 
-Memo uses the standard AWS SDK credential chain and does not write credentials into recordings. Packages are deterministic, checksummed, validated before installation, and installed atomically. Pull rejects unsafe archive paths and does not replace existing local data without `--force`.
+Memo uses the MinIO S3-compatible client with AWS environment, profile, and IAM credential providers, and does not write credentials into recordings. Packages are deterministic, checksummed, validated before installation, and installed atomically. Pull rejects unsafe archive paths and does not replace existing local data without `--force`.
 
 Remote objects are organized by the recording's original identity:
 
 ```text
 s3://<bucket>/<prefix>/<username>/<hostname>/sessions/<session-id>/
   generations/
-    00000042.tar.zst
-    00000042.sha256
-  completion.json
+    00000042-<archive-sha256>.tar.zst
+  completions/
+    00000042-<archive-sha256>.json
 
-s3://<bucket>/<prefix>/index/sessions/<session-id>.json
+s3://<bucket>/<prefix>/index/sessions/<session-id>/<index-sha256>.json
 ```
 
-The direct index lets `memo pull <session-id>` locate a recording without listing the whole bucket. Each generation is an immutable recovery checkpoint keyed by its local step. The fixed completion marker binds a completed recording to its final generation. Memo creates all final objects conditionally and verifies an existing object on retry; it never replaces or deletes a completed remote object.
+The direct index lets `memo pull <session-id>` locate a recording without listing the whole bucket. Generation and index keys contain their content digests, making repeated publication idempotent without conditional multipart operations. A completion record is published only after its generation exists. If concurrent writers publish different digests for the same step, or different index or completion records for one session, Memo reports the conflict instead of choosing one silently.
 
-Pull uses the generation named by `completion.json` for a completed recording. While a recording is still active, it lists that recording's `generations/` prefix and selects the highest complete package/checksum pair. Username and hostname are encoded safely for object keys, but remain intentionally visible to anyone who can inspect the bucket.
+Pull uses the sole completion record for a completed recording. While a recording is still active, it lists that recording's `generations/` prefix and selects the highest generation. The archive digest is verified while streaming the download. Username and hostname are encoded safely for object keys, but remain intentionally visible to anyone who can inspect the bucket.
 
-Memo's S3 credentials need `s3:GetObject`, prefix-limited `s3:ListBucket`, `s3:PutObject`, and optionally `s3:AbortMultipartUpload`. They do not need object deletion permissions. To enforce write-once storage rather than relying on client behavior alone, configure the bucket policy to require `If-None-Match: *` for completed object-creation operations while exempting the preliminary multipart operations.
+Memo's S3 credentials need `s3:GetObject`, prefix-limited `s3:ListBucket`, `s3:PutObject`, and `s3:AbortMultipartUpload` so failed multipart uploads can be cleaned up. They do not need object deletion permissions.
 
 When S3 is configured, the daemon attempts an automatic push every 15 minutes and an immediate final push after `memo end`. Local completion remains successful if S3 is unavailable; the completed recording remains eligible for a later automatic or manual retry.
 
@@ -359,7 +359,8 @@ Memo reads these location and deployment settings from the environment:
 - `MEMO_S3_PREFIX`: object-key prefix; defaults to `memo`.
 - `MEMO_S3_ENDPOINT`: optional endpoint for an S3-compatible service.
 - `MEMO_S3_REGION`: optional AWS region.
-- `MEMO_S3_PROFILE`: optional AWS SDK profile.
+- `MEMO_S3_PROFILE`: optional AWS credentials profile.
+- `MEMO_S3_UPLOAD_CONCURRENCY`: parallel multipart upload count; defaults to `3`.
 
 Memo sets `MEMO_SESSION_ID` and `MEMO_TERMINAL_ID` inside recorded shells. They identify the recording and attached terminal and are used internally by commands such as pathless `memo end`.
 
