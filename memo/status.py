@@ -7,7 +7,7 @@ from .session_store import SessionStore
 
 def render_status(paths: Paths | None = None) -> str:
     paths = paths or Paths.discover()
-    rows = [("STATE", "SESSION", "ROOT", "NAMESPACE", "STEP", "ATTACH", "UPDATED")]
+    rows = [("STATE", "SESSION", "ROOT", "STEP", "ATTACH", "UPDATED")]
     active = {}
     if paths.registry is not None and paths.registry.exists():
         with Registry(paths.registry) as registry:
@@ -19,9 +19,9 @@ def render_status(paths: Paths | None = None) -> str:
                 )
     store = SessionStore(paths)
     for _, session in store.list_sessions():
-        head = store.head(session.archive_namespace, session.session_id)
+        head = store.head(session.session_id)
         state, attachments = active.get(session.session_id, (session.state, 0))
-        rows.append((state, session.session_id, session.root, session.archive_namespace,
+        rows.append((state, session.session_id, session.root,
                      str(head.step) if head else "-", str(attachments),
                      head.created_utc if head else session.updated_utc))
     if len(rows) == 1:

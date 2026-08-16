@@ -13,8 +13,7 @@ from typing import IO, Any
 from .step import StepPublisher, utcnow
 from .config import (PUSH_INTERVAL_SECONDS, STEP_INTERVAL_SECONDS,
                      WATCHER_DEBOUNCE_SECONDS, Paths, TransportConfig)
-from .identity import local_namespace
-from .models import DirectorySession
+from .models import DirectorySession, SessionOrigin
 from .protocol import (
     DisconnectedError,
     ProtocolError,
@@ -24,8 +23,11 @@ from .protocol import (
     request,
     send_message,
 )
-from .registry import ActiveSession, Registry
+from .registry import ActiveSession, AgentLaunch, Registry
 from .session_store import SessionStore
+from .collector import TraceCollector
+from .harnesses import get_harness
+from .tracewatch import capture
 
 
 class DaemonAlreadyRunning(RuntimeError):
@@ -44,10 +46,9 @@ class MemoDaemon:
         self.streams = StreamStore(self.paths, self.registry)
         self.publisher = StepPublisher(
             self.store,
-            lambda session: self.streams.seal_session(
-                session.archive_namespace, session.session_id
-            ),
+            lambda session: self.streams.seal_session(session.session_id),
         )
+        self.collector = TraceCollector(self.store, self.registry)
         self.interval = STEP_INTERVAL_SECONDS if interval is None else interval
         self.socket_path = self.paths.socket
         self._stop = threading.Event()
@@ -56,6 +57,7 @@ class MemoDaemon:
         self._observers: dict[str, Any] = {}
         self._worker_lock = threading.Lock()
         self._session_locks: dict[str, threading.RLock] = {}
+        self._root_locks: dict[str, threading.RLock] = {}
         self._push_thread: threading.Thread | None = None
         self._server: socket.socket | None = None
         self._lock_handle: IO[str] | None = None
@@ -72,14 +74,20 @@ class MemoDaemon:
             raise DaemonAlreadyRunning("memo daemon is already running") from error
 
     def _session_model(self, active: ActiveSession) -> DirectorySession:
-        return self.store.load_session(active.archive_namespace, active.session_id)
+        return self.store.load_session(active.session_id)
 
     def _session_lock(self, session_id: str) -> threading.RLock:
         with self._worker_lock:
             return self._session_locks.setdefault(session_id, threading.RLock())
 
+    def _root_lock(self, root: Path) -> threading.RLock:
+        key = str(root.resolve())
+        with self._worker_lock:
+            return self._root_locks.setdefault(key, threading.RLock())
+
     def _publish(self, session: DirectorySession):
         with self._session_lock(session.session_id):
+            self.collector.collect(session.session_id)
             return self.publisher.publish(session)
 
     def _ensure_worker(self, active: ActiveSession) -> None:
@@ -132,107 +140,148 @@ class MemoDaemon:
                 print(f"memo daemon: step failed for {active.session_id}: {error}", file=sys.stderr)
             deadline = time.monotonic() + self.interval
 
-    def _start(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _create(self, root: Path) -> dict[str, Any]:
+        canonical = root.expanduser().resolve(strict=True)
+        created = utcnow()
+        active = self.registry.create(canonical, created)
+        session = DirectorySession(
+            session_id=active.session_id,
+            root=str(active.root),
+            created_utc=active.created_utc,
+            updated_utc=active.created_utc,
+            origin=SessionOrigin.current(),
+        )
+        try:
+            self.store.create(session)
+            manifest = self._publish(session)
+        except BaseException:
+            self.registry.remove(active.session_id)
+            raise
+        self._ensure_worker(active)
+        return {"session_id": active.session_id, "root": str(active.root), "step": manifest.step}
+
+    def _open(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             root = Path(payload["path"])
         except (KeyError, TypeError) as error:
-            raise ProtocolError("start requires a path") from error
+            raise ProtocolError("open requires a path") from error
         canonical = root.expanduser().resolve(strict=True)
-        namespace = local_namespace(canonical)
-        created = utcnow()
-        active, is_new = self.registry.start_or_join(canonical, namespace, created)
-        if is_new:
-            session = DirectorySession(
-                session_id=active.session_id,
-                root=str(active.root),
-                archive_namespace=active.archive_namespace,
-                created_utc=active.created_utc,
-                updated_utc=active.created_utc,
-            )
-            try:
-                self.store.create(session)
-                manifest = self._publish(session)
-            except BaseException:
-                self.registry.remove(active.session_id)
-                raise
-        else:
-            session = self._session_model(active)
-            manifest = self.store.head(active.archive_namespace, active.session_id)
-            if manifest is None:
-                manifest = self._publish(session)
-        self._ensure_worker(active)
-        return {
-            "session_id": active.session_id,
-            "root": str(active.root),
-            "archive_namespace": active.archive_namespace,
-            "joined": not is_new,
-            "step": manifest.step,
-        }
+        with self._root_lock(canonical):
+            active = self.registry.lookup(canonical)
+            if active is None:
+                created = self._create(canonical)
+                active = self.registry.lookup_session(str(created["session_id"]))
+                assert active is not None
+            else:
+                attached = self.registry.attached(active.session_id)
+                decision = payload.get("decision")
+                if not attached and decision is None:
+                    return {"decision_required": True, "session_id": active.session_id,
+                            "revision": active.revision, "root": str(active.root)}
+                expected = payload.get("expected_session_id")
+                revision = payload.get("expected_revision")
+                if decision is not None and (
+                    expected != active.session_id or revision != active.revision
+                ):
+                    return {"stale": True, "session_id": active.session_id,
+                            "revision": active.revision,
+                            "attachments": len(self.registry.attached(active.session_id))}
+                if decision == "replace":
+                    if attached:
+                        return {"stale": True, "session_id": active.session_id,
+                                "revision": active.revision, "attachments": len(attached)}
+                    self._finish(active)
+                    created = self._create(canonical)
+                    active = self.registry.lookup_session(str(created["session_id"]))
+                    assert active is not None
+                elif decision not in (None, "resume"):
+                    raise ProtocolError(f"invalid open decision: {decision}")
+            attachment = self.registry.allocate_attachment(active.session_id, utcnow())
+            manifest = self.store.head(active.session_id)
+            assert manifest is not None
+            self._ensure_worker(active)
+            return {"session_id": active.session_id, "root": str(active.root),
+                    "terminal_id": attachment.terminal_id,
+                    "accepted_sequence": attachment.accepted_sequence,
+                    "step": manifest.step}
 
-    def _lookup(self, payload: dict[str, Any]) -> dict[str, Any]:
-        active = self.registry.lookup(Path(payload["path"]))
-        if active is None:
-            return {"session": None}
-        head = self.store.head(active.archive_namespace, active.session_id)
-        return {
-            "session": {
-                "session_id": active.session_id,
-                "root": str(active.root),
-                "archive_namespace": active.archive_namespace,
-                "step": head.step if head else None,
-                "state": active.state,
-                "attachments": len([
-                    item for item in self.registry.list_attachments(active.session_id)
-                    if item.detached_utc is None
-                ]),
-            }
-        }
+    def _resolve_active(self, payload: dict[str, Any]) -> ActiveSession | None:
+        session_id = payload.get("session_id")
+        if session_id:
+            return self.registry.lookup_session(str(session_id))
+        path = payload.get("path")
+        if path is None:
+            raise ProtocolError("operation requires a session ID or path")
+        return self.registry.lookup(Path(path))
 
     def _end(self, payload: dict[str, Any]) -> dict[str, Any]:
-        try:
-            root = Path(payload["path"]).expanduser().resolve(strict=True)
-        except (KeyError, TypeError) as error:
-            raise ProtocolError("end requires a path") from error
-        active = self.registry.lookup(root)
+        active = self._resolve_active(payload)
         if active is None:
-            completed = [
-                session for _, session in self.store.list_sessions()
-                if Path(session.root) == root and session.state == "complete"
-            ]
-            if completed:
-                session = max(completed, key=lambda item: item.updated_utc)
-                manifest = self.store.head(session.archive_namespace, session.session_id)
-                return {
-                    "session_id": session.session_id,
-                    "state": "complete",
-                    "step": manifest.step if manifest else None,
-                    "already_complete": True,
-                }
+            session_id = payload.get("session_id")
+            if session_id:
+                try:
+                    session = self.store.load_session(str(session_id))
+                except (FileNotFoundError, ValueError):
+                    pass
+                else:
+                    if session.state == "complete":
+                        head = self.store.head(session.session_id)
+                        return {
+                            "session_id": session.session_id,
+                            "state": "complete",
+                            "step": None if head is None else head.step,
+                            "already_complete": True,
+                        }
             raise FileNotFoundError("no active recording for path")
+        with self._root_lock(active.root):
+            active = self.registry.lookup_session(active.session_id)
+            if active is None:
+                raise FileNotFoundError("recording already completed")
+            others = self.registry.attached(active.session_id)
+            caller = payload.get("terminal_id")
+            if caller and any(item.terminal_id == caller for item in others):
+                others = [item for item in others if item.terminal_id != caller]
+            expected = payload.get("expected_revision")
+            if expected is not None and int(expected) != active.revision:
+                return {"stale": True, "session_id": active.session_id,
+                        "revision": active.revision, "other_terminals": len(others)}
+            if others and (not payload.get("confirmed") or expected is None):
+                return {"confirmation_required": True, "session_id": active.session_id,
+                        "revision": active.revision, "other_terminals": len(others)}
+            return self._finish(active)
+
+    def _finish(self, active: ActiveSession) -> dict[str, Any]:
+        with self._session_lock(active.session_id):
+            return self._finish_locked(active)
+
+    def _finish_locked(self, active: ActiveSession) -> dict[str, Any]:
+        session = self._session_model(active)
+        if session.state == "complete":
+            if active.state == "ending":
+                self.registry.transition(active.session_id, "ending", "complete")
+            self.registry.remove(active.session_id)
+            self._cleanup_runtime(active.session_id)
+            head = self.store.head(active.session_id)
+            return {
+                "session_id": active.session_id,
+                "state": "complete",
+                "step": None if head is None else head.step,
+                "already_complete": True,
+            }
         if active.state == "active":
             active = self.registry.transition(active.session_id, "active", "ending")
-        session = self._session_model(active)
         if session.state != "ending":
             session.state = "ending"
             session.updated_utc = utcnow()
             self.store.update_session(session)
-        detached_at = utcnow()
-        for attachment in self.registry.list_attachments(active.session_id):
-            if attachment.detached_utc is None:
-                self.registry.detach(attachment.terminal_id, detached_at)
+        self.streams.drain_and_detach(active.session_id, utcnow())
         manifest = self._publish(session)
         session.state = "complete"
         session.updated_utc = manifest.created_utc
         self.store.update_session(session)
         self.registry.transition(active.session_id, "ending", "complete")
         self.registry.remove(active.session_id)
-        request_event = self._step_requests.get(active.session_id)
-        if request_event:
-            request_event.set()
-        observer = self._observers.pop(active.session_id, None)
-        if observer:
-            observer.stop()
-            observer.join(timeout=2)
+        self._cleanup_runtime(active.session_id)
         return {
             "session_id": active.session_id,
             "state": "complete",
@@ -240,23 +289,66 @@ class MemoDaemon:
             "already_complete": False,
         }
 
-    def _status(self) -> dict[str, Any]:
-        sessions = []
-        for active in self.registry.list_active():
-            head = self.store.head(active.archive_namespace, active.session_id)
-            sessions.append({
-                "session_id": active.session_id,
-                "root": str(active.root),
-                "archive_namespace": active.archive_namespace,
-                "state": active.state,
-                "step": head.step if head else None,
-                "latest_step_utc": head.created_utc if head else None,
-                "attachments": len([
-                    item for item in self.registry.list_attachments(active.session_id)
-                    if item.detached_utc is None
-                ]),
-            })
-        return {"sessions": sessions}
+    def _cleanup_runtime(self, session_id: str) -> None:
+        request_event = self._step_requests.get(session_id)
+        if request_event:
+            request_event.set()
+        observer = self._observers.pop(session_id, None)
+        if observer:
+            observer.stop()
+            observer.join(timeout=2)
+
+    def _agent_launch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            session_id = str(payload["session_id"])
+            terminal_id = str(payload["terminal_id"])
+            harness_name = str(payload["harness"])
+            launch_id = str(payload["launch_id"])
+            cwd = Path(payload["cwd"]).expanduser().resolve(strict=True)
+            command = payload["command"]
+            started_utc = str(payload["started_utc"])
+        except (KeyError, TypeError, OSError) as error:
+            raise ProtocolError("invalid agent launch") from error
+        if not cwd.is_dir() or not isinstance(command, list) or not all(
+            isinstance(value, str) for value in command
+        ):
+            raise ProtocolError("invalid agent launch")
+        harness = get_harness(harness_name)
+        active = self.registry.lookup_session(session_id)
+        attachment = self.registry.attachment(terminal_id)
+        if active is None or active.state != "active":
+            raise RuntimeError(f"recording is not active: {session_id}")
+        if (attachment is None or attachment.session_id != session_id
+                or attachment.detached_utc is not None):
+            raise RuntimeError(f"terminal is not attached to recording: {terminal_id}")
+        with self._session_lock(session_id):
+            existing = [window for window in self.registry.windows(session_id)
+                        if window.harness == harness_name and window.cwd == str(cwd)]
+            if not existing:
+                checkpoint = capture(harness.trace_roots()).to_json()
+                self.registry.create_window(session_id, harness_name, str(cwd), checkpoint)
+            self.registry.add_launch(AgentLaunch(
+                launch_id, session_id, terminal_id, harness_name, str(cwd),
+                list(command), started_utc,
+            ))
+        return {"launch_id": launch_id, "capture": "active"}
+
+    def _agent_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            launch_id = str(payload["launch_id"])
+            ended_utc = str(payload["ended_utc"])
+            exit_code = int(payload["exit_code"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ProtocolError("invalid agent completion") from error
+        launch = self.registry.launch(launch_id)
+        if launch is None:
+            raise KeyError(f"unknown agent launch: {launch_id}")
+        with self._session_lock(launch.session_id):
+            completed = self.registry.finish_launch(launch_id, ended_utc, exit_code)
+            active = self.registry.lookup_session(completed.session_id)
+            if active is not None:
+                self._publish(self._session_model(active))
+        return {"launch_id": launch_id, "capture": "complete"}
 
     def _push(self, payload: dict[str, Any]) -> dict[str, Any]:
         from .transport import PushSummary, push_session
@@ -290,43 +382,44 @@ class MemoDaemon:
     def dispatch(self, message: Request) -> dict[str, Any]:
         if message.operation == "health":
             return {"status": "ok"}
-        if message.operation == "start":
-            return self._start(message.payload)
         if message.operation == "attach":
-            started = self._start(message.payload)
-            attachment = self.registry.allocate_attachment(started["session_id"], utcnow())
-            return {**started, "terminal_id": attachment.terminal_id,
-                    "accepted_sequence": attachment.accepted_sequence}
+            return self._open(message.payload)
         if message.operation == "events":
             terminal_id = str(message.payload["terminal_id"])
             attachment = self.registry.attachment(terminal_id)
             if attachment is None:
-                raise KeyError(f"unknown terminal attachment: {terminal_id}")
+                return {"terminal_id": terminal_id, "recording_ended": True}
+            active = self.registry.lookup_session(attachment.session_id)
+            if active is None or active.state != "active" or attachment.detached_utc:
+                return {"terminal_id": terminal_id, "recording_ended": True}
             values = message.payload.get("events")
             if not isinstance(values, list):
                 raise ProtocolError("events requires an event list")
-            accepted = self.streams.append(
-                attachment.session_id, terminal_id, values, time.time_ns()
-            )
+            try:
+                accepted = self.streams.append(
+                    attachment.session_id, terminal_id, values, time.time_ns()
+                )
+            except (KeyError, RuntimeError):
+                return {"terminal_id": terminal_id, "recording_ended": True}
             return {"terminal_id": terminal_id, "accepted_sequence": accepted}
         if message.operation == "detach":
             terminal_id = str(message.payload["terminal_id"])
-            self.registry.detach(terminal_id, utcnow())
+            attachment = self.registry.attachment(terminal_id)
+            active = None if attachment is None else self.registry.lookup_session(
+                attachment.session_id
+            )
+            if active is not None:
+                with self._root_lock(active.root):
+                    self.streams.detach(terminal_id, utcnow())
             return {"terminal_id": terminal_id, "detached": True}
-        if message.operation == "lookup":
-            return self._lookup(message.payload)
         if message.operation == "end":
             return self._end(message.payload)
-        if message.operation == "status":
-            return self._status()
         if message.operation == "push":
             return self._push(message.payload)
-        if message.operation == "step":
-            active = self.registry.lookup(Path(message.payload["path"]))
-            if active is None:
-                raise FileNotFoundError("no active recording for path")
-            manifest = self._publish(self._session_model(active))
-            return {"session_id": active.session_id, "step": manifest.step}
+        if message.operation == "agent_launch":
+            return self._agent_launch(message.payload)
+        if message.operation == "agent_complete":
+            return self._agent_complete(message.payload)
         if message.operation == "shutdown":
             self._stop.set()
             return {"status": "stopping"}
@@ -350,12 +443,14 @@ class MemoDaemon:
         self._acquire_daemon_lock()
         self.registry.remove_stale(self.paths.archive)
         for active in self.registry.list_active():
-            self.store.check_integrity(active.archive_namespace, active.session_id)
+            self.store.check_integrity(active.session_id)
         self.streams.recover_all()
         self.registry.expire_attachments(utcnow())
         for active in self.registry.list_active():
             if active.state == "ending":
-                self._end({"path": str(active.root)})
+                self._finish(active)
+            elif active.state == "complete":
+                self.registry.remove(active.session_id)
         self.socket_path.unlink(missing_ok=True)
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server = server
@@ -415,25 +510,37 @@ def ensure_daemon(paths: Paths | None = None, timeout: float = 5.0) -> None:
     raise RuntimeError("memo daemon did not start")
 
 
-def activate(path: Path, paths: Paths | None = None) -> dict[str, Any]:
+def attach(path: Path, paths: Paths | None = None, *, decision: str | None = None,
+           expected_session_id: str | None = None,
+           expected_revision: int | None = None) -> dict[str, Any]:
     paths = paths or Paths.discover()
     ensure_daemon(paths)
     assert paths.socket is not None
-    return request(str(paths.socket), "start", {"path": str(path)})
+    payload: dict[str, Any] = {"path": str(path)}
+    if decision is not None:
+        payload.update({"decision": decision, "expected_session_id": expected_session_id,
+                        "expected_revision": expected_revision})
+    return request(str(paths.socket), "attach", payload)
 
 
-def attach(path: Path, paths: Paths | None = None) -> dict[str, Any]:
+def end(path: Path | None = None, paths: Paths | None = None, *,
+        session_id: str | None = None, terminal_id: str | None = None,
+        confirmed: bool = False, expected_revision: int | None = None) -> dict[str, Any]:
     paths = paths or Paths.discover()
     ensure_daemon(paths)
     assert paths.socket is not None
-    return request(str(paths.socket), "attach", {"path": str(path)})
-
-
-def end(path: Path, paths: Paths | None = None) -> dict[str, Any]:
-    paths = paths or Paths.discover()
-    ensure_daemon(paths)
-    assert paths.socket is not None
-    return request(str(paths.socket), "end", {"path": str(path)}, timeout=60.0)
+    payload: dict[str, Any] = {}
+    if path is not None:
+        payload["path"] = str(path)
+    if session_id is not None:
+        payload["session_id"] = session_id
+    if terminal_id is not None:
+        payload["terminal_id"] = terminal_id
+    if confirmed:
+        payload["confirmed"] = True
+    if expected_revision is not None:
+        payload["expected_revision"] = expected_revision
+    return request(str(paths.socket), "end", payload, timeout=60.0)
 
 
 def push(session_id: str | None = None, paths: Paths | None = None) -> dict[str, Any]:

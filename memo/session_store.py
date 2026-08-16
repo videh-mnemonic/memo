@@ -18,8 +18,11 @@ class SessionNotFoundError(FileNotFoundError):
     pass
 
 
-class AmbiguousSessionError(RuntimeError):
-    pass
+def validate_session_id(session_id: str) -> str:
+    if (not session_id or session_id in {".", ".."}
+            or Path(session_id).name != session_id or "\\" in session_id):
+        raise ValueError(f"unsafe session ID: {session_id}")
+    return session_id
 
 
 def _json_bytes(value: dict[str, object]) -> bytes:
@@ -50,29 +53,23 @@ class SessionStore:
         self.paths = paths
         paths.ensure_storage()
 
-    def session_path(self, namespace: str, session_id: str) -> Path:
+    def session_path(self, session_id: str) -> Path:
         assert self.paths.archive is not None
-        return self.paths.archive / namespace / session_id
+        return self.paths.archive / validate_session_id(session_id)
 
     def list_sessions(self) -> list[tuple[Path, DirectorySession]]:
         return list_directory_sessions(self.paths)
 
     def find(self, session_id: str) -> tuple[Path, DirectorySession]:
         assert self.paths.archive is not None
-        matches = sorted(self.paths.archive.glob(f"*/{session_id}/session.json"))
-        if not matches:
+        metadata = self.session_path(session_id) / "session.json"
+        if not metadata.is_file():
             raise SessionNotFoundError(f"session not found: {session_id}")
-        if len(matches) > 1:
-            namespaces = ", ".join(item.parent.parent.name for item in matches)
-            raise AmbiguousSessionError(
-                f"session {session_id} exists in multiple namespaces: {namespaces}"
-            )
-        path = matches[0].parent
-        return path, DirectorySession.load(matches[0])
+        return metadata.parent, DirectorySession.load(metadata)
 
     def create(self, session: DirectorySession) -> Path:
         session.validate()
-        path = self.session_path(session.archive_namespace, session.session_id)
+        path = self.session_path(session.session_id)
         path.mkdir(parents=True, exist_ok=False)
         (path / "steps").mkdir()
         (path / "snapshots").mkdir()
@@ -82,16 +79,16 @@ class SessionStore:
         atomic_write(path / "session.json", _json_bytes(session.to_dict()))
         return path
 
-    def load_session(self, namespace: str, session_id: str) -> DirectorySession:
-        return DirectorySession.load(self.session_path(namespace, session_id) / "session.json")
+    def load_session(self, session_id: str) -> DirectorySession:
+        return DirectorySession.load(self.session_path(session_id) / "session.json")
 
     def update_session(self, session: DirectorySession) -> None:
         session.validate()
-        atomic_write(self.session_path(session.archive_namespace, session.session_id) / "session.json",
+        atomic_write(self.session_path(session.session_id) / "session.json",
                      _json_bytes(session.to_dict()))
 
-    def head(self, namespace: str, session_id: str) -> StepManifest | None:
-        path = self.session_path(namespace, session_id)
+    def head(self, session_id: str) -> StepManifest | None:
+        path = self.session_path(session_id)
         head = path / "HEAD"
         if not head.is_file():
             return None
@@ -104,9 +101,9 @@ class SessionStore:
             raise ValueError("HEAD step does not match manifest")
         return manifest
 
-    def step(self, namespace: str, session_id: str, selector: str | int = -1) -> StepManifest:
+    def step(self, session_id: str, selector: str | int = -1) -> StepManifest:
         if selector == -1 or selector == "-1":
-            manifest = self.head(namespace, session_id)
+            manifest = self.head(session_id)
             if manifest is None:
                 raise ValueError(f"session has no published step: {session_id}")
             return manifest
@@ -116,7 +113,7 @@ class SessionStore:
             raise ValueError(f"invalid step selector: {selector}") from error
         if number < 0:
             raise ValueError(f"invalid step selector: {selector}")
-        path = self.session_path(namespace, session_id)
+        path = self.session_path(session_id)
         manifest_path = path / "steps" / f"{number}.json"
         if not manifest_path.is_file():
             raise ValueError(f"step not found: {number}")
@@ -124,9 +121,9 @@ class SessionStore:
         self._validate_manifest(path, session_id, manifest)
         return manifest
 
-    def steps(self, namespace: str, session_id: str) -> list[StepManifest]:
-        path = self.session_path(namespace, session_id)
-        return self._validate_history(path, namespace, session_id)
+    def steps(self, session_id: str) -> list[StepManifest]:
+        path = self.session_path(session_id)
+        return self._validate_history(path, session_id)
 
     @staticmethod
     def _validate_manifest(path: Path, session_id: str, manifest: StepManifest,
@@ -168,16 +165,16 @@ class SessionStore:
                 if not (path / "agents" / "traces" / trace_file).is_file():
                     raise ValueError(f"agent run references missing trace: {run_id}")
 
-    def restore(self, namespace: str, session_id: str, destination: Path,
+    def restore(self, session_id: str, destination: Path,
                 selector: str | int = -1, force: bool = False) -> Path:
-        manifest = self.step(namespace, session_id, selector)
-        return self.restore_manifest(namespace, session_id, manifest, destination, force)
+        manifest = self.step(session_id, selector)
+        return self.restore_manifest(session_id, manifest, destination, force)
 
-    def restore_manifest(self, namespace: str, session_id: str, manifest: StepManifest,
+    def restore_manifest(self, session_id: str, manifest: StepManifest,
                          destination: Path, force: bool = False) -> Path:
-        path = self.session_path(namespace, session_id)
+        path = self.session_path(session_id)
         self._validate_manifest(path, session_id, manifest)
-        source = self.session_path(namespace, session_id) / manifest.snapshot
+        source = self.session_path(session_id) / manifest.snapshot
         if destination.exists():
             occupied = not destination.is_dir() or any(destination.iterdir())
             if occupied and not force:
@@ -188,18 +185,18 @@ class SessionStore:
         shutil.copytree(source, destination, dirs_exist_ok=True, copy_function=shutil.copy2)
         return destination
 
-    def stream_events(self, namespace: str, session_id: str,
+    def stream_events(self, session_id: str,
                       terminal_id: str | None = None,
                       selector: str | int = -1) -> list[StreamEvent]:
-        manifest = self.step(namespace, session_id, selector)
+        manifest = self.step(session_id, selector)
         terminal_ids = None if terminal_id is None else [terminal_id]
-        return self.stream_events_for_manifest(namespace, session_id, manifest, terminal_ids)
+        return self.stream_events_for_manifest(session_id, manifest, terminal_ids)
 
-    def stream_events_for_manifest(self, namespace: str, session_id: str,
+    def stream_events_for_manifest(self, session_id: str,
                                    manifest: StepManifest,
                                    terminal_ids: Iterable[str] | None = None) -> list[StreamEvent]:
         from .streams import merged_timeline
-        path = self.session_path(namespace, session_id)
+        path = self.session_path(session_id)
         self._validate_manifest(path, session_id, manifest, streams=True)
         terminals = manifest.stream_high_water
         selected = sorted(terminals) if terminal_ids is None else list(terminal_ids)
@@ -218,16 +215,15 @@ class SessionStore:
         return [event for event in merged_timeline(chunks)
                 if event.sequence <= terminals.get(event.terminal_id, -1)]
 
-    def check_integrity(self, namespace: str, session_id: str) -> StepManifest | None:
-        path = self.session_path(namespace, session_id)
-        manifests = self._validate_history(path, namespace, session_id)
+    def check_integrity(self, session_id: str) -> StepManifest | None:
+        path = self.session_path(session_id)
+        manifests = self._validate_history(path, session_id)
         return manifests[-1] if manifests else None
 
     @classmethod
-    def _validate_history(cls, path: Path, namespace: str,
-                          session_id: str) -> list[StepManifest]:
+    def _validate_history(cls, path: Path, session_id: str) -> list[StepManifest]:
         session = DirectorySession.load(path / "session.json")
-        if session.session_id != session_id or session.archive_namespace != namespace:
+        if session.session_id != session_id:
             raise ValueError("session metadata does not match archive location")
         head_path = path / "HEAD"
         if not head_path.is_file():
@@ -255,8 +251,8 @@ class SessionStore:
             manifests.append(manifest)
         return manifests
 
-    def next_step(self, namespace: str, session_id: str) -> int:
-        current = self.head(namespace, session_id)
+    def next_step(self, session_id: str) -> int:
+        current = self.head(session_id)
         return 0 if current is None else current.step + 1
 
     def publish(self, session: DirectorySession, manifest: StepManifest,
@@ -264,8 +260,8 @@ class SessionStore:
         manifest.validate()
         if manifest.session_id != session.session_id:
             raise ValueError("step belongs to a different session")
-        path = self.session_path(session.archive_namespace, session.session_id)
-        expected = self.next_step(session.archive_namespace, session.session_id)
+        path = self.session_path(session.session_id)
+        expected = self.next_step(session.session_id)
         if manifest.step != expected:
             raise ValueError(f"step {manifest.step} is not next step {expected}")
         snapshot = path / manifest.snapshot
@@ -300,7 +296,7 @@ class SessionStore:
 def list_directory_sessions(paths: Paths) -> list[tuple[Path, DirectorySession]]:
     assert paths.archive is not None
     result = []
-    for session_file in sorted(paths.archive.glob("*/*/session.json")):
+    for session_file in sorted(paths.archive.glob("*/session.json")):
         try:
             result.append((session_file.parent, DirectorySession.load(session_file)))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):

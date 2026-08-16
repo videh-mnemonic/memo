@@ -16,6 +16,7 @@ from types import FrameType
 from .config import Paths
 from .daemon import attach
 from .protocol import request
+from .shim import ensure_shims
 
 
 def _event(sequence: int, direction: str, data: bytes) -> dict[str, object]:
@@ -37,7 +38,24 @@ def _resize(source_fd: int, pty_fd: int) -> None:
 def run(path: Path, paths: Paths | None = None, shell: str | None = None,
         stdin_fd: int = 0, stdout_fd: int = 1) -> int:
     paths = paths or Paths.discover()
+    shim_directory = ensure_shims(paths)
     allocation = attach(path, paths)
+    while allocation.get("decision_required") or allocation.get("stale"):
+        if allocation.get("stale"):
+            os.write(stdout_fd, b"The recording changed while awaiting your choice; please choose again.\n")
+        prompt = (
+            "A Memo recording already exists for this directory.\n\n"
+            "1. Resume existing recording\n"
+            "2. Start a new recording\n\n"
+            "Choice [1]: "
+        )
+        choice = input(prompt).strip()
+        decision = "replace" if choice == "2" else "resume"
+        allocation = attach(
+            path, paths, decision=decision,
+            expected_session_id=str(allocation["session_id"]),
+            expected_revision=int(allocation["revision"]),
+        )
     terminal_id = allocation["terminal_id"]
     session_id = allocation["session_id"]
     assert paths.socket is not None
@@ -45,7 +63,12 @@ def run(path: Path, paths: Paths | None = None, shell: str | None = None,
     pid, master_fd = pty.fork()
     if pid == 0:
         os.chdir(allocation["root"])
-        os.execv(executable, [executable])
+        environment = os.environ.copy()
+        environment["MEMO_SESSION_ID"] = session_id
+        environment["MEMO_TERMINAL_ID"] = terminal_id
+        environment["MEMO_SHIM_DIR"] = str(shim_directory)
+        environment["PATH"] = str(shim_directory) + os.pathsep + environment.get("PATH", "")
+        os.execve(executable, [executable], environment)
     sequence = int(allocation["accepted_sequence"])
     original_mode = termios.tcgetattr(stdin_fd) if os.isatty(stdin_fd) else None
     previous_handlers: dict[int, object] = {}
@@ -67,6 +90,7 @@ def run(path: Path, paths: Paths | None = None, shell: str | None = None,
             previous_handlers[signum] = signal.signal(signum, forward)
         previous_handlers[signal.SIGWINCH] = signal.signal(signal.SIGWINCH, resize)
         input_open = True
+        ended = False
         while True:
             readable, _, _ = select.select(
                 [master_fd] + ([stdin_fd] if input_open else []), [], [], 0.1
@@ -74,13 +98,16 @@ def run(path: Path, paths: Paths | None = None, shell: str | None = None,
             if stdin_fd in readable:
                 data = os.read(stdin_fd, 65536)
                 if data:
-                    os.write(master_fd, data)
                     sequence += 1
-                    request(str(paths.socket), "events", {
+                    result = request(str(paths.socket), "events", {
                         "session_id": session_id,
                         "terminal_id": terminal_id,
                         "events": [_event(sequence, "input", data)],
                     })
+                    if result.get("recording_ended"):
+                        ended = True
+                        break
+                    os.write(master_fd, data)
                 else:
                     input_open = False
             if master_fd in readable:
@@ -92,13 +119,31 @@ def run(path: Path, paths: Paths | None = None, shell: str | None = None,
                     raise
                 if not data:
                     break
-                os.write(stdout_fd, data)
                 sequence += 1
-                request(str(paths.socket), "events", {
+                result = request(str(paths.socket), "events", {
                     "session_id": session_id,
                     "terminal_id": terminal_id,
                     "events": [_event(sequence, "output", data)],
                 })
+                if result.get("recording_ended"):
+                    ended = True
+                    break
+                os.write(stdout_fd, data)
+            if not readable:
+                result = request(str(paths.socket), "events", {
+                    "session_id": session_id,
+                    "terminal_id": terminal_id,
+                    "events": [],
+                })
+                if result.get("recording_ended"):
+                    ended = True
+                    break
+        if ended:
+            os.write(stdout_fd, b"\r\nmemo: recording ended\r\n")
+            try:
+                os.killpg(pid, signal.SIGHUP)
+            except ProcessLookupError:
+                pass
         _, status = os.waitpid(pid, 0)
         return os.waitstatus_to_exitcode(status)
     finally:

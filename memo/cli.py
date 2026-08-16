@@ -1,27 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
-from .agent import run as run_agent
-from .daemon import activate, end, push
-from .harnesses import get_harness, registered_harnesses
+from .daemon import end, push
 from .load import inspect_session, replay_session, trace_json, write_traces
 from .relay import run as run_relay
 from .status import render_status
 
 
-COMMANDS = {"background", "end", "status", "inspect", "traces", "replay", "push", "pull"}
+COMMANDS = {"end", "status", "inspect", "traces", "replay", "push", "pull"}
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="memo", description="Record and replay directory sessions")
     subparsers = result.add_subparsers(dest="command")
-    record = subparsers.add_parser("record", help=argparse.SUPPRESS)
-    record.add_argument("recording_path", nargs="?", type=Path)
-    background = subparsers.add_parser("background", help="start or join a recording")
-    background.add_argument("path", nargs="?", type=Path)
     finish = subparsers.add_parser("end", help="finish a recording")
     finish.add_argument("path", nargs="?", type=Path)
     subparsers.add_parser("status", help="list recordings")
@@ -48,29 +43,52 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    harness_names = {harness.name for harness in registered_harnesses()}
-    if argv and argv[0] in harness_names:
+    if not argv:
         try:
-            return run_agent(get_harness(argv[0]), argv[1:])
+            return run_relay(Path.cwd())
         except Exception as error:
             print(f"memo: {error}", file=sys.stderr)
             return 1
-    if not argv:
-        argv = ["record"]
     elif argv[0] not in COMMANDS and (argv[0] == "." or Path(argv[0]).exists()):
-        argv.insert(0, "record")
+        try:
+            return run_relay(Path(argv[0]))
+        except Exception as error:
+            print(f"memo: {error}", file=sys.stderr)
+            return 1
     args = parser().parse_args(argv)
     try:
         if args.command == "status":
             print(render_status(), end="")
         elif args.command == "inspect":
             print(inspect_session(args.session_id), end="")
-        elif args.command == "background":
-            response = activate(args.path or Path.cwd())
-            action = "joined" if response["joined"] else "started"
-            print(f"{action}: {response['session_id']} step={response['step']} root={response['root']}")
         elif args.command == "end":
-            response = end(args.path or Path.cwd())
+            target_path = args.path
+            environment_session = os.environ.get("MEMO_SESSION_ID") if target_path is None else None
+            environment_terminal = os.environ.get("MEMO_TERMINAL_ID")
+            response = end(
+                target_path if target_path is not None or environment_session else Path.cwd(),
+                session_id=environment_session,
+                terminal_id=environment_terminal,
+            )
+            while response.get("confirmation_required") or response.get("stale"):
+                count = int(response["other_terminals"])
+                if response.get("stale"):
+                    print("The recording's attached terminals changed; confirmation is required again.")
+                answer = input(
+                    f"This recording has {count} other attached terminal"
+                    f"{'s' if count != 1 else ''}.\n"
+                    "End the recording for all terminals? [y/N] "
+                )
+                if answer.strip().lower() not in {"y", "yes"}:
+                    print("recording unchanged")
+                    return 0
+                response = end(
+                    target_path if target_path is not None or environment_session else Path.cwd(),
+                    session_id=environment_session,
+                    terminal_id=environment_terminal,
+                    confirmed=True,
+                    expected_revision=int(response["revision"]),
+                )
             action = "already complete" if response["already_complete"] else "completed"
             print(f"{action}: {response['session_id']} step={response['step']}")
         elif args.command == "push":
@@ -101,8 +119,6 @@ def main(argv: list[str] | None = None) -> int:
                 args.session_id, args.at, args.directory, args.include_prompts, args.force
             )
             print(f"replayed: {args.session_id} step={args.at} path={destination}")
-        elif args.command == "record":
-            return run_relay(args.recording_path or Path.cwd())
         else:
             parser().error("a command is required")
         return 0

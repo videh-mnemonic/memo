@@ -10,7 +10,7 @@ import pytest
 
 from memo.config import Paths
 from memo.load import inspect_session, replay_session, trace_json, write_traces
-from memo.models import DirectorySession, SnapshotEntry, StepManifest
+from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.session_store import SessionStore, atomic_write
 from memo.streams import StreamEvent
 
@@ -39,7 +39,8 @@ def _fixture(tmp_path: Path) -> tuple[Paths, SessionStore, DirectorySession]:
     root.mkdir()
     paths = _paths(tmp_path / "home")
     store = SessionStore(paths)
-    session = DirectorySession("session", str(root.resolve()), "namespace", "start", "now", "complete")
+    session = DirectorySession("session", str(root.resolve()), "start", "now",
+                               SessionOrigin("1.0.0", "user", "host"), "complete")
     session_path = store.create(session)
     events = {
         "z": [StreamEvent("z", 1, "output", base64.b64encode(b"z").decode(), 10)],
@@ -129,8 +130,8 @@ def test_prompt_output_is_optional_collision_safe_and_manifest_bounded(tmp_path:
 
 def test_invalid_directory_manifest_is_rejected(tmp_path: Path) -> None:
     paths, store, _ = _fixture(tmp_path)
-    session_path = store.session_path("namespace", "session")
-    head = store.head("namespace", "session")
+    session_path = store.session_path("session")
+    head = store.head("session")
     assert head is not None
     (session_path / head.snapshot / "note.txt").unlink()
     with pytest.raises(ValueError, match="missing snapshot file"):

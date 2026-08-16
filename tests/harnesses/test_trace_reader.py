@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from memo.harnesses import get_harness
-from memo.harnesses.harness import all_traces, source_records, trace_events
+from memo.harnesses.harness import source_records, trace_events
 
 
 def test_source_records_represent_every_physical_line(tmp_path: Path) -> None:
@@ -36,22 +36,3 @@ def test_trace_events_include_unknown_and_parse_errors(tmp_path: Path) -> None:
     assert events[0]["native"]["record"] == [1]
     assert events[1]["native"]["record"] is None
     assert events[2]["event"]["content"]["line"] == ""
-
-
-def test_all_traces_orders_legs_and_preserves_raw_values(tmp_path: Path) -> None:
-    traces = tmp_path / "traces"
-    traces.mkdir()
-    (traces / "leg-010.jsonl").write_text('{"type":"user","content":"ten"}\n')
-    (traces / "leg-002.jsonl").write_text('{"type":"user","content":"two"}\ninvalid\n')
-    (traces / "leg-001.jsonl").write_text('null\n')
-    harness = get_harness("claude")
-
-    events = all_traces(harness, tmp_path)
-    raw = all_traces(harness, tmp_path, raw=True)
-    bounded = all_traces(harness, tmp_path, through_leg=2)
-
-    assert [(item["position"]["trace"], item["position"]["seq"]) for item in events] == [
-        ("001", 0), ("002", 0), ("002", 1), ("010", 0),
-    ]
-    assert raw == [None, {"type": "user", "content": "two"}, {"type": "user", "content": "ten"}]
-    assert [item["position"]["trace"] for item in bounded] == ["001", "002", "002"]

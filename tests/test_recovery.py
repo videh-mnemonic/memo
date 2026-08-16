@@ -4,7 +4,7 @@ import struct
 from pathlib import Path
 
 from memo.config import Paths
-from memo.models import DirectorySession, SnapshotEntry, StepManifest
+from memo.models import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.registry import Registry
 from memo.session_store import SessionStore
 from memo.streams import StreamStore
@@ -17,10 +17,11 @@ def _setup(tmp_path: Path):
     root = tmp_path / "root"
     root.mkdir()
     registry = Registry(paths.registry)
-    active, _ = registry.start_or_join(root, "namespace", "now", "session")
+    active = registry.create(root, "now", "session")
     registry.allocate_attachment(active.session_id, "now", "terminal")
     store = SessionStore(paths)
-    store.create(DirectorySession("session", str(root.resolve()), "namespace", "now", "now"))
+    store.create(DirectorySession("session", str(root.resolve()), "now", "now",
+                                  SessionOrigin("1.0.0", "user", "host")))
     return paths, registry, store
 
 
@@ -39,14 +40,14 @@ def test_recovery_truncates_partial_frame_and_restores_ack(tmp_path: Path) -> No
     assert streams.recover_spool("session", "terminal") == 1
     assert spool.stat().st_size == valid_size
     assert registry.attachment("terminal").accepted_sequence == 1
-    assert streams.seal_session("namespace", "session") == {"terminal": 1}
+    assert streams.seal_session("session") == {"terminal": 1}
     registry.close()
 
 
 def test_integrity_keeps_last_head_and_ignores_unpublished_artifacts(tmp_path: Path) -> None:
     _, registry, store = _setup(tmp_path)
-    session = store.load_session("namespace", "session")
-    session_path = store.session_path("namespace", "session")
+    session = store.load_session("session")
+    session_path = store.session_path("session")
     prepared = session_path / "prepared"
     prepared.mkdir()
     (prepared / "file.txt").write_text("complete")
@@ -56,7 +57,7 @@ def test_integrity_keeps_last_head_and_ignores_unpublished_artifacts(tmp_path: P
     (session_path / "snapshots" / ".abandoned").mkdir()
     (session_path / "steps" / ".abandoned.tmp").write_text("partial")
 
-    assert store.check_integrity("namespace", "session") == manifest
+    assert store.check_integrity("session") == manifest
     assert (session_path / "HEAD").read_text().strip() == "0"
     registry.close()
 
@@ -66,18 +67,18 @@ def test_integrity_rejects_missing_published_stream_chunk(tmp_path: Path) -> Non
     streams = StreamStore(paths, registry)
     event = {"sequence": 1, "direction": "output", "data": base64.b64encode(b"x").decode()}
     streams.append("session", "terminal", [event], 10)
-    streams.seal_session("namespace", "session")
-    session = store.load_session("namespace", "session")
-    prepared = store.session_path("namespace", "session") / "prepared"
+    streams.seal_session("session")
+    session = store.load_session("session")
+    prepared = store.session_path("session") / "prepared"
     prepared.mkdir()
     manifest = StepManifest("session", 0, "now", "snapshots/0", [], {"terminal": 1})
     store.publish(session, manifest, prepared)
-    metadata_path = store.session_path("namespace", "session") / "streams/terminals/terminal/stream.json"
+    metadata_path = store.session_path("session") / "streams/terminals/terminal/stream.json"
     metadata = json.loads(metadata_path.read_text())
     (metadata_path.parent / metadata["chunks"][0]).unlink()
 
     try:
-        store.check_integrity("namespace", "session")
+        store.check_integrity("session")
     except ValueError as error:
         assert "missing chunk" in str(error)
     else:

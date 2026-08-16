@@ -1,36 +1,100 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
+import json
+import os
 from collections.abc import Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
-class TraceMarker:
-    files: dict[Path, tuple[int, int]]
+class TraceState:
+    device: int
+    inode: int
+    mtime_ns: int
+    size: int
+    complete_size: int
+
+    @classmethod
+    def from_stat(cls, value: os.stat_result, complete_size: int | None = None) -> "TraceState":
+        return cls(
+            value.st_dev, value.st_ino, value.st_mtime_ns, value.st_size,
+            value.st_size if complete_size is None else complete_size,
+        )
 
 
-def _files(roots: Sequence[Path]) -> list[Path]:
+@dataclass
+class TraceCheckpoint:
+    files: dict[str, TraceState]
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {path: asdict(state) for path, state in self.files.items()},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> "TraceCheckpoint":
+        raw = json.loads(value)
+        return cls({path: TraceState(**state) for path, state in raw.items()})
+
+
+def files(roots: Sequence[Path]) -> list[Path]:
     result: list[Path] = []
     for root in roots:
         if root.exists():
-            result.extend(p for p in root.rglob("*.jsonl") if p.is_file())
+            result.extend(path for path in root.rglob("*.jsonl") if path.is_file())
+    return sorted(set(result))
+
+
+def capture(roots: Sequence[Path]) -> TraceCheckpoint:
+    values: dict[str, TraceState] = {}
+    for path in files(roots):
+        try:
+            values[str(path.resolve())] = TraceState.from_stat(path.stat())
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+    return TraceCheckpoint(values)
+
+
+def changed(roots: Sequence[Path], checkpoint: TraceCheckpoint) -> list[Path]:
+    result = []
+    for path in files(roots):
+        try:
+            resolved = str(path.resolve())
+            state = TraceState.from_stat(path.stat())
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        previous = checkpoint.files.get(resolved)
+        if previous != state or (
+            previous is not None and previous.complete_size < previous.size
+        ):
+            result.append(path)
     return result
 
 
-def mark(roots: Sequence[Path]) -> TraceMarker:
-    values = {}
-    for path in _files(roots):
-        stat = path.stat()
-        values[path] = (stat.st_mtime_ns, stat.st_size)
-    return TraceMarker(values)
-
-
-def locate(roots: Sequence[Path], marker: TraceMarker) -> Path | None:
-    candidates = []
-    for path in _files(roots):
-        stat = path.stat()
-        previous = marker.files.get(path)
-        if previous is None or (stat.st_mtime_ns, stat.st_size) != previous:
-            candidates.append((stat.st_mtime_ns, path))
-    return max(candidates, default=(0, None))[1]
+def snapshot_complete(source: Path, destination: Path) -> tuple[TraceState, int]:
+    """Copy a fixed-size prefix ending at the final complete JSONL record."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    last_newline = 0
+    copied = 0
+    with source.open("rb") as reader, destination.open("wb") as writer:
+        state = TraceState.from_stat(os.fstat(reader.fileno()))
+        remaining = state.size
+        while remaining:
+            chunk = reader.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            writer.write(chunk)
+            index = chunk.rfind(b"\n")
+            if index >= 0:
+                last_newline = copied + index + 1
+            copied += len(chunk)
+            remaining -= len(chunk)
+        writer.truncate(last_newline)
+        writer.flush()
+        os.fsync(writer.fileno())
+    return TraceState(
+        state.device, state.inode, state.mtime_ns, state.size, last_newline
+    ), last_newline

@@ -4,8 +4,6 @@ import os
 import shutil
 import stat
 import tempfile
-import threading
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -139,52 +137,22 @@ def scan_tree(root: Path, destination: Path, *, previous: Path | None = None,
     return entries
 
 
-@dataclass
-class _State:
-    running: bool = False
-    requested: bool = False
-
-
 class StepPublisher:
     def __init__(self, store: SessionStore, seal_streams=None):
         self.store = store
         self.seal_streams = seal_streams or (lambda _session: {})
-        self._condition = threading.Condition()
-        self._states: dict[str, _State] = {}
 
     def publish(self, session: DirectorySession) -> StepManifest:
-        with self._condition:
-            state = self._states.setdefault(session.session_id, _State())
-            if state.running:
-                state.requested = True
-                while state.running:
-                    self._condition.wait()
-                current = self.store.head(session.archive_namespace, session.session_id)
-                if current is None:
-                    raise RuntimeError("coalesced step did not publish")
-                return current
-            state.running = True
-        try:
-            result = self._publish_once(session)
-            while True:
-                with self._condition:
-                    if not state.requested:
-                        return result
-                    state.requested = False
-                result = self._publish_once(session)
-        finally:
-            with self._condition:
-                state.running = False
-                self._condition.notify_all()
+        return self._publish_once(session)
 
     def _publish_once(self, session: DirectorySession) -> StepManifest:
         high_water = self.seal_streams(session)
-        previous_manifest = self.store.head(session.archive_namespace, session.session_id)
+        previous_manifest = self.store.head(session.session_id)
         previous = None if previous_manifest is None else (
-            self.store.session_path(session.archive_namespace, session.session_id) / previous_manifest.snapshot
+            self.store.session_path(session.session_id) / previous_manifest.snapshot
         )
-        step = self.store.next_step(session.archive_namespace, session.session_id)
-        session_path = self.store.session_path(session.archive_namespace, session.session_id)
+        step = self.store.next_step(session.session_id)
+        session_path = self.store.session_path(session.session_id)
         agent_runs = sorted(path.stem for path in (session_path / "agents" / "runs").glob("*.json"))
         temporary = Path(tempfile.mkdtemp(prefix=f".{step}.", dir=session_path / "snapshots"))
         try:

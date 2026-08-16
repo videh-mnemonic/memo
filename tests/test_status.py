@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from memo.config import Paths
-from memo.models import DirectorySession
+from memo.models import DirectorySession, SessionOrigin
 from memo.session_store import SessionStore
 from memo.status import render_status
 from memo.step import StepPublisher
@@ -16,14 +16,15 @@ def test_status_lists_directory_step(tmp_path: Path) -> None:
     root.mkdir()
     paths = _paths(tmp_path)
     store = SessionStore(paths)
-    session = DirectorySession("session", str(root.resolve()), "namespace", "now", "now", "complete")
+    session = DirectorySession("session", str(root.resolve()), "now", "now",
+                               SessionOrigin("1.0.0", "user", "host"), "complete")
     store.create(session)
     StepPublisher(store).publish(session)
     output = render_status(paths)
     assert "STEP" in output
     assert "complete" in output
     assert "session" in output
-    assert "namespace" in output
+    assert "namespace" not in output
     assert "  0" in output
 
 
