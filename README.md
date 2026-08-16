@@ -65,6 +65,12 @@ memo status [SESSION_ID] [--include-archive] [--limit N]
 Single-recording status shows lifecycle, step, terminal, archive, and agent-run
 details.
 
+To inspect a row from `memo status`, copy its session ID and run:
+
+```console
+memo status SESSION_ID
+```
+
 ### Export traces
 
 ```console
@@ -82,6 +88,21 @@ otherwise it exports all terminal streams.
   normalized events.
 
 `--list-terminals` cannot be combined with the other export options.
+
+To print what Memo has recorded to the console instead of writing a temporary
+file:
+
+```console
+memo traces SESSION_ID --path -
+memo traces SESSION_ID --raw --path -
+```
+
+For terminal streams, first list stream IDs, then export one or more:
+
+```console
+memo traces SESSION_ID --list-terminals
+memo traces SESSION_ID --terminals TERMINAL_ID --path -
+```
 
 ### Replay a filesystem step
 
@@ -240,6 +261,17 @@ This discovers existing Claude and Codex traces, turns uncaptured sessions into
 agent-only recordings, uploads recordings, and removes only safely archived
 completed local copies. Use `memo import` instead if you want to import traces
 without uploading or removing anything.
+
+For a cautious first migration from older local data, preview before writing:
+
+```console
+memo migrate-legacy --dry-run
+memo import --dry-run
+memo migrate-legacy
+memo import
+memo tidy
+memo status --include-archive
+```
 
 ## How recording works
 
