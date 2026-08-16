@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import socket
-import threading
+from multiprocessing import Pipe
 
 import pytest
 
@@ -10,28 +9,21 @@ from memo.protocol import (
     ProtocolError,
     Request,
     Response,
-    encode_frame,
+    MAX_FRAME_SIZE,
     receive_request,
     receive_response,
+    send_message,
 )
 
 
-def test_partial_frame_is_reassembled() -> None:
-    reader, writer = socket.socketpair()
-    frame = encode_frame(Request("health", {}))
-
-    def send() -> None:
-        for byte in frame:
-            writer.sendall(bytes([byte]))
-        writer.close()
-
-    thread = threading.Thread(target=send)
-    thread.start()
+def test_request_round_trip() -> None:
+    reader, writer = Pipe(duplex=True)
     try:
+        send_message(writer, Request("health", {}))
         assert receive_request(reader).operation == "health"
     finally:
         reader.close()
-        thread.join()
+        writer.close()
 
 
 @pytest.mark.parametrize(
@@ -45,8 +37,8 @@ def test_partial_frame_is_reassembled() -> None:
     ],
 )
 def test_invalid_requests_are_rejected(value: dict[str, object], message: str) -> None:
-    reader, writer = socket.socketpair()
-    writer.sendall(encode_frame(value))
+    reader, writer = Pipe(duplex=True)
+    send_message(writer, value)
     with pytest.raises(ProtocolError, match=message):
         receive_request(reader)
     reader.close()
@@ -54,18 +46,27 @@ def test_invalid_requests_are_rejected(value: dict[str, object], message: str) -
 
 
 def test_error_response_requires_message() -> None:
-    reader, writer = socket.socketpair()
-    writer.sendall(encode_frame(Response(False, {})))
+    reader, writer = Pipe(duplex=True)
+    send_message(writer, Response(False, {}))
     with pytest.raises(ProtocolError, match="no message"):
         receive_response(reader)
     reader.close()
     writer.close()
 
 
-def test_disconnect_mid_frame_is_reported() -> None:
-    reader, writer = socket.socketpair()
-    writer.sendall(b"\x00\x00\x00\x10{}")
+def test_disconnect_before_message_is_reported() -> None:
+    reader, writer = Pipe(duplex=True)
     writer.close()
     with pytest.raises(DisconnectedError):
         receive_request(reader)
     reader.close()
+
+
+def test_oversized_message_is_rejected_before_send() -> None:
+    reader, writer = Pipe(duplex=True)
+    try:
+        with pytest.raises(ProtocolError, match="too large"):
+            send_message(writer, {"value": "x" * MAX_FRAME_SIZE})
+    finally:
+        reader.close()
+        writer.close()

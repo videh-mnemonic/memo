@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-import socket
-import struct
 from dataclasses import asdict, dataclass
+from multiprocessing.connection import Client, Connection
 from typing import Any
 
 
@@ -70,30 +69,25 @@ class Response:
         return result
 
 
-def encode_frame(value: Request | Response | dict[str, Any]) -> bytes:
+def _encode(value: Request | Response | dict[str, Any]) -> bytes:
     body = json.dumps(asdict(value) if not isinstance(value, dict) else value,
                       separators=(",", ":"), sort_keys=True).encode("utf-8")
     if len(body) > MAX_FRAME_SIZE:
         raise ProtocolError("frame is too large")
-    return struct.pack("!I", len(body)) + body
+    return body
 
 
-def _read_exact(connection: socket.socket, size: int) -> bytes:
-    chunks = bytearray()
-    while len(chunks) < size:
-        chunk = connection.recv(size - len(chunks))
-        if not chunk:
-            raise DisconnectedError("client disconnected during frame")
-        chunks.extend(chunk)
-    return bytes(chunks)
-
-
-def receive_dict(connection: socket.socket) -> dict[str, Any]:
-    size = struct.unpack("!I", _read_exact(connection, 4))[0]
-    if size == 0 or size > MAX_FRAME_SIZE:
-        raise ProtocolError(f"invalid frame size: {size}")
+def receive_dict(connection: Connection) -> dict[str, Any]:
     try:
-        value = json.loads(_read_exact(connection, size))
+        body = connection.recv_bytes(MAX_FRAME_SIZE)
+    except EOFError as error:
+        raise DisconnectedError("client disconnected before sending a message") from error
+    except OSError as error:
+        if str(error) == "bad message length":
+            raise ProtocolError("frame is too large") from error
+        raise DisconnectedError("client disconnected during message") from error
+    try:
+        value = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ProtocolError("invalid JSON frame") from error
     if not isinstance(value, dict):
@@ -101,24 +95,24 @@ def receive_dict(connection: socket.socket) -> dict[str, Any]:
     return value
 
 
-def receive_request(connection: socket.socket) -> Request:
+def receive_request(connection: Connection) -> Request:
     return Request.from_dict(receive_dict(connection))
 
 
-def receive_response(connection: socket.socket) -> Response:
+def receive_response(connection: Connection) -> Response:
     return Response.from_dict(receive_dict(connection))
 
 
-def send_message(connection: socket.socket, value: Request | Response | dict[str, Any]) -> None:
-    connection.sendall(encode_frame(value))
+def send_message(connection: Connection, value: Request | Response | dict[str, Any]) -> None:
+    connection.send_bytes(_encode(value))
 
 
 def request(socket_path: str, operation: str, payload: dict[str, Any] | None = None,
             timeout: float = 10.0) -> dict[str, Any]:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(timeout)
-        connection.connect(socket_path)
+    with Client(socket_path, family="AF_UNIX") as connection:
         send_message(connection, Request(operation, payload or {}))
+        if not connection.poll(timeout):
+            raise TimeoutError(f"daemon request timed out after {timeout} seconds")
         response = receive_response(connection)
     if not response.ok:
         raise ProtocolError(response.error or "daemon request failed")

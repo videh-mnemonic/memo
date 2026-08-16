@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import fcntl
 import os
-import socket
 import subprocess
 import sys
 import threading
 import time
+from multiprocessing.connection import Client, Connection, Listener
 from pathlib import Path
 from typing import IO, Any
 
@@ -59,7 +59,7 @@ class MemoDaemon:
         self._session_locks: dict[str, threading.RLock] = {}
         self._root_locks: dict[str, threading.RLock] = {}
         self._push_thread: threading.Thread | None = None
-        self._server: socket.socket | None = None
+        self._server: Listener | None = None
         self._lock_handle: IO[str] | None = None
 
     def _acquire_daemon_lock(self) -> None:
@@ -513,10 +513,15 @@ class MemoDaemon:
             return self._agent_complete(message.payload)
         if message.operation == "shutdown":
             self._stop.set()
+            try:
+                with Client(str(self.socket_path), family="AF_UNIX"):
+                    pass
+            except OSError:
+                pass
             return {"status": "stopping"}
         raise ProtocolError(f"unknown operation: {message.operation}")
 
-    def _handle(self, connection: socket.socket) -> None:
+    def _handle(self, connection: Connection) -> None:
         with connection:
             try:
                 message = receive_request(connection)
@@ -543,23 +548,20 @@ class MemoDaemon:
             elif active.state == "complete":
                 self.registry.remove(active.session_id)
         self.socket_path.unlink(missing_ok=True)
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server = Listener(str(self.socket_path), family="AF_UNIX", backlog=32)
         self._server = server
         try:
-            server.bind(str(self.socket_path))
             os.chmod(self.socket_path, 0o600)
-            server.listen(32)
-            server.settimeout(0.25)
             for active in self.registry.list_active():
                 self._ensure_worker(active)
             if TransportConfig.discover() is not None:
                 self._push_thread = threading.Thread(target=self._automatic_push_loop, daemon=True)
                 self._push_thread.start()
             while not self._stop.is_set():
-                try:
-                    connection, _ = server.accept()
-                except socket.timeout:
-                    continue
+                connection = server.accept()
+                if self._stop.is_set():
+                    connection.close()
+                    break
                 threading.Thread(target=self._handle, args=(connection,), daemon=True).start()
         finally:
             for observer in self._observers.values():
