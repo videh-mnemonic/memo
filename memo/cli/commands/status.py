@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import stat
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from ...agents.run_metadata import AgentRunMetadata
-from ...daemon.registry import Registry
+from ...daemon.registry import Attachment, Registry
+from ...daemon.server import TERMINAL_STALE_SECONDS
 from ...recording.metadata import DirectorySession
 from ...recording.paths import StoragePaths
 from ...recording.store import SessionStore
@@ -144,6 +146,12 @@ def _local_row(
     )
 
 
+def _terminal_is_active(attachment: Attachment, cutoff_seen_ns: int) -> bool:
+    if attachment.detached_utc is not None:
+        return False
+    return attachment.last_seen_ns == 0 or attachment.last_seen_ns >= cutoff_seen_ns
+
+
 def _archived_progress(session: DirectorySession, steps: int) -> str:
     if session.last_pushed_step is None:
         return "—"
@@ -194,7 +202,14 @@ def _render_session_detail(
     lines.append("Terminals:")
     if attachments:
         for item in attachments:
-            status = "detached" if item.detached_utc else "attached"
+            cutoff = time.time_ns() - int(TERMINAL_STALE_SECONDS * 1_000_000_000)
+            status = (
+                "detached"
+                if item.detached_utc
+                else "stale"
+                if not _terminal_is_active(item, cutoff)
+                else "attached"
+            )
             lines.append(
                 f"  {item.terminal_id}: {status}, accepted={item.accepted_sequence}, "
                 f"attached={item.attached_utc}, detached={item.detached_utc or '—'}"
@@ -266,6 +281,7 @@ def render_status(
         )
     ]
     active = {}
+    cutoff_seen_ns = time.time_ns() - int(TERMINAL_STALE_SECONDS * 1_000_000_000)
     if paths.registry.exists():
         with Registry(paths.registry) as registry:
             for item in registry.list_active():
@@ -275,7 +291,7 @@ def render_status(
                         [
                             value
                             for value in registry.list_attachments(item.session_id)
-                            if value.detached_utc is None
+                            if _terminal_is_active(value, cutoff_seen_ns)
                         ]
                     ),
                 )

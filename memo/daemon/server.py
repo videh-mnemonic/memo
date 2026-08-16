@@ -33,6 +33,7 @@ from .registry import ActiveSession, AgentLaunch, Registry
 STEP_INTERVAL_SECONDS = 15.0
 WATCHER_DEBOUNCE_SECONDS = 0.25
 PUSH_INTERVAL_SECONDS = 15 * 60.0
+TERMINAL_STALE_SECONDS = 5 * 60.0
 
 
 class DaemonAlreadyRunning(RuntimeError):
@@ -86,6 +87,10 @@ class MemoDaemon:
         key = str(root.resolve())
         with self._worker_lock:
             return self._root_locks.setdefault(key, threading.RLock())
+
+    def _expire_stale_attachments(self) -> None:
+        cutoff = time.time_ns() - int(TERMINAL_STALE_SECONDS * 1_000_000_000)
+        self.registry.expire_stale_attachments(cutoff, utcnow())
 
     def _publish(self, session: DirectorySession):
         with self._session_lock(session.session_id):
@@ -181,6 +186,7 @@ class MemoDaemon:
             raise ProtocolError("open requires a path") from error
         canonical = root.expanduser().resolve(strict=True)
         with self._root_lock(canonical):
+            self._expire_stale_attachments()
             active = self.registry.lookup(canonical)
             if active is None:
                 created = self._create(canonical)
@@ -243,6 +249,7 @@ class MemoDaemon:
         return self.registry.lookup(Path(path))
 
     def _end(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._expire_stale_attachments()
         active = self._resolve_active(payload)
         if active is None:
             session_id = payload.get("session_id")

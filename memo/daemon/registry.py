@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ class Attachment:
     accepted_sequence: int
     attached_utc: str
     detached_utc: str | None = None
+    last_seen_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -83,8 +85,16 @@ class Registry:
             "CREATE TABLE IF NOT EXISTS attachments ("
             "terminal_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, "
             "accepted_sequence INTEGER NOT NULL DEFAULT 0, attached_utc TEXT NOT NULL, "
-            "detached_utc TEXT, FOREIGN KEY(session_id) REFERENCES active_sessions(session_id))"
+            "detached_utc TEXT, last_seen_ns INTEGER NOT NULL DEFAULT 0, "
+            "FOREIGN KEY(session_id) REFERENCES active_sessions(session_id))"
         )
+        columns = {
+            str(row[1]) for row in self.connection.execute("PRAGMA table_info(attachments)")
+        }
+        if "last_seen_ns" not in columns:
+            self.connection.execute(
+                "ALTER TABLE attachments ADD COLUMN last_seen_ns INTEGER NOT NULL DEFAULT 0"
+            )
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS capture_windows ("
             "session_id TEXT NOT NULL, harness TEXT NOT NULL, cwd TEXT NOT NULL, "
@@ -173,7 +183,14 @@ class Registry:
     def allocate_attachment(
         self, session_id: str, attached_utc: str, terminal_id: str | None = None
     ) -> Attachment:
-        attachment = Attachment(terminal_id or uuid.uuid4().hex, session_id, 0, attached_utc)
+        attachment = Attachment(
+            terminal_id or uuid.uuid4().hex,
+            session_id,
+            0,
+            attached_utc,
+            None,
+            time.time_ns(),
+        )
         with self._lock:
             state = self.connection.execute(
                 "SELECT state FROM active_sessions WHERE session_id = ?", (session_id,)
@@ -183,9 +200,9 @@ class Registry:
             if state[0] != "active":
                 raise RuntimeError(f"recording is {state[0]}: {session_id}")
             self.connection.execute(
-                "INSERT INTO attachments(terminal_id, session_id, accepted_sequence, attached_utc) "
-                "VALUES (?, ?, 0, ?)",
-                (attachment.terminal_id, session_id, attached_utc),
+                "INSERT INTO attachments(terminal_id, session_id, accepted_sequence, attached_utc, last_seen_ns) "
+                "VALUES (?, ?, 0, ?, ?)",
+                (attachment.terminal_id, session_id, attached_utc, attachment.last_seen_ns),
             )
             self.connection.execute(
                 "UPDATE active_sessions SET revision = revision + 1 WHERE session_id = ?",
@@ -196,18 +213,28 @@ class Registry:
     def attachment(self, terminal_id: str) -> Attachment | None:
         with self._lock:
             row = self.connection.execute(
-                "SELECT terminal_id, session_id, accepted_sequence, attached_utc, detached_utc "
+                "SELECT terminal_id, session_id, accepted_sequence, attached_utc, detached_utc, last_seen_ns "
                 "FROM attachments WHERE terminal_id = ?",
                 (terminal_id,),
             ).fetchone()
         return Attachment(*row) if row else None
 
-    def accept_sequence(self, terminal_id: str, expected: int, accepted: int) -> None:
+    def touch_attachment(self, terminal_id: str, seen_ns: int) -> None:
+        with self._lock:
+            self.connection.execute(
+                "UPDATE attachments SET last_seen_ns = ? "
+                "WHERE terminal_id = ? AND detached_utc IS NULL",
+                (seen_ns, terminal_id),
+            )
+
+    def accept_sequence(
+        self, terminal_id: str, expected: int, accepted: int, seen_ns: int
+    ) -> None:
         with self._lock:
             cursor = self.connection.execute(
-                "UPDATE attachments SET accepted_sequence = ? "
+                "UPDATE attachments SET accepted_sequence = ?, last_seen_ns = ? "
                 "WHERE terminal_id = ? AND accepted_sequence = ? AND detached_utc IS NULL",
-                (accepted, terminal_id, expected),
+                (accepted, seen_ns, terminal_id, expected),
             )
             if cursor.rowcount != 1:
                 current = self.attachment(terminal_id)
@@ -239,6 +266,27 @@ class Registry:
             )
         return [row[0] for row in rows]
 
+    def expire_stale_attachments(
+        self, cutoff_seen_ns: int, detached_utc: str
+    ) -> list[str]:
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT terminal_id, session_id FROM attachments "
+                "WHERE detached_utc IS NULL AND last_seen_ns > 0 AND last_seen_ns < ?",
+                (cutoff_seen_ns,),
+            ).fetchall()
+            self.connection.execute(
+                "UPDATE attachments SET detached_utc = ? "
+                "WHERE detached_utc IS NULL AND last_seen_ns > 0 AND last_seen_ns < ?",
+                (detached_utc, cutoff_seen_ns),
+            )
+            for _terminal_id, session_id in rows:
+                self.connection.execute(
+                    "UPDATE active_sessions SET revision = revision + 1 WHERE session_id = ?",
+                    (session_id,),
+                )
+        return [row[0] for row in rows]
+
     def detach(self, terminal_id: str, detached_utc: str) -> None:
         with self._lock:
             cursor = self.connection.execute(
@@ -258,7 +306,7 @@ class Registry:
     def list_attachments(self, session_id: str) -> list[Attachment]:
         with self._lock:
             rows = self.connection.execute(
-                "SELECT terminal_id, session_id, accepted_sequence, attached_utc, detached_utc "
+                "SELECT terminal_id, session_id, accepted_sequence, attached_utc, detached_utc, last_seen_ns "
                 "FROM attachments WHERE session_id = ? ORDER BY terminal_id",
                 (session_id,),
             ).fetchall()

@@ -1,3 +1,4 @@
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -5,6 +6,7 @@ import pytest
 
 from memo.cli.commands.status import _age, _format_size, _session_size, render_status
 from memo.daemon.registry import Registry
+from memo.daemon.server import TERMINAL_STALE_SECONDS
 from memo.recording.filesystem import atomic_write
 from memo.recording.metadata import DirectorySession, SessionOrigin
 from memo.recording.paths import StoragePaths
@@ -190,6 +192,38 @@ def test_status_can_filter_active_recordings(tmp_path: Path, monkeypatch) -> Non
 
     assert "active" in output
     assert "complete" not in output
+
+
+def test_status_marks_stale_terminals_inactive(tmp_path: Path, monkeypatch) -> None:
+    now = datetime(2026, 8, 15, 20, 0, tzinfo=UTC)
+    paths = _paths(tmp_path / "memo-home")
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(paths)
+    session = DirectorySession(
+        "session",
+        str(root.resolve()),
+        now.isoformat(),
+        now.isoformat(),
+        SessionOrigin("1.0.0", "user", "host"),
+        "active",
+    )
+    store.create(session)
+    StepPublisher(store).publish(session)
+    with Registry(paths.registry) as registry:
+        registry.create(root, session.created_utc, session.session_id)
+        attachment = registry.allocate_attachment(session.session_id, session.created_utc, "terminal")
+        registry.touch_attachment(
+            attachment.terminal_id,
+            time.time_ns() - int((TERMINAL_STALE_SECONDS + 1) * 1_000_000_000),
+        )
+    monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
+
+    summary = render_status(paths, now=now).splitlines()[1]
+    detail = render_status(paths, now=now, session_id="session")
+
+    assert "  0  " in summary
+    assert "terminal: stale" in detail
 
 
 def test_single_status_rejects_list_only_options(tmp_path: Path) -> None:

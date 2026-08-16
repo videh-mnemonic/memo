@@ -222,6 +222,10 @@ without uploading or removing anything.
 - VS Code, terminal, or shell restarts do not complete a recording by
   themselves. Re-enter the directory with `memo` to resume, or run `memo end`
   when the work should be finalized.
+- If a terminal exits cleanly, Memo detaches it. If a terminal or VS Code dies
+  without detaching while the daemon stays alive, Memo treats that terminal as
+  stale after about five minutes. Starting `memo` in that directory will then
+  offer to resume the existing recording or complete it and start a new one.
 - Each step contains a directory snapshot, terminal-stream high-water marks,
   and references to captured agent runs. `HEAD` points only to a completely
   published step.

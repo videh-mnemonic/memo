@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from memo.daemon.protocol import request
-from memo.daemon.server import MemoDaemon
+from memo.daemon.server import TERMINAL_STALE_SECONDS, MemoDaemon
 from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore
 
@@ -53,6 +53,25 @@ def test_zero_terminal_recording_keeps_publishing(tmp_path: Path) -> None:
         ).read_text() == "second"
         decision = request(str(paths.socket), "attach", {"path": str(root)})
         assert decision["decision_required"] is True
+    finally:
+        _stop(paths, thread)
+
+
+def test_stale_terminal_attachment_prompts_on_next_attach(tmp_path: Path) -> None:
+    paths, root, daemon, thread = _running(tmp_path)
+    try:
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        stale_seen = time.time_ns() - int((TERMINAL_STALE_SECONDS + 1) * 1_000_000_000)
+        assert daemon.registry.attachment(attached["terminal_id"]).last_seen_ns > 0
+        daemon.registry.touch_attachment(attached["terminal_id"], stale_seen)
+
+        decision = request(str(paths.socket), "attach", {"path": str(root)})
+
+        assert decision["decision_required"] is True
+        assert decision["session_id"] == attached["session_id"]
+        attachment = daemon.registry.attachment(attached["terminal_id"])
+        assert attachment is not None
+        assert attachment.detached_utc is not None
     finally:
         _stop(paths, thread)
 

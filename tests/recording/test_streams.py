@@ -124,10 +124,10 @@ def test_end_drain_waits_for_admitted_event_acknowledgement(tmp_path: Path, monk
     release_ack = threading.Event()
     original = registry.accept_sequence
 
-    def paused_ack(terminal: str, expected: int, accepted: int) -> None:
+    def paused_ack(terminal: str, expected: int, accepted: int, seen_ns: int) -> None:
         reached_ack.set()
         assert release_ack.wait(2)
-        original(terminal, expected, accepted)
+        original(terminal, expected, accepted, seen_ns)
 
     monkeypatch.setattr(registry, "accept_sequence", paused_ack)
     append = threading.Thread(

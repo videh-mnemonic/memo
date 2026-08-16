@@ -77,6 +77,7 @@ class StreamStore:
         if attachment is None or attachment.session_id != session_id:
             raise KeyError(f"unknown terminal attachment: {terminal_id}")
         if not values:
+            self.registry.touch_attachment(terminal_id, receipt_ns)
             return attachment.accepted_sequence
         if len(values) > 1024:
             raise ValueError("event batch exceeds backpressure limit")
@@ -111,7 +112,9 @@ class StreamStore:
                     handle.write(self._encode_event(event))
                 handle.flush()
                 os.fsync(handle.fileno())
-            self.registry.accept_sequence(terminal_id, attachment.accepted_sequence, expected)
+            self.registry.accept_sequence(
+                terminal_id, attachment.accepted_sequence, expected, receipt_ns
+            )
             return expected
 
     def drain_and_detach(self, session_id: str, detached_utc: str) -> list[str]:
