@@ -1,8 +1,6 @@
 # Memo
 
-Memo records how work is done. Memo easily records 
-
- Memo records the filesystem, terminal commands, and agent promts / traces in a single package for further analysis.
+Memo records how work is done. Memo records the terminal commands, prompts / instructions, agentic traces, and filesystem diffs in one place. These combined sessions make evaluating AI tooling on real work simple.
 
 ## Installation
 
