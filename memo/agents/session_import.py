@@ -370,7 +370,9 @@ def import_native_sessions(
                     if dry_run:
                         summary.imported.append(candidate.native_id)
                     else:
-                        summary.imported.append(_create(store, candidate, snapshot, boundary, digest))
+                        summary.imported.append(
+                            _create(store, candidate, snapshot, boundary, digest)
+                        )
                         session_ids.add(candidate.native_id)
             except (OSError, ValueError, StopIteration, json.JSONDecodeError) as error:
                 summary.failed.append((label, str(error)))

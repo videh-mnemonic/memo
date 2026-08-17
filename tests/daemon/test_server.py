@@ -311,9 +311,7 @@ def test_agent_and_sandbox_shell_launch_metadata_are_archived(tmp_path: Path) ->
         )
 
         directory = (
-            SessionStore(paths).session_path(str(attached["session_id"]))
-            / "agents"
-            / "launches"
+            SessionStore(paths).session_path(str(attached["session_id"])) / "agents" / "launches"
         )
         agent = json.loads((directory / "agent-launch.json").read_text())
         shell = json.loads((directory / "shell-launch.json").read_text())

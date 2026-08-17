@@ -108,9 +108,7 @@ class Registry:
             "detached_utc TEXT, last_seen_ns INTEGER NOT NULL DEFAULT 0, "
             "FOREIGN KEY(session_id) REFERENCES active_sessions(session_id))"
         )
-        columns = {
-            str(row[1]) for row in self.connection.execute("PRAGMA table_info(attachments)")
-        }
+        columns = {str(row[1]) for row in self.connection.execute("PRAGMA table_info(attachments)")}
         if "last_seen_ns" not in columns:
             self.connection.execute(
                 "ALTER TABLE attachments ADD COLUMN last_seen_ns INTEGER NOT NULL DEFAULT 0"
@@ -270,9 +268,7 @@ class Registry:
                 (seen_ns, terminal_id),
             )
 
-    def accept_sequence(
-        self, terminal_id: str, expected: int, accepted: int, seen_ns: int
-    ) -> None:
+    def accept_sequence(self, terminal_id: str, expected: int, accepted: int, seen_ns: int) -> None:
         with self._lock:
             cursor = self.connection.execute(
                 "UPDATE attachments SET accepted_sequence = ?, last_seen_ns = ? "
@@ -309,9 +305,7 @@ class Registry:
             )
         return [row[0] for row in rows]
 
-    def expire_stale_attachments(
-        self, cutoff_seen_ns: int, detached_utc: str
-    ) -> list[str]:
+    def expire_stale_attachments(self, cutoff_seen_ns: int, detached_utc: str) -> list[str]:
         with self._lock:
             rows = self.connection.execute(
                 "SELECT terminal_id, session_id FROM attachments "
@@ -466,9 +460,7 @@ class Registry:
     def launches(
         self, session_id: str, harness: str | None = None, cwd: str | None = None
     ) -> list[AgentLaunch]:
-        query = (
-            f"SELECT {self._launch_columns()} FROM agent_launches WHERE session_id = ?"
-        )
+        query = f"SELECT {self._launch_columns()} FROM agent_launches WHERE session_id = ?"
         values: list[object] = [session_id]
         if harness is not None:
             query += " AND harness = ?"

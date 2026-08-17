@@ -43,7 +43,9 @@ def configure(subparsers: Any) -> None:
 def run(args: Any) -> int:
     if args.session_id is not None:
         if args.include_archive or args.limit is not None or args.active:
-            raise ValueError("single-session status cannot use --include-archive, --limit, or --active")
+            raise ValueError(
+                "single-session status cannot use --include-archive, --limit, or --active"
+            )
         require_local_session(args.session_id)
     print(
         render_status(

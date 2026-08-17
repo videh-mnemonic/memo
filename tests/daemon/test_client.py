@@ -17,15 +17,17 @@ def test_push_sends_caller_s3_config(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         client,
         "request",
-        lambda socket, operation, payload, timeout=5.0: captured.update(
-            {
-                "socket": socket,
-                "operation": operation,
-                "payload": payload,
-                "timeout": timeout,
-            }
-        )
-        or {"pushed": [], "skipped": [], "failed": []},
+        lambda socket, operation, payload, timeout=5.0: (
+            captured.update(
+                {
+                    "socket": socket,
+                    "operation": operation,
+                    "payload": payload,
+                    "timeout": timeout,
+                }
+            )
+            or {"pushed": [], "skipped": [], "failed": []}
+        ),
     )
 
     client.push("session")
@@ -47,14 +49,16 @@ def test_end_wait_for_push_extends_timeout_and_sends_s3_config(monkeypatch, tmp_
     monkeypatch.setattr(
         client,
         "request",
-        lambda socket, operation, payload, timeout=5.0: captured.update(
-            {
-                "operation": operation,
-                "payload": payload,
-                "timeout": timeout,
-            }
-        )
-        or {"session_id": "session", "step": 1, "already_complete": False},
+        lambda socket, operation, payload, timeout=5.0: (
+            captured.update(
+                {
+                    "operation": operation,
+                    "payload": payload,
+                    "timeout": timeout,
+                }
+            )
+            or {"session_id": "session", "step": 1, "already_complete": False}
+        ),
     )
 
     client.end(session_id="session", wait_for_push=True)

@@ -212,7 +212,9 @@ def test_status_marks_stale_terminals_inactive(tmp_path: Path, monkeypatch) -> N
     StepPublisher(store).publish(session)
     with Registry(paths.registry) as registry:
         registry.create(root, session.created_utc, session.session_id)
-        attachment = registry.allocate_attachment(session.session_id, session.created_utc, "terminal")
+        attachment = registry.allocate_attachment(
+            session.session_id, session.created_utc, "terminal"
+        )
         registry.touch_attachment(
             attachment.terminal_id,
             time.time_ns() - int((TERMINAL_STALE_SECONDS + 1) * 1_000_000_000),

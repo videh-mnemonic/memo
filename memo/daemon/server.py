@@ -476,9 +476,7 @@ class MemoDaemon:
                     ),
                     sandbox_mode=sandbox_mode,
                     sandbox_args=list(sandbox_args),
-                    policy_summary=(
-                        None if policy_summary is None else dict(policy_summary)
-                    ),
+                    policy_summary=(None if policy_summary is None else dict(policy_summary)),
                     policy_digest=policy_digest,
                     guidance_digest=guidance_digest,
                 )
@@ -555,18 +553,14 @@ class MemoDaemon:
         if launch is None:
             raise KeyError(f"unknown sandbox shell launch: {launch_id}")
         with self._session_lock(launch.session_id):
-            completed = self.registry.finish_sandbox_shell_launch(
-                launch_id, ended_utc, exit_code
-            )
+            completed = self.registry.finish_sandbox_shell_launch(launch_id, ended_utc, exit_code)
             self._archive_launch(completed, "sandbox-shell")
             active = self.registry.lookup_session(completed.session_id)
             if active is not None:
                 self._publish(self._session_model(active))
         return {"launch_id": launch_id, "capture": "complete"}
 
-    def _archive_launch(
-        self, launch: AgentLaunch | SandboxShellLaunch, kind: str
-    ) -> None:
+    def _archive_launch(self, launch: AgentLaunch | SandboxShellLaunch, kind: str) -> None:
         directory = self.store.session_path(launch.session_id) / "agents" / "launches"
         directory.mkdir(parents=True, exist_ok=True)
         value = asdict(launch)

@@ -126,7 +126,9 @@ def run(harness_name: str, args: list[str]) -> int:
                 sandbox_args=sandbox_args,
             )
             if sandbox_args:
-                print(f"memo: custom sandbox command: {shlex.join(process_command)}", file=sys.stderr)
+                print(
+                    f"memo: custom sandbox command: {shlex.join(process_command)}", file=sys.stderr
+                )
             process_environment = policy.environment
         except (OSError, ValueError, SandboxUnavailable) as error:
             print(f"memo: sandbox unavailable: {error}", file=sys.stderr)
