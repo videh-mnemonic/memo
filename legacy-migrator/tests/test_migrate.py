@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
-from memo.legacy import migrate_legacy
+from memo_legacy_migrator.cli import main
+from memo_legacy_migrator.migrate import migrate_legacy
+
 from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore
 
@@ -79,3 +82,22 @@ def test_migrate_legacy_scratch_recording(tmp_path: Path) -> None:
     snapshot = store.session_path("legacy-session") / head.snapshot
     assert (snapshot / "note.txt").read_text() == "legacy\n"
     assert not (snapshot / ".git").exists()
+
+
+def test_cli_dry_run_reports_without_writing(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "memo_legacy_migrator.cli.migrate_legacy",
+        lambda *, dry_run: SimpleNamespace(
+            migrated=["legacy-session"] if dry_run else [],
+            skipped=[],
+            failed=[],
+        ),
+    )
+
+    assert main(["--dry-run"]) == 0
+    assert capsys.readouterr().out == (
+        "would migrate: 1\n"
+        "skipped: 0\n"
+        "failed: 0\n"
+        "would migrate: legacy-session\n"
+    )

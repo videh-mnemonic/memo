@@ -14,6 +14,7 @@ def test_removed_public_commands_are_not_registered() -> None:
     assert "claude" not in choices
     assert "codex" not in choices
     assert "inspect" not in choices
+    assert "migrate-legacy" not in choices
 
 
 def test_default_and_path_invocations_launch_generic_relay(monkeypatch, tmp_path: Path) -> None:

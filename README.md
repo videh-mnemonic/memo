@@ -134,21 +134,9 @@ sessions without writing recordings.
 
 ### Migrate old Memo recordings
 
-```console
-memo migrate-legacy
-memo migrate-legacy --dry-run
-```
-
-Migrates complete recordings written by the older pre-daemon Memo prototype from
-the old `$MEMO_HOME/scratch` and old tarball archive layout into the current
-recording store. Legacy source directories and tarballs are left in place.
-
-The migrator is conservative: it converts recordings with enough Git artifacts
-to reconstruct a final filesystem snapshot, preserves copied Claude/Codex
-JSONL traces as agent run sidecars, skips sessions that already exist in the
-new store, and reports incomplete or unsupported legacy recordings. It is a
-final-state migration: old per-leg Git history is not expanded into separate
-new-format steps.
+Recordings written by the pre-daemon Memo prototype require the separately
+installed [Memo legacy migrator](legacy-migrator/README.md). The one-time utility
+is not included in the main Memo package or CLI.
 
 ### Push recordings
 
@@ -262,12 +250,10 @@ agent-only recordings, uploads recordings, and removes only safely archived
 completed local copies. Use `memo import` instead if you want to import traces
 without uploading or removing anything.
 
-For a cautious first migration from older local data, preview before writing:
+To import existing native agent sessions cautiously, preview before writing:
 
 ```console
-memo migrate-legacy --dry-run
 memo import --dry-run
-memo migrate-legacy
 memo import
 memo tidy
 memo status --include-archive

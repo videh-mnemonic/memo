@@ -12,11 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .agents.run_metadata import AgentRunMetadata
-from .recording.metadata import DirectorySession, SessionOrigin, StepManifest
-from .recording.paths import StoragePaths
-from .recording.snapshots import scan_tree, utcnow
-from .recording.store import SessionStore, validate_session_id
+from memo.agents.run_metadata import AgentRunMetadata
+from memo.recording.metadata import DirectorySession, SessionOrigin, StepManifest
+from memo.recording.paths import StoragePaths
+from memo.recording.snapshots import scan_tree, utcnow
+from memo.recording.store import SessionStore, validate_session_id
 
 
 @dataclass
