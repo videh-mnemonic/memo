@@ -77,6 +77,8 @@ class IgnorePolicy:
         return result
 
     def decision(self, path: Path, is_dir: bool = False) -> IgnoreDecision:
+        if path.absolute() == self.root / ".memo-sandbox":
+            return IgnoreDecision(True, "memo-control")
         absolute = path.resolve(strict=False)
         for excluded in self._excluded:
             if absolute == excluded or absolute.is_relative_to(excluded):

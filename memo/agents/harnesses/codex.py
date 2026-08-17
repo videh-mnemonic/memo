@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,8 @@ class CodexHarness(AgentHarness):
     executable = "codex"
 
     def default_trace_roots(self) -> tuple[Path, ...]:
-        return (Path.home() / ".codex" / "sessions",)
+        home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+        return (home / "sessions",)
 
     def parse_resume(self, args: Sequence[str]) -> str | None:
         flagged = flag_resume(args)

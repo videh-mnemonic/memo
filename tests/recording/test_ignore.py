@@ -60,3 +60,13 @@ def test_memo_storage_is_excluded_when_nested_in_recording(tmp_path: Path) -> No
     assert policy.decision(home / "archive", is_dir=True).ignored
     assert policy.decision(home / "runtime", is_dir=True).ignored
     assert not policy.decision(root / "notes.txt").ignored
+
+
+def test_root_sandbox_policy_is_memo_control_state(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    policy = IgnorePolicy(root)
+
+    decision = policy.decision(root / ".memo-sandbox")
+    assert decision.ignored
+    assert decision.source == "memo-control"

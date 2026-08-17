@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import sys
 import threading
 import time
 from contextlib import suppress
+from dataclasses import asdict
 from multiprocessing.connection import Client, Connection, Listener
 from pathlib import Path
 from typing import IO, Any
@@ -15,6 +17,7 @@ from typing import IO, Any
 from ..agents.harnesses import get_harness
 from ..agents.ingestion import TraceIngester
 from ..agents.trace_files import capture
+from ..recording.filesystem import atomic_write
 from ..recording.metadata import DirectorySession, SessionOrigin
 from ..recording.paths import StoragePaths
 from ..recording.snapshots import StepPublisher, utcnow
@@ -28,7 +31,7 @@ from .protocol import (
     receive_request,
     send_message,
 )
-from .registry import ActiveSession, AgentLaunch, Registry
+from .registry import ActiveSession, AgentLaunch, Registry, SandboxShellLaunch
 
 STEP_INTERVAL_SECONDS = 15.0
 WATCHER_DEBOUNCE_SECONDS = 0.25
@@ -411,6 +414,12 @@ class MemoDaemon:
             launch_id = str(payload["launch_id"])
             cwd = Path(payload["cwd"]).expanduser().resolve(strict=True)
             command = payload["command"]
+            effective_command = payload.get("effective_command")
+            sandbox_mode = payload.get("sandbox_mode")
+            sandbox_args = payload.get("sandbox_args", [])
+            policy_summary = payload.get("policy_summary")
+            policy_digest = payload.get("policy_digest")
+            guidance_digest = payload.get("guidance_digest")
             started_utc = str(payload["started_utc"])
         except (KeyError, TypeError, OSError) as error:
             raise ProtocolError("invalid agent launch") from error
@@ -418,6 +427,19 @@ class MemoDaemon:
             not cwd.is_dir()
             or not isinstance(command, list)
             or not all(isinstance(value, str) for value in command)
+            or (
+                effective_command is not None
+                and (
+                    not isinstance(effective_command, list)
+                    or not all(isinstance(value, str) for value in effective_command)
+                )
+            )
+            or sandbox_mode not in {None, "sandbox", "custom", "no-sandbox"}
+            or not isinstance(sandbox_args, list)
+            or not all(isinstance(value, str) for value in sandbox_args)
+            or (policy_summary is not None and not isinstance(policy_summary, dict))
+            or (policy_digest is not None and not isinstance(policy_digest, str))
+            or (guidance_digest is not None and not isinstance(guidance_digest, str))
         ):
             raise ProtocolError("invalid agent launch")
         harness = get_harness(harness_name)
@@ -442,15 +464,28 @@ class MemoDaemon:
                 self.registry.create_window(session_id, harness_name, str(cwd), checkpoint)
             self.registry.add_launch(
                 AgentLaunch(
-                    launch_id,
-                    session_id,
-                    terminal_id,
-                    harness_name,
-                    str(cwd),
-                    list(command),
-                    started_utc,
+                    launch_id=launch_id,
+                    session_id=session_id,
+                    terminal_id=terminal_id,
+                    harness=harness_name,
+                    cwd=str(cwd),
+                    command=list(command),
+                    started_utc=started_utc,
+                    effective_command=(
+                        None if effective_command is None else list(effective_command)
+                    ),
+                    sandbox_mode=sandbox_mode,
+                    sandbox_args=list(sandbox_args),
+                    policy_summary=(
+                        None if policy_summary is None else dict(policy_summary)
+                    ),
+                    policy_digest=policy_digest,
+                    guidance_digest=guidance_digest,
                 )
             )
+            stored = self.registry.launch(launch_id)
+            assert stored is not None
+            self._archive_launch(stored, "agent")
         return {"launch_id": launch_id, "capture": "active"}
 
     def _agent_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -465,10 +500,81 @@ class MemoDaemon:
             raise KeyError(f"unknown agent launch: {launch_id}")
         with self._session_lock(launch.session_id):
             completed = self.registry.finish_launch(launch_id, ended_utc, exit_code)
+            self._archive_launch(completed, "agent")
             active = self.registry.lookup_session(completed.session_id)
             if active is not None:
                 self._publish(self._session_model(active))
         return {"launch_id": launch_id, "capture": "complete"}
+
+    def _sandbox_shell_launch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            command = payload["command"]
+            policy_summary = payload["policy_summary"]
+            launch = SandboxShellLaunch(
+                launch_id=str(payload["launch_id"]),
+                session_id=str(payload["session_id"]),
+                terminal_id=str(payload["terminal_id"]),
+                cwd=str(Path(payload["cwd"]).expanduser().resolve(strict=True)),
+                command=list(command),
+                started_utc=str(payload["started_utc"]),
+                policy_summary=dict(policy_summary),
+                policy_digest=str(payload["policy_digest"]),
+            )
+        except (KeyError, TypeError, OSError) as error:
+            raise ProtocolError("invalid sandbox shell launch") from error
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(value, str) for value in command)
+            or not isinstance(policy_summary, dict)
+        ):
+            raise ProtocolError("invalid sandbox shell launch")
+        active = self.registry.lookup_session(launch.session_id)
+        attachment = self.registry.attachment(launch.terminal_id)
+        if active is None or active.state != "active":
+            raise RuntimeError(f"recording is not active: {launch.session_id}")
+        if (
+            attachment is None
+            or attachment.session_id != launch.session_id
+            or attachment.detached_utc is not None
+        ):
+            raise RuntimeError(f"terminal is not attached to recording: {launch.terminal_id}")
+        with self._session_lock(launch.session_id):
+            self.registry.add_sandbox_shell_launch(launch)
+            self._archive_launch(launch, "sandbox-shell")
+        return {"launch_id": launch.launch_id, "capture": "active"}
+
+    def _sandbox_shell_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            launch_id = str(payload["launch_id"])
+            ended_utc = str(payload["ended_utc"])
+            exit_code = int(payload["exit_code"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ProtocolError("invalid sandbox shell completion") from error
+        launch = self.registry.sandbox_shell_launch(launch_id)
+        if launch is None:
+            raise KeyError(f"unknown sandbox shell launch: {launch_id}")
+        with self._session_lock(launch.session_id):
+            completed = self.registry.finish_sandbox_shell_launch(
+                launch_id, ended_utc, exit_code
+            )
+            self._archive_launch(completed, "sandbox-shell")
+            active = self.registry.lookup_session(completed.session_id)
+            if active is not None:
+                self._publish(self._session_model(active))
+        return {"launch_id": launch_id, "capture": "complete"}
+
+    def _archive_launch(
+        self, launch: AgentLaunch | SandboxShellLaunch, kind: str
+    ) -> None:
+        directory = self.store.session_path(launch.session_id) / "agents" / "launches"
+        directory.mkdir(parents=True, exist_ok=True)
+        value = asdict(launch)
+        value["kind"] = kind
+        atomic_write(
+            directory / f"{launch.launch_id}.json",
+            (json.dumps(value, indent=2, sort_keys=True) + "\n").encode(),
+        )
 
     def _push(self, payload: dict[str, Any]) -> dict[str, Any]:
         from ..transport import PushSummary, prepare_generation, publish_generation
@@ -593,6 +699,10 @@ class MemoDaemon:
             return self._agent_launch(message.payload)
         if message.operation == "agent_complete":
             return self._agent_complete(message.payload)
+        if message.operation == "sandbox_shell_launch":
+            return self._sandbox_shell_launch(message.payload)
+        if message.operation == "sandbox_shell_complete":
+            return self._sandbox_shell_complete(message.payload)
         if message.operation == "shutdown":
             self._stop.set()
             try:

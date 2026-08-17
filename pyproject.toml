@@ -29,6 +29,9 @@ memo-daemon = "memo.daemon.server:main"
 [tool.setuptools.packages.find]
 include = ["memo*"]
 
+[tool.setuptools.package-data]
+"memo.agents.sandbox" = ["defaults.toml", "agent-guidance.md"]
+
 [tool.setuptools.dynamic]
 version = {attr = "memo.__version__"}
 

@@ -193,10 +193,12 @@ def _render_session_detail(
         with Registry(paths.registry) as registry:
             attachments = registry.list_attachments(session.session_id)
             launches = registry.launches(session.session_id)
+            sandbox_shells = registry.sandbox_shell_launches(session.session_id)
             windows = registry.windows(session.session_id)
     else:
         attachments = []
         launches = []
+        sandbox_shells = []
         windows = []
     lines.append("")
     lines.append("Terminals:")
@@ -222,14 +224,27 @@ def _render_session_detail(
     if launches:
         for launch in launches:
             status = "running" if launch.ended_utc is None else f"exit={launch.exit_code}"
+            mode = launch.sandbox_mode or "legacy"
             lines.append(
-                f"  launch {launch.launch_id}: {launch.harness}, {status}, cwd={launch.cwd}"
+                f"  launch {launch.launch_id}: {launch.harness}, {mode}, {status}, cwd={launch.cwd}"
             )
     elif windows:
         for window in windows:
             lines.append(f"  watching {window.harness}: cwd={window.cwd}")
     else:
         lines.append("  (none active)")
+
+    lines.append("")
+    lines.append("Sandbox shells:")
+    if sandbox_shells:
+        for launch in sandbox_shells:
+            status = "running" if launch.ended_utc is None else f"exit={launch.exit_code}"
+            lines.append(
+                f"  {launch.launch_id}: {status}, cwd={launch.cwd}, "
+                f"policy={launch.policy_digest[:12]}"
+            )
+    else:
+        lines.append("  (none)")
 
     lines.append("")
     lines.append("Recorded agent runs:")

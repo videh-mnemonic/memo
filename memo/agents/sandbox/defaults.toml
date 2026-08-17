@@ -1,0 +1,42 @@
+network = true
+gpu = true
+
+[home]
+read_write_if_present = [".cache", ".triton", ".nv"]
+
+[system]
+read_only = ["/usr"]
+read_only_if_present = [
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/ld.so.cache",
+    "/etc/localtime",
+    "/etc/gitconfig",
+    "/etc/ssl/certs",
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+]
+
+[environment]
+inherit = "all"
+exclude = [
+    "*_API_KEY",
+    "*_ACCESS_KEY",
+    "*_SECRET",
+    "*_TOKEN",
+    "*_PASSWORD",
+    "*_CREDENTIALS",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "DATABASE_URL",
+    "KUBECONFIG",
+    "SSH_AUTH_SOCK",
+    "GPG_AGENT_INFO",
+    "DOCKER_HOST",
+    "MEMO_*",
+]

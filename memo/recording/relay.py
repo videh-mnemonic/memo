@@ -78,6 +78,7 @@ def run(
         environment["MEMO_SESSION_ID"] = session_id
         environment["MEMO_TERMINAL_ID"] = terminal_id
         environment["MEMO_SHIM_DIR"] = str(shim_directory)
+        environment["MEMO_RECORDING_ROOT"] = str(Path(allocation["root"]).resolve())
         environment["PATH"] = str(shim_directory) + os.pathsep + environment.get("PATH", "")
         os.execve(executable, [executable], environment)
     sequence = int(allocation["accepted_sequence"])

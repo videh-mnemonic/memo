@@ -265,6 +265,68 @@ def test_end_scope_is_selected_before_completion(tmp_path: Path) -> None:
         _stop(paths, thread)
 
 
+def test_agent_and_sandbox_shell_launch_metadata_are_archived(tmp_path: Path) -> None:
+    paths, root, daemon, thread = _running(tmp_path)
+    try:
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        common = {
+            "session_id": attached["session_id"],
+            "terminal_id": attached["terminal_id"],
+            "cwd": str(root),
+            "started_utc": "start",
+            "policy_summary": {"root": str(root), "environment_inherited": ["PATH"]},
+            "policy_digest": "a" * 64,
+        }
+        request(
+            str(paths.socket),
+            "agent_launch",
+            {
+                **common,
+                "launch_id": "agent-launch",
+                "harness": "codex",
+                "command": ["codex"],
+                "effective_command": [
+                    "codex",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ],
+                "sandbox_mode": "sandbox",
+                "sandbox_args": [],
+                "guidance_digest": "b" * 64,
+            },
+        )
+        request(
+            str(paths.socket),
+            "agent_complete",
+            {"launch_id": "agent-launch", "ended_utc": "end", "exit_code": 0},
+        )
+        request(
+            str(paths.socket),
+            "sandbox_shell_launch",
+            {**common, "launch_id": "shell-launch", "command": ["/bin/sh"]},
+        )
+        request(
+            str(paths.socket),
+            "sandbox_shell_complete",
+            {"launch_id": "shell-launch", "ended_utc": "end", "exit_code": 7},
+        )
+
+        directory = (
+            SessionStore(paths).session_path(str(attached["session_id"]))
+            / "agents"
+            / "launches"
+        )
+        agent = json.loads((directory / "agent-launch.json").read_text())
+        shell = json.loads((directory / "shell-launch.json").read_text())
+        assert agent["kind"] == "agent"
+        assert agent["sandbox_mode"] == "sandbox"
+        assert agent["exit_code"] == 0
+        assert shell["kind"] == "sandbox-shell"
+        assert shell["exit_code"] == 7
+        assert daemon.registry.sandbox_shell_launch("shell-launch").exit_code == 7
+    finally:
+        _stop(paths, thread)
+
+
 def test_resume_replace_and_stale_decisions(tmp_path: Path) -> None:
     paths, root, _, thread = _running(tmp_path)
     try:

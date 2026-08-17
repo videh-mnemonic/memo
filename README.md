@@ -50,6 +50,70 @@ can be omitted even after changing directories.
 Without `--scope`, an interactive invocation asks. Memo also asks before ending
 a recording that still has other attached shells.
 
+### Agent sandboxing
+
+Inside a Memo shell, ordinary `claude` and `codex` commands are automatically
+linked to the recording and launched through a Bubblewrap sandbox. Memo adds
+the provider's externally-sandboxed dangerous-mode flag so the provider does
+not ask for redundant filesystem approvals. Provider arguments otherwise stay
+in their normal order.
+
+Bubblewrap is a Linux system dependency. Memo never installs it implicitly or
+invokes `sudo`. Install it with the system package manager, then check the host:
+
+```console
+sudo apt-get install bubblewrap   # Debian and Ubuntu
+memo sandbox setup
+```
+
+Native distribution packages should depend on Bubblewrap directly. Python and
+editable installations instead report an appropriate installation command.
+If Bubblewrap is missing or the kernel blocks the required namespaces, Memo
+fails closed and does not launch the provider unsandboxed.
+
+The default sandbox exposes the recording root read-write, linked-worktree Git
+metadata, read-only system tools, the active provider's native state, existing
+shared `~/.cache`, `~/.triton`, and `~/.nv` directories, and compatible GPUs.
+Other home-directory content—including personal `~/.aws` credentials and
+sibling projects—is hidden. Shared provider state, Git metadata, and caches are
+deliberate cross-recording blast radii; caches are not recorded and can be
+deleted, corrupted, or poisoned by an agent. Missing default cache directories
+are not created on the host and remain ephemeral if created in the sandbox.
+
+The sandbox shares the host network by default. It can reach localhost
+services, internal and VPN networks, cloud metadata endpoints, and services
+authenticated by network location. Filtering credential environment variables
+does not prevent these network-side effects. Disable networking for one launch
+with:
+
+```console
+codex --sandbox-args --unshare-net
+```
+
+Root-persistent permissions live in `.memo-sandbox`, which should be ignored by
+Git and is excluded from Memo filesystem snapshots and replay. Manage it with:
+
+```console
+memo sandbox show
+memo sandbox allow --read ~/Documents/datasets
+memo sandbox allow --read-write ~/Documents/shared-output
+memo sandbox allow --read ~/.aws/project.credentials --at ~/.aws/credentials
+memo sandbox disallow ~/.aws/credentials
+memo sandbox reset
+```
+
+Permission changes affect the next agent launch or resume. A sandboxed provider
+or debugging shell must start inside the recording root; Memo never mounts a
+different current directory automatically. To inspect the same base sandbox
+without starting a provider, run `memo sandbox shell`. Its terminal activity,
+filesystem changes, policy digest, and exit status remain part of the Memo
+recording.
+
+Use `claude --no-sandbox ...` or `codex --no-sandbox ...` for an explicit
+one-invocation bypass. The invocation remains terminal- and trace-recorded, but
+Memo does not add the dangerous-mode flag and the provider receives normal host
+filesystem and environment access.
+
 ### List recordings
 
 ```console

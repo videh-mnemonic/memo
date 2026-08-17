@@ -320,6 +320,9 @@ def test_package_is_deterministic_and_contains_complete_history(tmp_path: Path) 
     root = tmp_path / "work"
     root.mkdir()
     store, session = _published(_paths(tmp_path / "home"), root)
+    launches = store.session_path(session.session_id) / "agents" / "launches"
+    launches.mkdir()
+    (launches / "launch.json").write_text('{"kind":"sandbox-shell"}\n')
     first = prepare_generation(store, session)
     second = prepare_generation(store, session)
     try:
@@ -341,6 +344,7 @@ def test_package_is_deterministic_and_contains_complete_history(tmp_path: Path) 
         "streams/terminals/terminal/chunks/events.jsonl.gz",
         "agents/runs/run.json",
         "agents/traces/run.jsonl",
+        "agents/launches/launch.json",
     }.issubset(names)
 
 

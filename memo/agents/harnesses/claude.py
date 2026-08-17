@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,8 @@ class ClaudeHarness(AgentHarness):
     executable = "claude"
 
     def default_trace_roots(self) -> tuple[Path, ...]:
-        return (Path.home() / ".claude" / "projects",)
+        home = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+        return (home / "projects",)
 
     def parse_resume(self, args: Sequence[str]) -> str | None:
         return flag_resume(args)

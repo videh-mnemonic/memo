@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from memo.agents.ingestion import TraceIngester
-from memo.agents.shim import ensure_shims
+from memo.agents.shim import _memo_arguments, ensure_shims
 from memo.agents.shim import run as run_shim
 from memo.agents.trace_files import TraceCheckpoint, capture, changed, snapshot_complete
 from memo.daemon.registry import AgentLaunch, Registry
@@ -192,7 +194,62 @@ def test_shim_notifies_around_real_process_and_preserves_status(
         lambda _socket, operation, payload, **_kwargs: messages.append((operation, payload)) or {},
     )
 
-    assert run_shim("claude", ["--model", "test"]) == 7
+    assert run_shim("claude", ["--no-sandbox", "--model", "test"]) == 7
     assert [operation for operation, _ in messages] == ["agent_launch", "agent_complete"]
     assert messages[0][1]["command"] == ["claude", "--model", "test"]
+    assert messages[0][1]["sandbox_mode"] == "no-sandbox"
     assert messages[1][1]["exit_code"] == 7
+
+
+def test_shim_sandboxes_by_default_and_injects_provider_arguments(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = StoragePaths(tmp_path / "home")
+    shim_directory = ensure_shims(paths)
+    root = tmp_path / "project"
+    binaries = root / "bin"
+    binaries.mkdir(parents=True)
+    real = binaries / "claude"
+    real.write_text("#!/bin/sh\nexit 7\n")
+    real.chmod(0o700)
+    messages = []
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("PATH", f"{shim_directory}:{binaries}:/usr/bin")
+    monkeypatch.setenv("MEMO_SHIM_DIR", str(shim_directory))
+    monkeypatch.setenv("MEMO_SESSION_ID", "session")
+    monkeypatch.setenv("MEMO_TERMINAL_ID", "terminal")
+    monkeypatch.setenv("MEMO_RECORDING_ROOT", str(root))
+    monkeypatch.setattr("memo.agents.shim.StoragePaths.discover", lambda: paths)
+    monkeypatch.setattr("memo.agents.shim.self_test", lambda _paths: {})
+    monkeypatch.setattr(
+        "memo.agents.shim.build_command",
+        lambda _policy, target, **_kwargs: target,
+    )
+    monkeypatch.setattr("memo.agents.shim.ensure_daemon", lambda _: None)
+    monkeypatch.setattr(
+        "memo.agents.shim.request",
+        lambda _socket, operation, payload, **_kwargs: messages.append((operation, payload)) or {},
+    )
+
+    assert run_shim("claude", ["--model", "test"]) == 7
+    launch = messages[0][1]
+    assert launch["sandbox_mode"] == "sandbox"
+    assert launch["command"] == ["claude", "--model", "test"]
+    assert "--dangerously-skip-permissions" in launch["effective_command"]
+    assert launch["policy_digest"]
+    assert launch["guidance_digest"]
+
+
+def test_memo_argument_boundary_is_deterministic() -> None:
+    assert _memo_arguments(["resume", "id", "--sandbox-args", "--unshare-net"]) == (
+        ["resume", "id"],
+        False,
+        ["--unshare-net"],
+    )
+    assert _memo_arguments(["--no-sandbox", "--", "--no-sandbox"]) == (
+        ["--", "--no-sandbox"],
+        True,
+        [],
+    )
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _memo_arguments(["--sandbox-args", "--no-sandbox"])

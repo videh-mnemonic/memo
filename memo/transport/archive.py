@@ -211,6 +211,9 @@ def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Pa
         paths.append(metadata)
         run = AgentRunMetadata.load(metadata)
         paths.append(session_path / "agents" / "traces" / run.trace_file)
+    launch_root = session_path / "agents" / "launches"
+    if launch_root.is_dir():
+        paths.extend([session_path / "agents", launch_root, *launch_root.glob("*.json")])
     return sorted(
         {path for path in paths if path.exists()},
         key=lambda item: item.relative_to(session_path).as_posix(),

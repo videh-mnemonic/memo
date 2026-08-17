@@ -29,3 +29,13 @@ def test_resume_contract() -> None:
     assert codex.parse_resume(["resume", "session"]) == "session"
     assert claude.identify_session([], Path("claude-session.jsonl")) == "claude-session"
     assert codex.identify_session([], Path("codex-session.jsonl")) == "codex-session"
+
+
+def test_custom_provider_state_controls_trace_roots(tmp_path: Path, monkeypatch) -> None:
+    codex_home = tmp_path / "codex"
+    claude_home = tmp_path / "claude"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+
+    assert get_harness("codex").default_trace_roots() == (codex_home / "sessions",)
+    assert get_harness("claude").default_trace_roots() == (claude_home / "projects",)
