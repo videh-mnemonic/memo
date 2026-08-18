@@ -209,6 +209,7 @@ def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Pa
     ]
     if any(manifest.snapshot_commit for manifest in manifests):
         paths.append(session_path / "snapshots.git")
+        paths.extend((session_path / "snapshots.git").rglob("*"))
     for manifest in manifests:
         paths.append(session_path / "steps" / f"{manifest.step}.json")
         if not manifest.snapshot_commit:

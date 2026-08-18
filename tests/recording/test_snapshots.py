@@ -1,6 +1,10 @@
 import os
+import subprocess
 from pathlib import Path
 
+import pytest
+
+from memo.recording.git_snapshots import GitSnapshotError, GitSnapshotStore
 from memo.recording.metadata import DirectorySession, SessionOrigin
 from memo.recording.paths import StoragePaths
 from memo.recording.snapshots import StepPublisher, scan_tree
@@ -95,3 +99,29 @@ def test_step_publisher_uses_git_commits_and_restores_files(tmp_path: Path) -> N
     store.restore_manifest("session", second, restored)
     assert (restored / "unchanged.txt").read_text() == "same"
     assert (restored / "changed.txt").read_text() == "two"
+
+    repository = store.session_path("session") / "snapshots.git"
+    first_blob = subprocess.run(
+        ["git", "--git-dir", str(repository), "ls-tree", first.snapshot_commit, "--", "unchanged.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()[2]
+    second_blob = subprocess.run(
+        ["git", "--git-dir", str(repository), "ls-tree", second.snapshot_commit, "--", "unchanged.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()[2]
+    assert first_blob == second_blob
+
+
+def test_git_restore_rejects_symlink_entries(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    os.symlink("/etc/passwd", tree / "escape")
+    repository = GitSnapshotStore(tmp_path / "snapshots.git")
+    commit = repository.commit(tree, None, "unsafe")
+
+    with pytest.raises(GitSnapshotError, match="unsupported snapshot entry"):
+        repository.restore(commit, tmp_path / "restored")

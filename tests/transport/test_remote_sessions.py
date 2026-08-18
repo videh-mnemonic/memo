@@ -21,6 +21,7 @@ from memo.export import replay_session
 from memo.recording.filesystem import atomic_write
 from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.recording.paths import StoragePaths
+from memo.recording.snapshots import StepPublisher
 from memo.recording.store import SessionStore
 from memo.recording.streams import StreamEvent
 from memo.transport import (
@@ -32,6 +33,7 @@ from memo.transport import (
     push_session,
     remote_sessions,
 )
+from memo.transport.archive import atomic_install_directory, safe_extract_tar_zst_stream
 from memo.transport.config import S3Config
 from memo.transport.s3 import MULTIPART_PART_SIZE
 
@@ -417,6 +419,40 @@ def test_package_is_deterministic_and_contains_complete_history(tmp_path: Path) 
         "agents/traces/run.jsonl",
         "agents/launches/launch.json",
     }.issubset(names)
+
+
+def test_git_snapshot_generation_extracts_and_validates_as_a_session(tmp_path: Path) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "note.txt").write_text("captured")
+    source_paths = _paths(tmp_path / "source-home")
+    source_store = SessionStore(source_paths)
+    session = DirectorySession(
+        "git-session", str(root.resolve()), "now", "now", SessionOrigin("1.0.0", "user", "host")
+    )
+    source_store.create(session)
+    manifest = StepPublisher(source_store).publish(session)
+    prepared = prepare_generation(source_store, session)
+    try:
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        with prepared.path.open("rb") as archive:
+            safe_extract_tar_zst_stream(archive, extracted)
+
+        pulled_paths = _paths(tmp_path / "pulled-home")
+        pulled_paths.archive.mkdir(parents=True)
+        destination = pulled_paths.archive / session.session_id
+        atomic_install_directory(extracted, destination)
+        pulled_store = SessionStore(pulled_paths)
+        pulled_manifest = pulled_store.steps(session.session_id)[-1]
+        restored = tmp_path / "restored"
+        pulled_store.restore_manifest(session.session_id, pulled_manifest, restored)
+    finally:
+        prepared.cleanup()
+
+    assert manifest.snapshot_commit == pulled_manifest.snapshot_commit
+    assert (destination / "snapshots.git" / "HEAD").is_file()
+    assert (restored / "note.txt").read_text() == "captured"
 
 
 def test_push_rejects_large_generation_before_upload(tmp_path: Path, monkeypatch) -> None:

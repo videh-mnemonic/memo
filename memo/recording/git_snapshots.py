@@ -84,9 +84,15 @@ class GitSnapshotStore:
         try:
             with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
                 for member in archive:
+                    if member.issym() or member.islnk() or member.isdev():
+                        raise GitSnapshotError(f"unsupported snapshot entry: {member.name}")
                     target = (destination / member.name).resolve()
                     target.relative_to(destination.resolve())
                     archive.extract(member, destination)
+        except GitSnapshotError:
+            process.kill()
+            process.wait()
+            raise
         except (OSError, tarfile.TarError, ValueError) as error:
             process.kill()
             process.wait()
