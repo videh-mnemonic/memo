@@ -1,0 +1,5 @@
+{"type":"assistant","uuid":"assistant-2","parentUuid":"user-1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"pytest"}}],"usage":{"input_tokens":10,"output_tokens":4}},"version":"claude-v1"}
+{"type":"user","uuid":"result-1","parentUuid":"assistant-2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"2 passed"}]}}
+{"type":"future_claude","schema_version":7,"detail":{"retained":true}}
+["non-object",1]
+not json

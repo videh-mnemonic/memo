@@ -1,0 +1,8 @@
+{"type":"session_meta","version":"codex-v1","payload":{"id":"codex-session","model":"gpt"}}
+{"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"user_message","id":"message-1","message":"run tests"}}
+{"type":"response_item","payload":{"type":"function_call","id":"item-1","parent_id":"message-1","name":"shell","call_id":"call-1","arguments":"{\"cmd\":\"pytest\"}"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":{"exit_code":0,"text":"2 passed"}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":5}}}}
+{"type":"future_codex","schema_version":9,"payload":{"detail":{"retained":true}}}
+null
+{broken

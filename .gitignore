@@ -1,0 +1,10 @@
+.venv/
+*.egg-info/
+build/
+__pycache__/
+.pytest_cache/
+.memo-sandbox
+
+
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/

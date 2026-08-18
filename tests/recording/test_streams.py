@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import base64
+import json
+import threading
+from pathlib import Path
+
+import pytest
+
+from memo.daemon.registry import Registry
+from memo.recording.paths import StoragePaths
+from memo.recording.streams import StreamStore, merged_timeline
+
+
+def _event(sequence: int, data: bytes = b"x") -> dict[str, object]:
+    return {"sequence": sequence, "direction": "output", "data": base64.b64encode(data).decode()}
+
+
+def _store(tmp_path: Path) -> tuple[StreamStore, Registry, str]:
+    home = tmp_path / "home"
+    paths = StoragePaths(home)
+    paths.ensure_storage()
+    registry = Registry(paths.registry)
+    root = tmp_path / "root"
+    root.mkdir()
+    active = registry.create(root, "now", "session")
+    attachment = registry.allocate_attachment(active.session_id, "now", "terminal")
+    return StreamStore(paths, registry), registry, attachment.terminal_id
+
+
+def test_sequence_validation_and_duplicate_rejection(tmp_path: Path) -> None:
+    store, registry, terminal_id = _store(tmp_path)
+    try:
+        assert store.append("session", terminal_id, [_event(1), _event(2)], 10) == 2
+        with pytest.raises(ValueError, match="acknowledged sequence"):
+            store.append("session", terminal_id, [_event(2)], 11)
+        assert [event.sequence for event in store.events("session", terminal_id)] == [1, 2]
+    finally:
+        registry.close()
+
+
+def test_sealing_is_immutable_and_reports_high_water(tmp_path: Path) -> None:
+    store, registry, terminal_id = _store(tmp_path)
+    try:
+        session = tmp_path / "home" / "archive" / "session"
+        (session / "streams" / "terminals").mkdir(parents=True)
+        store.append("session", terminal_id, [_event(1, b"one")], 10)
+        assert store.seal_session("session") == {terminal_id: 1}
+        first = next((session / "streams" / "terminals" / terminal_id / "chunks").iterdir())
+        first_bytes = first.read_bytes()
+        store.append("session", terminal_id, [_event(2, b"two")], 20)
+        assert store.seal_session("session") == {terminal_id: 2}
+        assert first.read_bytes() == first_bytes
+        metadata = json.loads((first.parent.parent / "stream.json").read_text())
+        assert metadata["highest_sequence"] == 2
+        assert len(metadata["chunks"]) == 2
+    finally:
+        registry.close()
+
+
+def test_sealing_refreshes_sequence_after_concurrent_append(tmp_path: Path, monkeypatch) -> None:
+    store, registry, terminal_id = _store(tmp_path)
+    try:
+        session = tmp_path / "home" / "archive" / "session"
+        (session / "streams" / "terminals").mkdir(parents=True)
+        store.append("session", terminal_id, [_event(1, b"one")], 10)
+
+        listed = threading.Event()
+        continue_sealing = threading.Event()
+        original = registry.list_attachments
+
+        def paused_list(session_id: str):
+            attachments = original(session_id)
+            listed.set()
+            assert continue_sealing.wait(2)
+            return attachments
+
+        monkeypatch.setattr(registry, "list_attachments", paused_list)
+        result: dict[str, int] = {}
+
+        def seal() -> None:
+            result.update(store.seal_session("session"))
+
+        sealing = threading.Thread(target=seal)
+        sealing.start()
+        assert listed.wait(2)
+        store.append("session", terminal_id, [_event(2, b"two")], 20)
+        continue_sealing.set()
+        sealing.join(2)
+        assert not sealing.is_alive()
+
+        assert result == {terminal_id: 2}
+        metadata_path = session / "streams" / "terminals" / terminal_id / "stream.json"
+        metadata = json.loads(metadata_path.read_text())
+        assert metadata["highest_sequence"] == 2
+        assert metadata["chunks"] == ["chunks/00000001-00000002.jsonl.gz"]
+        assert [
+            event.sequence
+            for event in merged_timeline(metadata_path.parent / item for item in metadata["chunks"])
+        ] == [1, 2]
+    finally:
+        registry.close()
+
+
+def test_merged_timeline_has_stable_tie_breakers(tmp_path: Path) -> None:
+    store, registry, terminal_id = _store(tmp_path)
+    try:
+        second = registry.allocate_attachment("session", "now", "alpha")
+        session = tmp_path / "home" / "archive" / "session"
+        (session / "streams" / "terminals").mkdir(parents=True)
+        store.append("session", terminal_id, [_event(1)], 10)
+        store.append("session", second.terminal_id, [_event(1)], 10)
+        store.seal_session("session")
+        chunks = session.glob("streams/terminals/*/chunks/*.gz")
+        assert [event.terminal_id for event in merged_timeline(chunks)] == ["alpha", "terminal"]
+    finally:
+        registry.close()
+
+
+def test_end_drain_waits_for_admitted_event_acknowledgement(tmp_path: Path, monkeypatch) -> None:
+    store, registry, terminal_id = _store(tmp_path)
+    (tmp_path / "home/archive/session/streams/terminals").mkdir(parents=True)
+    reached_ack = threading.Event()
+    release_ack = threading.Event()
+    original = registry.accept_sequence
+
+    def paused_ack(terminal: str, expected: int, accepted: int, seen_ns: int) -> None:
+        reached_ack.set()
+        assert release_ack.wait(2)
+        original(terminal, expected, accepted, seen_ns)
+
+    monkeypatch.setattr(registry, "accept_sequence", paused_ack)
+    append = threading.Thread(
+        target=store.append, args=("session", terminal_id, [_event(1, b"kept")], 10)
+    )
+    append.start()
+    assert reached_ack.wait(2)
+    drain = threading.Thread(target=store.drain_and_detach, args=("session", "later"))
+    drain.start()
+    assert drain.is_alive()
+    release_ack.set()
+    append.join(2)
+    drain.join(2)
+
+    assert registry.attachment(terminal_id).accepted_sequence == 1
+    assert registry.attachment(terminal_id).detached_utc == "later"
+    assert store.seal_session("session") == {terminal_id: 1}
+    assert [event.bytes() for event in store.events("session", terminal_id)] == [b"kept"]
+    registry.close()
