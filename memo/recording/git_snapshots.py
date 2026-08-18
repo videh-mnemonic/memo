@@ -75,6 +75,11 @@ class GitSnapshotStore:
         if not self.contains(commit):
             raise GitSnapshotError(f"snapshot commit is missing: {commit}")
         destination.mkdir(parents=True, exist_ok=True)
+        entries = self._run(
+            "--git-dir", str(self.path), "ls-tree", "-r", "--name-only", commit
+        ).stdout
+        if not entries:
+            return
         process = subprocess.Popen(
             ["git", "--git-dir", str(self.path), "archive", "--format=tar", commit],
             stdout=subprocess.PIPE,

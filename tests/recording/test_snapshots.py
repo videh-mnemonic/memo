@@ -125,3 +125,16 @@ def test_git_restore_rejects_symlink_entries(tmp_path: Path) -> None:
 
     with pytest.raises(GitSnapshotError, match="unsupported snapshot entry"):
         repository.restore(commit, tmp_path / "restored")
+
+
+def test_git_restore_handles_empty_tree(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    repository = GitSnapshotStore(tmp_path / "snapshots.git")
+    commit = repository.commit(tree, None, "empty")
+
+    destination = tmp_path / "restored"
+    repository.restore(commit, destination)
+
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
