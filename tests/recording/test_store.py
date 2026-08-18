@@ -222,6 +222,27 @@ def test_remove_archived_requires_complete_fully_pushed_head(tmp_path: Path) -> 
     assert not directory.exists()
 
 
+def test_remove_archived_does_not_revalidate_old_history(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(_paths(tmp_path / "home"))
+    session = _session(root)
+    directory = store.create(session)
+    head = _publish(store, session, 0)
+    session.state = "complete"
+    session.last_pushed_step = head.step
+    session.last_pushed_digest = "0" * 64
+    session.remote_object = "remote"
+    store.update_session(session)
+
+    monkeypatch.setattr(store, "check_integrity", lambda _session_id: (_ for _ in ()).throw(
+        AssertionError("full history validation should not run")
+    ))
+
+    store.remove_archived("session")
+    assert not directory.exists()
+
+
 def test_remove_archived_renames_before_recursive_removal(
     tmp_path: Path,
     monkeypatch,

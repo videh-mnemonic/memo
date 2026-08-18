@@ -218,12 +218,18 @@ class SessionStore:
         return manifests[-1] if manifests else None
 
     def remove_archived(self, session_id: str) -> None:
-        """Remove a complete session whose latest local step is recorded as pushed."""
+        """Remove a complete session whose published HEAD is recorded as pushed.
+
+        The remote generation digest is already recorded by the successful push.
+        Revalidating every historical snapshot here would reread tens of
+        thousands of files without adding protection against a newer local
+        step, which is already ruled out by the pushed step number.
+        """
         path = self.session_path(session_id)
         session = self.load_session(session_id)
-        head = self.check_integrity(session_id)
         if session.state != "complete":
             raise ValueError("recording is not complete")
+        head = self.head(session_id)
         if head is None:
             raise ValueError("recording has no published step")
         if (

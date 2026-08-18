@@ -13,6 +13,8 @@ from ..recording.paths import StoragePaths
 from ..transport.config import S3Config
 from .protocol import ProtocolError, request
 
+REMOVE_ARCHIVED_TIMEOUT_SECONDS = 15 * 60
+
 
 def _s3_payload() -> dict[str, Any]:
     config = S3Config.discover(required=True)
@@ -127,4 +129,9 @@ def remove_archived(
 ) -> dict[str, Any]:
     paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
-    return request(str(paths.socket), "remove_archived", {"exclude": exclude or []}, timeout=60.0)
+    return request(
+        str(paths.socket),
+        "remove_archived",
+        {"exclude": exclude or []},
+        timeout=REMOVE_ARCHIVED_TIMEOUT_SECONDS,
+    )
