@@ -19,6 +19,7 @@ def configure(subparsers: Any) -> None:
     command = subparsers.add_parser(NAME, help="finish a recording")
     command.add_argument("path", nargs="?", type=Path)
     command.add_argument("--scope", choices=("partial", "full"))
+    command.add_argument("--allow-large", action="store_true")
     command.set_defaults(handler=run)
 
 
@@ -33,6 +34,7 @@ def run(args: Any) -> int:
         terminal_id=environment_terminal,
         capture_scope=args.scope,
         prompt_scope=prompt_scope,
+        allow_large=args.allow_large,
     )
     confirmed = False
     expected_revision = None
@@ -51,6 +53,7 @@ def run(args: Any) -> int:
                 confirmed=confirmed,
                 expected_revision=expected_revision,
                 capture_scope=selected_scope,
+                allow_large=args.allow_large,
             )
             continue
         count = int(response["other_terminals"])
@@ -74,6 +77,7 @@ def run(args: Any) -> int:
             expected_revision=expected_revision,
             capture_scope=args.scope,
             prompt_scope=prompt_scope,
+            allow_large=args.allow_large,
         )
     action = "already complete" if response["already_complete"] else "completed"
     session_path = SessionStore(StoragePaths.discover()).session_path(response["session_id"])

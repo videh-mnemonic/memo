@@ -419,6 +419,20 @@ def test_package_is_deterministic_and_contains_complete_history(tmp_path: Path) 
     }.issubset(names)
 
 
+def test_push_rejects_large_generation_before_upload(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    store, session = _published(_paths(tmp_path / "home"), root)
+    client = FakeS3()
+    monkeypatch.setenv("MEMO_LARGE_ARCHIVE_BYTES", "0")
+
+    with pytest.raises(ValueError, match="exceeding the configured limit"):
+        push_session(store, session, S3Config("bucket", "prefix"), client)
+
+    assert not [operation for operation in client.operations if operation[0] == "upload"]
+    assert store.load_session(session.session_id).last_pushed_step is None
+
+
 def test_push_publishes_immutable_generation_index_and_completion_and_skips_unchanged(
     tmp_path: Path,
 ) -> None:

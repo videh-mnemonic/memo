@@ -24,6 +24,7 @@ from ..recording.store import SessionNotFoundError, SessionStore, validate_sessi
 from .archive import (
     PreparedGeneration,
     atomic_install_directory,
+    enforce_archive_limit,
     prepare_generation,
     safe_extract_tar_zst_stream,
 )
@@ -209,9 +210,11 @@ def publish_generation(
     client: Any | None = None,
     *,
     update_local: bool = True,
+    allow_large: bool = False,
 ) -> dict[str, object]:
     """Publish an append-only generation and its discovery records."""
     remote = _store(config, client)
+    enforce_archive_limit(prepared, allow_large)
     base = _session_base(config, session.origin, session.session_id)
     generation_prefix = f"{base}/generations/"
     generation = _generation_key(base, prepared.step, prepared.digest)
@@ -284,7 +287,12 @@ def publish_generation_metadata(
 
 
 def push_session(
-    store: SessionStore, session: DirectorySession, config: S3Config, client: Any | None = None
+    store: SessionStore,
+    session: DirectorySession,
+    config: S3Config,
+    client: Any | None = None,
+    *,
+    allow_large: bool = False,
 ) -> dict[str, object]:
     """Package and publish a session unless its current step was already pushed."""
     manifest = store.head(session.session_id)
@@ -320,7 +328,9 @@ def push_session(
         }
     prepared = prepare_generation(store, session)
     try:
-        return publish_generation(store, session, prepared, config, client)
+        return publish_generation(
+            store, session, prepared, config, client, allow_large=allow_large
+        )
     finally:
         prepared.cleanup()
 

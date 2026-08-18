@@ -82,6 +82,7 @@ def end(
     expected_revision: int | None = None,
     capture_scope: str | None = None,
     prompt_scope: bool = False,
+    allow_large: bool = False,
 ) -> dict[str, Any]:
     paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
@@ -100,15 +101,24 @@ def end(
         payload["capture_scope"] = capture_scope
     if prompt_scope:
         payload["prompt_scope"] = True
+    if allow_large:
+        payload["allow_large"] = True
     payload["s3"] = _s3_payload()
     return request(str(paths.socket), "end", payload, timeout=300.0)
 
 
-def push(session_id: str | None = None, paths: StoragePaths | None = None) -> dict[str, Any]:
+def push(
+    session_id: str | None = None,
+    paths: StoragePaths | None = None,
+    *,
+    allow_large: bool = False,
+) -> dict[str, Any]:
     paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
     payload = {"session_id": session_id} if session_id else {}
     payload["s3"] = _s3_payload()
+    if allow_large:
+        payload["allow_large"] = True
     return request(str(paths.socket), "push", payload, timeout=300.0)
 
 

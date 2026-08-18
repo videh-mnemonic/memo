@@ -58,11 +58,20 @@ Optional settings:
 - `MEMO_S3_REGION`: AWS region.
 - `MEMO_S3_PROFILE`: AWS credentials profile.
 - `MEMO_S3_UPLOAD_CONCURRENCY`: multipart upload concurrency; defaults to `3`.
+- `MEMO_LARGE_ARCHIVE_BYTES`: maximum generation size before Memo requires an
+  explicit override; defaults to `1073741824` (1 GiB). Set it to `0` to
+  require `--allow-large` for every upload.
 
 Memo uses AWS environment, profile, and IAM credential providers. Credentials
 need `GetObject`, prefix-limited `ListBucket`, `PutObject`, and
 `AbortMultipartUpload`; object deletion is not required. Archives are
 checksummed, validated before installation, and installed atomically.
+
+Memo refuses to upload a generation larger than the configured safety limit
+before starting the remote transfer. Interactive `memo push` offers a
+confirmation; use `memo push --allow-large` or `memo end --allow-large` when a
+large archive is intentional. Automatic and non-interactive pushes fail and
+retain the local recording for inspection.
 
 S3 is part of Memo's durability contract, not a best-effort backup. Explicit
 push, pull, import, archive inspection, and final publication failures make the
