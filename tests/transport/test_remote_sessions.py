@@ -120,6 +120,20 @@ def _paths(root: Path) -> StoragePaths:
     return StoragePaths(root)
 
 
+def _git_session(paths: StoragePaths, root: Path) -> tuple[SessionStore, DirectorySession]:
+    root.mkdir()
+    (root / "note.txt").write_text("captured")
+    store = SessionStore(paths)
+    session = DirectorySession(
+        "git-session", str(root.resolve()), "now", "now", SessionOrigin("1.0.0", "user", "host")
+    )
+    store.create(session)
+    StepPublisher(store).publish(session)
+    session.state = "complete"
+    store.update_session(session)
+    return store, session
+
+
 def test_list_archived_session_ids_uses_index_and_filters_invalid_keys() -> None:
     client = FakeS3()
     digest = "a" * 64
@@ -453,6 +467,67 @@ def test_git_snapshot_generation_extracts_and_validates_as_a_session(tmp_path: P
     assert manifest.snapshot_commit == pulled_manifest.snapshot_commit
     assert (destination / "snapshots.git" / "HEAD").is_file()
     assert (restored / "note.txt").read_text() == "captured"
+
+
+def test_git_session_round_trips_through_remote_transport(tmp_path: Path) -> None:
+    source_paths = _paths(tmp_path / "source-home")
+    source_store, session = _git_session(source_paths, tmp_path / "source")
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+
+    pushed = push_session(source_store, session, config, client)
+    assert pushed["status"] == "pushed"
+
+    pulled_paths = _paths(tmp_path / "pulled-home")
+    pulled_path = pull_session(session.session_id, pulled_paths, config, client=client)
+    pulled_store = SessionStore(pulled_paths)
+    manifest = pulled_store.steps(session.session_id)[-1]
+    restored = tmp_path / "restored"
+    pulled_store.restore_manifest(session.session_id, manifest, restored)
+
+    assert pulled_path == pulled_paths.archive / session.session_id
+    assert manifest.snapshot_commit
+    assert (restored / "note.txt").read_text() == "captured"
+
+
+def test_corrupt_git_snapshot_archive_does_not_replace_existing_session(tmp_path: Path) -> None:
+    source_paths = _paths(tmp_path / "source-home")
+    source_store, session = _git_session(source_paths, tmp_path / "source")
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+    push_session(source_store, session, config, client)
+
+    completion_key = next(key for key in client.objects if "/completions/" in key)
+    completion = json.loads(client.objects[completion_key])
+    generation = completion["generation"]
+    original = client.objects[generation]
+    manifest = source_store.steps(session.session_id)[-1]
+    assert manifest.snapshot_commit
+    commit_object = (
+        f"snapshots.git/objects/{manifest.snapshot_commit[:2]}/{manifest.snapshot_commit[2:]}"
+    )
+    uncompressed = zstandard.ZstdDecompressor().decompress(
+        original, max_output_size=64 * 1024 * 1024
+    )
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=io.BytesIO(uncompressed), mode="r:") as source:
+        with zstandard.ZstdCompressor(level=3).stream_writer(raw, closefd=False) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as target:
+                for member in source.getmembers():
+                    if member.name == commit_object:
+                        continue
+                    target.addfile(member, source.extractfile(member) if member.isfile() else None)
+    _replace_remote_package(client, raw.getvalue())
+
+    existing_paths = _paths(tmp_path / "existing-home")
+    existing = existing_paths.archive / session.session_id
+    existing.mkdir(parents=True)
+    (existing / "sentinel.txt").write_text("preserve")
+
+    with pytest.raises(ValueError, match="missing snapshot commit"):
+        pull_session(session.session_id, existing_paths, config, force=True, client=client)
+
+    assert (existing / "sentinel.txt").read_text() == "preserve"
 
 
 def test_push_rejects_large_generation_before_upload(tmp_path: Path, monkeypatch) -> None:
