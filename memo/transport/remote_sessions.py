@@ -223,6 +223,12 @@ def publish_generation(
         raise ValueError(f"remote generation fork at step {prepared.step}")
     if not remote.exists(generation):
         remote.upload_file(generation, prepared.path)
+    remote_size = remote.size(generation)
+    if remote_size != prepared.size_bytes:
+        raise ValueError(
+            f"remote generation size mismatch: expected {prepared.size_bytes}, "
+            f"received {remote_size}"
+        )
     return publish_generation_metadata(
         store,
         session,
