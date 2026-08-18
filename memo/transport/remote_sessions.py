@@ -385,7 +385,12 @@ def _stream_agent_run_metadata(store: S3Store, generation: str) -> list[AgentRun
                     if not isinstance(value, dict):
                         raise ValueError("remote agent metadata is invalid")
                     result.append(AgentRunMetadata.from_dict(value))
-                elif name.startswith("agents/traces/") or name.startswith("snapshots/"):
+                elif (
+                    name.startswith("agents/traces/")
+                    or name.startswith("snapshots/")
+                    or name == "snapshots.git"
+                    or name.startswith("snapshots.git/")
+                ):
                     break
     finally:
         try:

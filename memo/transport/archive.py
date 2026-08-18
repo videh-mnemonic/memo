@@ -202,10 +202,13 @@ def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Pa
         session_path / "steps",
         session_path / "snapshots",
     ]
+    if any(manifest.snapshot_commit for manifest in manifests):
+        paths.append(session_path / "snapshots.git")
     for manifest in manifests:
         paths.append(session_path / "steps" / f"{manifest.step}.json")
-        paths.extend((session_path / manifest.snapshot).rglob("*"))
-        paths.append(session_path / manifest.snapshot)
+        if not manifest.snapshot_commit:
+            paths.extend((session_path / manifest.snapshot).rglob("*"))
+            paths.append(session_path / manifest.snapshot)
     terminal_root = session_path / "streams" / "terminals"
     high_water_by_terminal: dict[str, int] = {}
     for manifest in manifests:

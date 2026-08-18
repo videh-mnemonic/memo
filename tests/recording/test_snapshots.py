@@ -1,8 +1,10 @@
 import os
 from pathlib import Path
 
+from memo.recording.metadata import DirectorySession, SessionOrigin
 from memo.recording.paths import StoragePaths
-from memo.recording.snapshots import scan_tree
+from memo.recording.snapshots import StepPublisher, scan_tree
+from memo.recording.store import SessionStore
 
 
 def _paths(tmp_path: Path) -> StoragePaths:
@@ -67,3 +69,29 @@ def test_authoritative_scan_captures_changes_without_watcher_hint(tmp_path: Path
         entry.path == "created.txt" and entry.kind == "file"
         for entry in scan_tree(root, destination, max_file_size=100)
     )
+
+
+def test_step_publisher_uses_git_commits_and_restores_files(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "unchanged.txt").write_text("same")
+    (root / "changed.txt").write_text("one")
+    store = SessionStore(_paths(tmp_path))
+    session = DirectorySession(
+        "session", str(root.resolve()), "now", "now", SessionOrigin("1.0.0", "user", "host")
+    )
+    store.create(session)
+    publisher = StepPublisher(store)
+
+    first = publisher.publish(session)
+    (root / "changed.txt").write_text("two")
+    second = publisher.publish(session)
+
+    assert first.snapshot_commit
+    assert second.snapshot_commit
+    assert first.snapshot_commit != second.snapshot_commit
+    assert not (store.session_path("session") / "snapshots/0").exists()
+    restored = tmp_path / "restored"
+    store.restore_manifest("session", second, restored)
+    assert (restored / "unchanged.txt").read_text() == "same"
+    assert (restored / "changed.txt").read_text() == "two"

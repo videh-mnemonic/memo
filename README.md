@@ -361,8 +361,9 @@ memo status --include-archive
   stale after about five minutes. Starting `memo` in that directory will then
   offer to resume the existing recording or complete it and start a new one.
 - Each step contains a directory snapshot, terminal-stream high-water marks,
-  and references to captured agent runs. `HEAD` points only to a completely
-  published step.
+  and references to captured agent runs. New recordings store filesystem
+  snapshots as commits in a session-local Git object store, so unchanged files
+  are shared across steps. `HEAD` points only to a completely published step.
 - Filesystem capture stays rooted at the original directory even if a shell
   changes directories. Git-compatible ignore rules are honored. Files over 100
   MiB and files changing during capture are skipped or retain their previous

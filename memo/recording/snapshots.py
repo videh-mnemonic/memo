@@ -9,8 +9,9 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .git_snapshots import GitSnapshotStore
 from .ignore import IgnorePolicy
-from .metadata import DirectorySession, SnapshotEntry, StepManifest
+from .metadata import STEP_SCHEMA_VERSION, DirectorySession, SnapshotEntry, StepManifest
 from .paths import StoragePaths
 from .store import SessionStore
 
@@ -203,28 +204,46 @@ class StepPublisher:
     def publish(self, session: DirectorySession) -> StepManifest:
         high_water = self.seal_streams(session)
         previous_manifest = self.store.head(session.session_id)
-        previous = (
-            None
-            if previous_manifest is None
-            else (self.store.session_path(session.session_id) / previous_manifest.snapshot)
-        )
-        step = self.store.next_step(session.session_id)
         session_path = self.store.session_path(session.session_id)
-        agent_runs = sorted(path.stem for path in (session_path / "agents" / "runs").glob("*.json"))
-        with tempfile.TemporaryDirectory(
-            prefix=f".{step}.", dir=session_path / "snapshots"
-        ) as temporary_name:
-            temporary = Path(temporary_name)
-            entries = scan_tree(
-                Path(session.root), temporary, previous=previous, paths=self.store.paths
+        repository = GitSnapshotStore(session_path / "snapshots.git")
+        previous = None
+        previous_temporary: Path | None = None
+        try:
+            if previous_manifest is not None:
+                if previous_manifest.snapshot_commit:
+                    previous_temporary = Path(tempfile.mkdtemp(prefix="previous-", dir=session_path))
+                    previous = previous_temporary
+                    repository.restore(previous_manifest.snapshot_commit, previous)
+                else:
+                    previous = session_path / previous_manifest.snapshot
+            step = self.store.next_step(session.session_id)
+            agent_runs = sorted(
+                path.stem for path in (session_path / "agents" / "runs").glob("*.json")
             )
-            manifest = StepManifest(
-                session.session_id,
-                step,
-                utcnow(),
-                f"snapshots/{step}",
-                entries,
-                high_water,
-                agent_runs=agent_runs,
-            )
-            return self.store.publish(session, manifest, temporary)
+            with tempfile.TemporaryDirectory(
+                prefix=f".{step}.", dir=session_path / "snapshots"
+            ) as temporary_name:
+                temporary = Path(temporary_name)
+                entries = scan_tree(
+                    Path(session.root), temporary, previous=previous, paths=self.store.paths
+                )
+                commit = repository.commit(
+                    temporary,
+                    previous_manifest.snapshot_commit if previous_manifest else None,
+                    f"Memo filesystem snapshot {step}",
+                )
+                manifest = StepManifest(
+                    session.session_id,
+                    step,
+                    utcnow(),
+                    f"snapshots/{step}",
+                    entries,
+                    high_water,
+                    schema_version=STEP_SCHEMA_VERSION,
+                    agent_runs=agent_runs,
+                    snapshot_commit=commit,
+                )
+                return self.store.publish(session, manifest, temporary)
+        finally:
+            if previous_temporary is not None:
+                shutil.rmtree(previous_temporary, ignore_errors=True)
