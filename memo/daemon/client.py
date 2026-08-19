@@ -6,12 +6,16 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from ..recording.paths import StoragePaths
 from ..transport.config import S3Config
 from .protocol import ProtocolError, request
+
+REMOVE_ARCHIVED_TIMEOUT_SECONDS = 15 * 60
+LONG_OPERATION_TIMEOUT_SECONDS = 30 * 60
 
 
 def _s3_payload() -> dict[str, Any]:
@@ -82,6 +86,7 @@ def end(
     expected_revision: int | None = None,
     capture_scope: str | None = None,
     prompt_scope: bool = False,
+    allow_large: bool = False,
 ) -> dict[str, Any]:
     paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
@@ -100,16 +105,29 @@ def end(
         payload["capture_scope"] = capture_scope
     if prompt_scope:
         payload["prompt_scope"] = True
+    if allow_large:
+        payload["allow_large"] = True
     payload["s3"] = _s3_payload()
-    return request(str(paths.socket), "end", payload, timeout=300.0)
+    return request(str(paths.socket), "end", payload, timeout=LONG_OPERATION_TIMEOUT_SECONDS)
 
 
-def push(session_id: str | None = None, paths: StoragePaths | None = None) -> dict[str, Any]:
+def push(
+    session_id: str | None = None,
+    paths: StoragePaths | None = None,
+    *,
+    allow_large: bool = False,
+    progress: Callable[[int, int, str], None] | None = None,
+) -> dict[str, Any]:
     paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
     payload = {"session_id": session_id} if session_id else {}
     payload["s3"] = _s3_payload()
-    return request(str(paths.socket), "push", payload, timeout=300.0)
+    if allow_large:
+        payload["allow_large"] = True
+    request_options: dict[str, Any] = {"timeout": LONG_OPERATION_TIMEOUT_SECONDS}
+    if progress is not None:
+        request_options["progress"] = progress
+    return request(str(paths.socket), "push", payload, **request_options)
 
 
 def remove_archived(
@@ -117,4 +135,9 @@ def remove_archived(
 ) -> dict[str, Any]:
     paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
-    return request(str(paths.socket), "remove_archived", {"exclude": exclude or []}, timeout=60.0)
+    return request(
+        str(paths.socket),
+        "remove_archived",
+        {"exclude": exclude or []},
+        timeout=REMOVE_ARCHIVED_TIMEOUT_SECONDS,
+    )

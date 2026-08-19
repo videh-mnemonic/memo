@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from ..agents.run_metadata import AgentRunMetadata
 from .filesystem import atomic_write
+from .git_snapshots import GitSnapshotStore
 from .metadata import DirectorySession, StepManifest
 from .paths import StoragePaths
 
@@ -94,6 +95,8 @@ class SessionStore:
         self._validate_manifest(path, session_id, manifest, streams=True)
         if manifest.step != int(value):
             raise ValueError("HEAD step does not match manifest")
+        if manifest.snapshot_commit:
+            GitSnapshotStore(path / "snapshots.git").pin(manifest.snapshot_commit)
         return manifest
 
     def step(self, session_id: str, selector: str | int = -1) -> StepManifest:
@@ -127,10 +130,17 @@ class SessionStore:
         if manifest.session_id != session_id:
             raise ValueError("step belongs to another session")
         snapshot = path / manifest.snapshot
-        if not snapshot.is_dir():
+        if manifest.snapshot_commit:
+            if not GitSnapshotStore(path / "snapshots.git").contains(manifest.snapshot_commit):
+                raise ValueError(f"step references missing snapshot commit: {manifest.snapshot_commit}")
+        elif not snapshot.is_dir():
             raise ValueError(f"step references missing snapshot: {manifest.snapshot}")
         for entry in manifest.entries:
-            if (entry.kind == "file" or entry.retained) and not (snapshot / entry.path).is_file():
+            if (
+                not manifest.snapshot_commit
+                and (entry.kind == "file" or entry.retained)
+                and not (snapshot / entry.path).is_file()
+            ):
                 raise ValueError(f"step references missing snapshot file: {entry.path}")
         if streams:
             for terminal_id, sequence in manifest.stream_high_water.items():
@@ -161,7 +171,6 @@ class SessionStore:
     ) -> Path:
         path = self.session_path(session_id)
         self._validate_manifest(path, session_id, manifest)
-        source = self.session_path(session_id) / manifest.snapshot
         if destination.exists():
             occupied = not destination.is_dir() or any(destination.iterdir())
             if occupied and not force:
@@ -169,7 +178,11 @@ class SessionStore:
             if occupied:
                 shutil.rmtree(destination) if destination.is_dir() else destination.unlink()
         destination.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, destination, dirs_exist_ok=True, copy_function=shutil.copy2)
+        if manifest.snapshot_commit:
+            GitSnapshotStore(path / "snapshots.git").restore(manifest.snapshot_commit, destination)
+        else:
+            source = self.session_path(session_id) / manifest.snapshot
+            shutil.copytree(source, destination, dirs_exist_ok=True, copy_function=shutil.copy2)
         return destination
 
     def stream_events_for_manifest(
@@ -207,12 +220,18 @@ class SessionStore:
         return manifests[-1] if manifests else None
 
     def remove_archived(self, session_id: str) -> None:
-        """Remove a complete session whose latest local step is recorded as pushed."""
+        """Remove a complete session whose published HEAD is recorded as pushed.
+
+        The remote generation digest is already recorded by the successful push.
+        Revalidating every historical snapshot here would reread tens of
+        thousands of files without adding protection against a newer local
+        step, which is already ruled out by the pushed step number.
+        """
         path = self.session_path(session_id)
         session = self.load_session(session_id)
-        head = self.check_integrity(session_id)
         if session.state != "complete":
             raise ValueError("recording is not complete")
+        head = self.head(session_id)
         if head is None:
             raise ValueError("recording has no published step")
         if (
@@ -267,6 +286,8 @@ class SessionStore:
                 raise ValueError("step filename does not match manifest")
             cls._validate_manifest(path, session_id, manifest, streams=True)
             manifests.append(manifest)
+        if manifests[-1].snapshot_commit:
+            GitSnapshotStore(path / "snapshots.git").pin(manifests[-1].snapshot_commit)
         return manifests
 
     def next_step(self, session_id: str) -> int:
@@ -285,6 +306,20 @@ class SessionStore:
             raise ValueError(f"step {manifest.step} is not next step {expected}")
         snapshot = path / manifest.snapshot
         manifest_path = path / "steps" / f"{manifest.step}.json"
+        if manifest.snapshot_commit:
+            if not GitSnapshotStore(path / "snapshots.git").contains(manifest.snapshot_commit):
+                raise ValueError(f"step references missing snapshot commit: {manifest.snapshot_commit}")
+            if manifest_path.exists():
+                existing = StepManifest.load(manifest_path)
+                self._validate_manifest(path, session.session_id, existing, streams=True)
+                atomic_write(path / "HEAD", f"{existing.step}\n".encode())
+                return existing
+            if snapshot.exists():
+                shutil.rmtree(snapshot) if snapshot.is_dir() else snapshot.unlink()
+            prepared_snapshot.unlink(missing_ok=True) if prepared_snapshot.is_file() else shutil.rmtree(prepared_snapshot, ignore_errors=True)
+            atomic_write(manifest_path, _json_bytes(manifest.to_dict()))
+            atomic_write(path / "HEAD", f"{manifest.step}\n".encode())
+            return manifest
         if snapshot.exists() and not manifest_path.exists():
             shutil.rmtree(snapshot) if snapshot.is_dir() else snapshot.unlink()
         elif snapshot.exists() and manifest_path.exists():

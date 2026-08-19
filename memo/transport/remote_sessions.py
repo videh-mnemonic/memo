@@ -24,6 +24,7 @@ from ..recording.store import SessionNotFoundError, SessionStore, validate_sessi
 from .archive import (
     PreparedGeneration,
     atomic_install_directory,
+    enforce_archive_limit,
     prepare_generation,
     safe_extract_tar_zst_stream,
 )
@@ -209,9 +210,12 @@ def publish_generation(
     client: Any | None = None,
     *,
     update_local: bool = True,
+    allow_large: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
     """Publish an append-only generation and its discovery records."""
     remote = _store(config, client)
+    enforce_archive_limit(prepared, allow_large)
     base = _session_base(config, session.origin, session.session_id)
     generation_prefix = f"{base}/generations/"
     generation = _generation_key(base, prepared.step, prepared.digest)
@@ -219,7 +223,17 @@ def publish_generation(
     if existing is not None and existing != (generation, prepared.digest):
         raise ValueError(f"remote generation fork at step {prepared.step}")
     if not remote.exists(generation):
-        remote.upload_file(generation, prepared.path)
+        if progress is not None:
+            progress(0, prepared.size_bytes, "uploading archive")
+        remote.upload_file(generation, prepared.path, progress=progress)
+        if progress is not None:
+            progress(prepared.size_bytes, prepared.size_bytes, "upload complete")
+    remote_size = remote.size(generation)
+    if remote_size != prepared.size_bytes:
+        raise ValueError(
+            f"remote generation size mismatch: expected {prepared.size_bytes}, "
+            f"received {remote_size}"
+        )
     return publish_generation_metadata(
         store,
         session,
@@ -284,7 +298,13 @@ def publish_generation_metadata(
 
 
 def push_session(
-    store: SessionStore, session: DirectorySession, config: S3Config, client: Any | None = None
+    store: SessionStore,
+    session: DirectorySession,
+    config: S3Config,
+    client: Any | None = None,
+    *,
+    allow_large: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
     """Package and publish a session unless its current step was already pushed."""
     manifest = store.head(session.session_id)
@@ -318,9 +338,17 @@ def push_session(
             "digest": session.last_pushed_digest,
             "status": "skipped",
         }
-    prepared = prepare_generation(store, session)
+    prepared = prepare_generation(store, session, progress=progress)
     try:
-        return publish_generation(store, session, prepared, config, client)
+        return publish_generation(
+            store,
+            session,
+            prepared,
+            config,
+            client,
+            allow_large=allow_large,
+            progress=progress,
+        )
     finally:
         prepared.cleanup()
 
@@ -385,7 +413,12 @@ def _stream_agent_run_metadata(store: S3Store, generation: str) -> list[AgentRun
                     if not isinstance(value, dict):
                         raise ValueError("remote agent metadata is invalid")
                     result.append(AgentRunMetadata.from_dict(value))
-                elif name.startswith("agents/traces/") or name.startswith("snapshots/"):
+                elif (
+                    name.startswith("agents/traces/")
+                    or name.startswith("snapshots/")
+                    or name == "snapshots.git"
+                    or name.startswith("snapshots.git/")
+                ):
                     break
     finally:
         try:

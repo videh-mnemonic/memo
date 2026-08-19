@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
@@ -102,12 +102,36 @@ class S3Store:
         size = getattr(metadata, "size", None)
         return size if isinstance(size, int) and size >= 0 else None
 
-    def upload_file(self, key: str, path: Path) -> None:
+    def upload_file(
+        self,
+        key: str,
+        path: Path,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> None:
+        progress_adapter = None
+        if progress is not None:
+            class UploadProgress:
+                def set_meta(self, object_name: str, total_length: int) -> None:
+                    del object_name
+                    progress(0, total_length, "uploading archive")
+
+                def update(self, length: int) -> None:
+                    progress_adapter.completed += length
+                    progress(
+                        progress_adapter.completed,
+                        progress_adapter.total,
+                        "uploading archive",
+                    )
+
+            progress_adapter = UploadProgress()
+            progress_adapter.completed = 0
+            progress_adapter.total = path.stat().st_size
         self.client.fput_object(
             self.config.bucket,
             key,
             str(path),
             content_type="application/zstd",
+            progress=progress_adapter,
             part_size=MULTIPART_PART_SIZE,
             num_parallel_uploads=self.config.upload_concurrency,
         )

@@ -63,9 +63,9 @@ def test_zero_terminal_recording_keeps_publishing(tmp_path: Path) -> None:
             time.sleep(0.05)
             manifest = store.head(attached["session_id"])
         assert manifest is not None and manifest.step >= 1
-        assert (
-            store.session_path(attached["session_id"]) / manifest.snapshot / "file.txt"
-        ).read_text() == "second"
+        restored = tmp_path / "restored"
+        store.restore_manifest(attached["session_id"], manifest, restored)
+        assert (restored / "file.txt").read_text() == "second"
         decision = request(str(paths.socket), "attach", {"path": str(root)})
         assert decision["decision_required"] is True
     finally:

@@ -22,6 +22,11 @@ from ..recording.metadata import DirectorySession, StepManifest
 from ..recording.store import SessionStore
 
 STREAM_READ_SIZE = 64 * 1024
+DEFAULT_LARGE_ARCHIVE_BYTES = 1 * 1024 * 1024 * 1024
+
+
+class LargeGenerationError(ValueError):
+    """Raised when an archive exceeds the configured upload safety limit."""
 
 
 class HashingWriter:
@@ -202,10 +207,14 @@ def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Pa
         session_path / "steps",
         session_path / "snapshots",
     ]
+    if any(manifest.snapshot_commit for manifest in manifests):
+        paths.append(session_path / "snapshots.git")
+        paths.extend((session_path / "snapshots.git").rglob("*"))
     for manifest in manifests:
         paths.append(session_path / "steps" / f"{manifest.step}.json")
-        paths.extend((session_path / manifest.snapshot).rglob("*"))
-        paths.append(session_path / manifest.snapshot)
+        if not manifest.snapshot_commit:
+            paths.extend((session_path / manifest.snapshot).rglob("*"))
+            paths.append(session_path / manifest.snapshot)
     terminal_root = session_path / "streams" / "terminals"
     high_water_by_terminal: dict[str, int] = {}
     for manifest in manifests:
@@ -253,12 +262,17 @@ class PreparedGeneration:
     step: int
     digest: str
     path: Path
+    size_bytes: int = 0
 
     def cleanup(self) -> None:
         self.path.unlink(missing_ok=True)
 
 
-def prepare_generation(store: SessionStore, session: DirectorySession) -> PreparedGeneration:
+def prepare_generation(
+    store: SessionStore,
+    session: DirectorySession,
+    progress: Callable[[int, int, str], None] | None = None,
+) -> PreparedGeneration:
     """Prepare a deterministic generation archive on disk."""
     manifests = store.steps(session.session_id)
     if not manifests:
@@ -274,14 +288,45 @@ def prepare_generation(store: SessionStore, session: DirectorySession) -> Prepar
     )
     path = Path(name)
     try:
+        if progress is not None:
+            progress(0, 1, "creating archive")
         with os.fdopen(descriptor, "wb") as handle:
             hashing = HashingWriter(handle)
             write_deterministic_tar_zst(root, _history_paths(root, manifests), hashing)
             handle.flush()
             os.fsync(handle.fileno())
-        return PreparedGeneration(session.session_id, manifest.step, hashing.hexdigest(), path)
+        prepared = PreparedGeneration(
+            session.session_id, manifest.step, hashing.hexdigest(), path, path.stat().st_size
+        )
+        if progress is not None:
+            progress(1, 1, f"archive ready ({prepared.size_bytes / (1024**2):.1f} MiB)")
+        return prepared
     except BaseException:
         with suppress(OSError):
             os.close(descriptor)
         path.unlink(missing_ok=True)
         raise
+
+
+def large_archive_limit() -> int:
+    value = os.environ.get("MEMO_LARGE_ARCHIVE_BYTES")
+    if value is None:
+        return DEFAULT_LARGE_ARCHIVE_BYTES
+    try:
+        limit = int(value)
+    except ValueError as error:
+        raise ValueError("MEMO_LARGE_ARCHIVE_BYTES must be a nonnegative integer") from error
+    if limit < 0:
+        raise ValueError("MEMO_LARGE_ARCHIVE_BYTES must be a nonnegative integer")
+    return limit
+
+
+def enforce_archive_limit(prepared: PreparedGeneration, allow_large: bool = False) -> None:
+    limit = large_archive_limit()
+    if not allow_large and prepared.size_bytes > limit:
+        raise LargeGenerationError(
+            f"archive for {prepared.session_id} step {prepared.step} is "
+            f"{prepared.size_bytes / (1024**3):.1f} GiB, exceeding the configured "
+            f"limit of {limit / (1024**3):.1f} GiB; "
+            "inspect the recording or retry with --allow-large"
+        )

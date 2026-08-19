@@ -1,8 +1,14 @@
 import os
+import subprocess
 from pathlib import Path
 
+import pytest
+
+from memo.recording.git_snapshots import GitSnapshotError, GitSnapshotStore
+from memo.recording.metadata import DirectorySession, SessionOrigin
 from memo.recording.paths import StoragePaths
-from memo.recording.snapshots import scan_tree
+from memo.recording.snapshots import StepPublisher, scan_tree
+from memo.recording.store import SessionStore
 
 
 def _paths(tmp_path: Path) -> StoragePaths:
@@ -67,3 +73,82 @@ def test_authoritative_scan_captures_changes_without_watcher_hint(tmp_path: Path
         entry.path == "created.txt" and entry.kind == "file"
         for entry in scan_tree(root, destination, max_file_size=100)
     )
+
+
+def test_step_publisher_uses_git_commits_and_restores_files(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "unchanged.txt").write_text("same")
+    (root / "changed.txt").write_text("one")
+    store = SessionStore(_paths(tmp_path))
+    session = DirectorySession(
+        "session", str(root.resolve()), "now", "now", SessionOrigin("1.0.0", "user", "host")
+    )
+    store.create(session)
+    publisher = StepPublisher(store)
+
+    first = publisher.publish(session)
+    (root / "changed.txt").write_text("two")
+    second = publisher.publish(session)
+
+    assert first.snapshot_commit
+    assert second.snapshot_commit
+    assert first.snapshot_commit != second.snapshot_commit
+    assert not (store.session_path("session") / "snapshots/0").exists()
+    restored = tmp_path / "restored"
+    store.restore_manifest("session", second, restored)
+    assert (restored / "unchanged.txt").read_text() == "same"
+    assert (restored / "changed.txt").read_text() == "two"
+
+    repository = store.session_path("session") / "snapshots.git"
+    first_blob = subprocess.run(
+        ["git", "--git-dir", str(repository), "ls-tree", first.snapshot_commit, "--", "unchanged.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()[2]
+    second_blob = subprocess.run(
+        ["git", "--git-dir", str(repository), "ls-tree", second.snapshot_commit, "--", "unchanged.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()[2]
+    assert first_blob == second_blob
+    assert (
+        subprocess.run(
+            ["git", "--git-dir", str(repository), "rev-parse", "refs/heads/master"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == second.snapshot_commit
+    )
+    subprocess.run(
+        ["git", "--git-dir", str(repository), "update-ref", "-d", "refs/heads/master"],
+        check=True,
+    )
+    assert store.head("session").snapshot_commit == second.snapshot_commit
+
+
+def test_git_restore_rejects_symlink_entries(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    os.symlink("/etc/passwd", tree / "escape")
+    repository = GitSnapshotStore(tmp_path / "snapshots.git")
+    commit = repository.commit(tree, None, "unsafe")
+
+    with pytest.raises(GitSnapshotError, match="unsupported snapshot entry"):
+        repository.restore(commit, tmp_path / "restored")
+
+
+def test_git_restore_handles_empty_tree(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    repository = GitSnapshotStore(tmp_path / "snapshots.git")
+    commit = repository.commit(tree, None, "empty")
+
+    destination = tmp_path / "restored"
+    repository.restore(commit, destination)
+
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []

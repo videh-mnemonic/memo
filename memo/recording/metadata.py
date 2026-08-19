@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 DIRECTORY_FORMAT_VERSION = 2
-STEP_SCHEMA_VERSION = 1
+STEP_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -107,17 +107,25 @@ class StepManifest:
     snapshot: str
     entries: list[SnapshotEntry] = field(default_factory=list)
     stream_high_water: dict[str, int] = field(default_factory=dict)
-    schema_version: int = STEP_SCHEMA_VERSION
+    schema_version: int = 1
     agent_runs: list[str] = field(default_factory=list)
+    snapshot_commit: str | None = None
 
     def validate(self) -> None:
-        if self.schema_version != STEP_SCHEMA_VERSION:
+        if self.schema_version not in {1, STEP_SCHEMA_VERSION}:
             raise ValueError("unsupported step schema version")
         if not isinstance(self.step, int) or self.step < 0:
             raise ValueError("step must be nonnegative")
         expected = f"snapshots/{self.step}"
         if self.snapshot != expected:
             raise ValueError(f"step snapshot must be {expected}")
+        if self.schema_version == STEP_SCHEMA_VERSION and not self.snapshot_commit:
+            raise ValueError("Git-backed step is missing its snapshot commit")
+        if self.snapshot_commit and (
+            len(self.snapshot_commit) not in {40, 64}
+            or any(value not in "0123456789abcdef" for value in self.snapshot_commit.lower())
+        ):
+            raise ValueError("invalid snapshot commit")
         for entry in self.entries:
             path = Path(entry.path)
             if path.is_absolute() or ".." in path.parts:

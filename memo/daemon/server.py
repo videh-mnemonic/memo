@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import asdict
 from multiprocessing.connection import Client, Connection, Listener
@@ -272,7 +273,12 @@ class MemoDaemon:
                             "step": None if head is None else head.step,
                             "already_complete": True,
                         }
-                        return self._push_after_end(result, session.session_id, s3_config)
+                        return self._push_after_end(
+                            result,
+                            session.session_id,
+                            s3_config,
+                            payload.get("allow_large") is True,
+                        )
             raise FileNotFoundError("no active recording for path")
         with self._root_lock(active.root):
             active = self.registry.lookup_session(active.session_id)
@@ -315,12 +321,24 @@ class MemoDaemon:
             result = self._finish(active, capture_scope=selected_scope)
         # Finish local lifecycle work before doing network I/O, but do not report
         # the end operation as successful until the completed recording is durable.
-        return self._push_after_end(result, active.session_id, s3_config)
+        return self._push_after_end(
+            result, active.session_id, s3_config, payload.get("allow_large") is True
+        )
 
     def _push_after_end(
-        self, result: dict[str, Any], session_id: str, config: S3Config
+        self,
+        result: dict[str, Any],
+        session_id: str,
+        config: S3Config,
+        allow_large: bool = False,
     ) -> dict[str, Any]:
-        push_result = self._push({"session_id": session_id, "s3": config.to_dict()})
+        push_result = self._push(
+            {
+                "session_id": session_id,
+                "s3": config.to_dict(),
+                "allow_large": allow_large,
+            }
+        )
         if push_result["failed"]:
             failed_session, error = push_result["failed"][0]
             raise RuntimeError(f"cloud upload failed: {failed_session}: {error}")
@@ -555,7 +573,11 @@ class MemoDaemon:
             (json.dumps(value, indent=2, sort_keys=True) + "\n").encode(),
         )
 
-    def _push(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _push(
+        self,
+        payload: dict[str, Any],
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> dict[str, Any]:
         from ..transport import (
             PushSummary,
             prepare_generation,
@@ -615,10 +637,17 @@ class MemoDaemon:
                         else:
                             result = {"status": "skipped"}
                     else:
-                        prepared = prepare_generation(self.store, session)
+                        prepared = prepare_generation(self.store, session, progress=progress)
                 if prepared is not None:
                     result = publish_generation(
-                        self.store, session, prepared, config, remote, update_local=False
+                        self.store,
+                        session,
+                        prepared,
+                        config,
+                        remote,
+                        update_local=False,
+                        allow_large=payload.get("allow_large") is True,
+                        progress=progress,
                     )
                     with self._session_lock(session.session_id):
                         current = self.store.load_session(session.session_id)
@@ -673,7 +702,11 @@ class MemoDaemon:
             except Exception as error:
                 print(f"memo daemon: automatic push failed: {error}", file=sys.stderr)
 
-    def dispatch(self, message: Request) -> dict[str, Any]:
+    def dispatch(
+        self,
+        message: Request,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> dict[str, Any]:
         if message.operation == "health":
             return {"status": "ok"}
         if message.operation == "attach":
@@ -709,7 +742,7 @@ class MemoDaemon:
         if message.operation == "end":
             return self._end(message.payload)
         if message.operation == "push":
-            return self._push(message.payload)
+            return self._push(message.payload, progress=progress)
         if message.operation == "remove_archived":
             return self._remove_archived(message.payload)
         if message.operation == "agent_launch":
@@ -734,7 +767,34 @@ class MemoDaemon:
         with connection:
             try:
                 message = receive_request(connection)
-                response = Response(True, self.dispatch(message))
+                send_progress = message.payload.get("_progress") is True
+                disconnected = False
+
+                def progress(completed: int, total: int, detail: str) -> None:
+                    nonlocal disconnected
+                    if not send_progress or disconnected:
+                        return
+                    try:
+                        send_message(
+                            connection,
+                            Response(
+                                True,
+                                {
+                                    "_progress": {
+                                        "completed": completed,
+                                        "total": total,
+                                        "message": detail,
+                                    }
+                                },
+                            ),
+                        )
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        disconnected = True
+
+                response = Response(
+                    True,
+                    self.dispatch(message, progress=progress if send_progress else None),
+                )
             except DisconnectedError:
                 return
             except Exception as error:

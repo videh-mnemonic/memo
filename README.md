@@ -58,11 +58,20 @@ Optional settings:
 - `MEMO_S3_REGION`: AWS region.
 - `MEMO_S3_PROFILE`: AWS credentials profile.
 - `MEMO_S3_UPLOAD_CONCURRENCY`: multipart upload concurrency; defaults to `3`.
+- `MEMO_LARGE_ARCHIVE_BYTES`: maximum generation size before Memo requires an
+  explicit override; defaults to `1073741824` (1 GiB). Set it to `0` to
+  require `--allow-large` for every upload.
 
 Memo uses AWS environment, profile, and IAM credential providers. Credentials
 need `GetObject`, prefix-limited `ListBucket`, `PutObject`, and
 `AbortMultipartUpload`; object deletion is not required. Archives are
 checksummed, validated before installation, and installed atomically.
+
+Memo refuses to upload a generation larger than the configured safety limit
+before starting the remote transfer. Interactive `memo push` offers a
+confirmation; use `memo push --allow-large` or `memo end --allow-large` when a
+large archive is intentional. Automatic and non-interactive pushes fail and
+retain the local recording for inspection.
 
 S3 is part of Memo's durability contract, not a best-effort backup. Explicit
 push, pull, import, archive inspection, and final publication failures make the
@@ -361,8 +370,9 @@ memo status --include-archive
   stale after about five minutes. Starting `memo` in that directory will then
   offer to resume the existing recording or complete it and start a new one.
 - Each step contains a directory snapshot, terminal-stream high-water marks,
-  and references to captured agent runs. `HEAD` points only to a completely
-  published step.
+  and references to captured agent runs. New recordings store filesystem
+  snapshots as commits in a session-local Git object store, so unchanged files
+  are shared across steps. `HEAD` points only to a completely published step.
 - Filesystem capture stays rooted at the original directory even if a shell
   changes directories. Git-compatible ignore rules are honored. Files over 100
   MiB and files changing during capture are skipped or retain their previous
