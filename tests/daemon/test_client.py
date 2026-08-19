@@ -63,6 +63,7 @@ def test_push_sends_caller_s3_config(monkeypatch, tmp_path) -> None:
     assert captured["payload"]["s3"]["region"] == "region"
     assert captured["payload"]["s3"]["access_key"] == "access"
     assert captured["payload"]["s3"]["secret_key"] == "secret"
+    assert captured["timeout"] == client.LONG_OPERATION_TIMEOUT_SECONDS
 
 
 def test_end_waits_for_push_and_sends_s3_config(monkeypatch, tmp_path) -> None:
@@ -91,4 +92,4 @@ def test_end_waits_for_push_and_sends_s3_config(monkeypatch, tmp_path) -> None:
     assert captured["operation"] == "end"
     assert "wait_for_push" not in captured["payload"]
     assert captured["payload"]["s3"]["bucket"] == "bucket"
-    assert captured["timeout"] == 300.0
+    assert captured["timeout"] == client.LONG_OPERATION_TIMEOUT_SECONDS

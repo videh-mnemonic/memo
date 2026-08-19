@@ -14,6 +14,7 @@ from ..transport.config import S3Config
 from .protocol import ProtocolError, request
 
 REMOVE_ARCHIVED_TIMEOUT_SECONDS = 15 * 60
+LONG_OPERATION_TIMEOUT_SECONDS = 30 * 60
 
 
 def _s3_payload() -> dict[str, Any]:
@@ -106,7 +107,7 @@ def end(
     if allow_large:
         payload["allow_large"] = True
     payload["s3"] = _s3_payload()
-    return request(str(paths.socket), "end", payload, timeout=300.0)
+    return request(str(paths.socket), "end", payload, timeout=LONG_OPERATION_TIMEOUT_SECONDS)
 
 
 def push(
@@ -121,7 +122,7 @@ def push(
     payload["s3"] = _s3_payload()
     if allow_large:
         payload["allow_large"] = True
-    return request(str(paths.socket), "push", payload, timeout=300.0)
+    return request(str(paths.socket), "push", payload, timeout=LONG_OPERATION_TIMEOUT_SECONDS)
 
 
 def remove_archived(

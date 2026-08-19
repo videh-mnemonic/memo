@@ -112,7 +112,10 @@ def send_message(connection: Connection, value: Request | Response | dict[str, A
 
 
 def request(
-    socket_path: str, operation: str, payload: dict[str, Any] | None = None, timeout: float = 10.0
+    socket_path: str,
+    operation: str,
+    payload: dict[str, Any] | None = None,
+    timeout: float | None = 10.0,
 ) -> dict[str, Any]:
     with Client(socket_path, family="AF_UNIX") as connection:
         send_message(connection, Request(operation, payload or {}))
