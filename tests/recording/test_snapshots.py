@@ -114,6 +114,20 @@ def test_step_publisher_uses_git_commits_and_restores_files(tmp_path: Path) -> N
         text=True,
     ).stdout.split()[2]
     assert first_blob == second_blob
+    assert (
+        subprocess.run(
+            ["git", "--git-dir", str(repository), "rev-parse", "refs/heads/master"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == second.snapshot_commit
+    )
+    subprocess.run(
+        ["git", "--git-dir", str(repository), "update-ref", "-d", "refs/heads/master"],
+        check=True,
+    )
+    assert store.head("session").snapshot_commit == second.snapshot_commit
 
 
 def test_git_restore_rejects_symlink_entries(tmp_path: Path) -> None:

@@ -95,6 +95,8 @@ class SessionStore:
         self._validate_manifest(path, session_id, manifest, streams=True)
         if manifest.step != int(value):
             raise ValueError("HEAD step does not match manifest")
+        if manifest.snapshot_commit:
+            GitSnapshotStore(path / "snapshots.git").pin(manifest.snapshot_commit)
         return manifest
 
     def step(self, session_id: str, selector: str | int = -1) -> StepManifest:
@@ -284,6 +286,8 @@ class SessionStore:
                 raise ValueError("step filename does not match manifest")
             cls._validate_manifest(path, session_id, manifest, streams=True)
             manifests.append(manifest)
+        if manifests[-1].snapshot_commit:
+            GitSnapshotStore(path / "snapshots.git").pin(manifests[-1].snapshot_commit)
         return manifests
 
     def next_step(self, session_id: str) -> int:

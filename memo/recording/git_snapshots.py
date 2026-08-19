@@ -14,6 +14,8 @@ class GitSnapshotError(RuntimeError):
 
 
 class GitSnapshotStore:
+    REF = "refs/heads/master"
+
     def __init__(self, path: Path):
         self.path = path
 
@@ -58,7 +60,9 @@ class GitSnapshotStore:
             )
         finally:
             Path(index_name).unlink(missing_ok=True)
-        return result.stdout.strip()
+        commit = result.stdout.strip()
+        self._run("--git-dir", str(self.path), "update-ref", self.REF, commit)
+        return commit
 
     def contains(self, commit: str) -> bool:
         if not self.path.is_dir():
@@ -70,6 +74,37 @@ class GitSnapshotStore:
             text=True,
         )
         return result.returncode == 0
+
+    def pin(self, commit: str) -> None:
+        """Keep the current snapshot reachable from the repository's branch ref."""
+        if not self.contains(commit):
+            raise GitSnapshotError(f"snapshot commit is missing: {commit}")
+        current = subprocess.run(
+            ["git", "--git-dir", str(self.path), "rev-parse", "--verify", self.REF],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if current.returncode == 0:
+            current_commit = current.stdout.strip()
+            if current_commit == commit:
+                return
+            ancestor = subprocess.run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(self.path),
+                    "merge-base",
+                    "--is-ancestor",
+                    current_commit,
+                    commit,
+                ],
+                capture_output=True,
+                check=False,
+            )
+            if ancestor.returncode != 0:
+                return
+        self._run("--git-dir", str(self.path), "update-ref", self.REF, commit)
 
     def restore(self, commit: str, destination: Path) -> None:
         if not self.contains(commit):
