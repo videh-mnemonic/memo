@@ -268,7 +268,11 @@ class PreparedGeneration:
         self.path.unlink(missing_ok=True)
 
 
-def prepare_generation(store: SessionStore, session: DirectorySession) -> PreparedGeneration:
+def prepare_generation(
+    store: SessionStore,
+    session: DirectorySession,
+    progress: Callable[[int, int, str], None] | None = None,
+) -> PreparedGeneration:
     """Prepare a deterministic generation archive on disk."""
     manifests = store.steps(session.session_id)
     if not manifests:
@@ -284,14 +288,19 @@ def prepare_generation(store: SessionStore, session: DirectorySession) -> Prepar
     )
     path = Path(name)
     try:
+        if progress is not None:
+            progress(0, 1, "creating archive")
         with os.fdopen(descriptor, "wb") as handle:
             hashing = HashingWriter(handle)
             write_deterministic_tar_zst(root, _history_paths(root, manifests), hashing)
             handle.flush()
             os.fsync(handle.fileno())
-        return PreparedGeneration(
+        prepared = PreparedGeneration(
             session.session_id, manifest.step, hashing.hexdigest(), path, path.stat().st_size
         )
+        if progress is not None:
+            progress(1, 1, f"archive ready ({prepared.size_bytes / (1024**2):.1f} MiB)")
+        return prepared
     except BaseException:
         with suppress(OSError):
             os.close(descriptor)

@@ -211,6 +211,7 @@ def publish_generation(
     *,
     update_local: bool = True,
     allow_large: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
     """Publish an append-only generation and its discovery records."""
     remote = _store(config, client)
@@ -222,7 +223,11 @@ def publish_generation(
     if existing is not None and existing != (generation, prepared.digest):
         raise ValueError(f"remote generation fork at step {prepared.step}")
     if not remote.exists(generation):
-        remote.upload_file(generation, prepared.path)
+        if progress is not None:
+            progress(0, prepared.size_bytes, "uploading archive")
+        remote.upload_file(generation, prepared.path, progress=progress)
+        if progress is not None:
+            progress(prepared.size_bytes, prepared.size_bytes, "upload complete")
     remote_size = remote.size(generation)
     if remote_size != prepared.size_bytes:
         raise ValueError(
@@ -299,6 +304,7 @@ def push_session(
     client: Any | None = None,
     *,
     allow_large: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
     """Package and publish a session unless its current step was already pushed."""
     manifest = store.head(session.session_id)
@@ -332,10 +338,16 @@ def push_session(
             "digest": session.last_pushed_digest,
             "status": "skipped",
         }
-    prepared = prepare_generation(store, session)
+    prepared = prepare_generation(store, session, progress=progress)
     try:
         return publish_generation(
-            store, session, prepared, config, client, allow_large=allow_large
+            store,
+            session,
+            prepared,
+            config,
+            client,
+            allow_large=allow_large,
+            progress=progress,
         )
     finally:
         prepared.cleanup()

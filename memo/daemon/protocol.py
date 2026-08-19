@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from multiprocessing.connection import Client, Connection
 from typing import Any
@@ -116,12 +117,22 @@ def request(
     operation: str,
     payload: dict[str, Any] | None = None,
     timeout: float | None = 10.0,
+    progress: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
+    request_payload = dict(payload or {})
+    if progress is not None:
+        request_payload["_progress"] = True
     with Client(socket_path, family="AF_UNIX") as connection:
-        send_message(connection, Request(operation, payload or {}))
-        if not connection.poll(timeout):
-            raise TimeoutError(f"daemon request timed out after {timeout} seconds")
-        response = receive_response(connection)
+        send_message(connection, Request(operation, request_payload))
+        while True:
+            if not connection.poll(timeout):
+                raise TimeoutError(f"daemon request timed out after {timeout} seconds")
+            response = receive_response(connection)
+            event = response.payload.get("_progress") if response.ok else None
+            if progress is not None and isinstance(event, dict):
+                progress(int(event["completed"]), int(event["total"]), str(event["message"]))
+                continue
+            break
     if not response.ok:
         raise ProtocolError(response.error or "daemon request failed")
     return response.payload

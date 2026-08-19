@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +116,7 @@ def push(
     paths: StoragePaths | None = None,
     *,
     allow_large: bool = False,
+    progress: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     paths = paths or StoragePaths.discover()
     ensure_daemon(paths)
@@ -122,7 +124,10 @@ def push(
     payload["s3"] = _s3_payload()
     if allow_large:
         payload["allow_large"] = True
-    return request(str(paths.socket), "push", payload, timeout=LONG_OPERATION_TIMEOUT_SECONDS)
+    request_options: dict[str, Any] = {"timeout": LONG_OPERATION_TIMEOUT_SECONDS}
+    if progress is not None:
+        request_options["progress"] = progress
+    return request(str(paths.socket), "push", payload, **request_options)
 
 
 def remove_archived(

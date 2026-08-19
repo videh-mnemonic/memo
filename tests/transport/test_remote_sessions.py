@@ -89,10 +89,18 @@ class FakeS3:
         if key == self.fail_key or self.fail_operation == ("upload", None):
             raise OSError("injected upload failure")
         chunks = []
+        progress = kwargs.get("progress")
+        total = Path(file_path).stat().st_size
+        if progress is not None:
+            progress.set_meta(key, total)
+        completed = 0
         with Path(file_path).open("rb") as handle:
             while chunk := handle.read(MULTIPART_PART_SIZE):
                 self.part_sizes.append(len(chunk))
                 chunks.append(chunk)
+                completed += len(chunk)
+                if progress is not None:
+                    progress.update(len(chunk))
         self.objects[key] = b"".join(chunks)
 
     def stat_object(self, bucket: str, key: str) -> object:
@@ -552,8 +560,17 @@ def test_push_publishes_immutable_generation_index_and_completion_and_skips_unch
     store, session = _published(_paths(tmp_path / "home"), root)
     client = FakeS3()
     config = S3Config("bucket", "prefix")
-    result = push_session(store, session, config, client)
+    progress: list[tuple[int, int, str]] = []
+    result = push_session(
+        store, session, config, client, progress=lambda completed, total, message: progress.append(
+            (completed, total, message)
+        )
+    )
     assert result["status"] == "pushed"
+    assert any(message == "creating archive" for _, _, message in progress)
+    upload_progress = [event for event in progress if event[2] == "uploading archive"]
+    assert upload_progress
+    assert upload_progress[-1][0] == upload_progress[-1][1] > 0
     digest = str(result["digest"])
     generation = f"prefix/user/host/sessions/session/generations/00000001-{digest}.tar.zst"
     completion_key = f"prefix/user/host/sessions/session/completions/00000001-{digest}.json"
