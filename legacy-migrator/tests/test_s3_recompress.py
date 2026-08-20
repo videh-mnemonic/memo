@@ -1,29 +1,44 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
+import json
+import shutil
+import tarfile
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from memo_legacy_migrator.s3_recompress import (
-    _convert_snapshots,
+    RemoteCandidate,
     _install_replacement,
-    _RemoteSource,
-    _Replacement,
+    _prepare_replacement,
+    discover_remote_candidates,
+    recompress_s3,
+    source_for_candidate,
 )
+from memo_legacy_migrator.session_upgrade import AlreadyLatest, upgrade_session
 
-from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
+from memo.recording.git_snapshots import GitSnapshotStore
+from memo.recording.metadata import (
+    STEP_SCHEMA_VERSION,
+    DirectorySession,
+    SessionOrigin,
+    SnapshotEntry,
+    StepManifest,
+    digest_entries,
+    encode_entries,
+)
 from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore
 from memo.transport import remote_sessions
-from memo.transport.archive import (
-    PreparedGeneration,
-    prepare_generation,
-    safe_extract_tar_zst_stream,
-)
+from memo.transport.archive import prepare_generation, safe_extract_tar_zst_stream
 from memo.transport.config import S3Config
 from memo.transport.s3 import S3Store
+
+ORIGIN = SessionOrigin("0.9.0", "user", "host")
 
 
 class FakeS3:
@@ -70,154 +85,409 @@ class FakeS3:
         self.objects.pop(key, None)
 
 
-def _replacement(tmp_path: Path, client: FakeS3) -> tuple[S3Store, _Replacement, str]:
-    config = S3Config("bucket", "prefix")
-    remote = S3Store(config, client)
-    session = DirectorySession(
-        "session",
-        "/recorded/root",
-        "now",
-        "now",
-        SessionOrigin("1.0.0", "user", "host"),
-        state="complete",
-    )
-    base = remote_sessions._session_base(config, session.origin, session.session_id)
-    old_data = b"original archive"
-    old_digest = hashlib.sha256(old_data).hexdigest()
-    old_generation = remote_sessions._generation_key(base, 0, old_digest)
-    old_completion = remote_sessions._completion_key(base, 0, old_digest)
-    old_completion_data = remote_sessions._canonical_json(
-        {
-            "schema_version": 1,
-            "session_id": session.session_id,
-            "final_step": 0,
-            "generation": old_generation,
-            "sha256": old_digest,
-        }
-    )
-    client.objects[old_generation] = old_data
-    client.objects[old_completion] = old_completion_data
-    index_key, index_data = remote_sessions._index_record(config, session)
-    client.objects[index_key] = index_data
-
-    candidate = tmp_path / "candidate.tar.zst"
-    candidate.write_bytes(b"verified replacement")
-    candidate_digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
-    prepared = PreparedGeneration(
-        session.session_id,
-        1,
-        candidate_digest,
-        candidate,
-        candidate.stat().st_size,
-    )
-    source = _RemoteSource(
-        session.session_id,
-        0,
-        old_generation,
-        old_digest,
-        old_completion,
-        old_completion_data,
-    )
-    return remote, _Replacement(source, session, prepared, len(old_data)), old_generation
+def _json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
-def test_convert_snapshots_preserves_every_filesystem_step(tmp_path: Path) -> None:
-    paths = StoragePaths(tmp_path / "home")
-    store = SessionStore(paths)
-    session = DirectorySession(
-        "session",
-        "/recorded/root",
-        "now",
-        "now",
-        SessionOrigin("1.0.0", "user", "host"),
-    )
-    session_root = store.create(session)
-    expected = []
-    for step, content in enumerate((b"first", b"second")):
-        snapshot = session_root / f"prepared-{step}"
-        snapshot.mkdir()
+def _session_value(session_id: str, version: int, *, origin: bool = True) -> dict[str, object]:
+    value: dict[str, object] = {
+        "format": "memo-directory-session",
+        "format_version": version,
+        "session_id": session_id,
+        "root": "/recorded/root",
+        "created_utc": "2025-01-01T00:00:00Z",
+        "updated_utc": "2025-01-01T00:00:01Z",
+        "state": "complete",
+        "capture_scope": "partial",
+    }
+    if origin:
+        value["origin"] = asdict(ORIGIN)
+    else:
+        value["archive_namespace"] = "legacy-host"
+    return value
+
+
+def _common_directories(root: Path) -> None:
+    (root / "streams" / "terminals").mkdir(parents=True)
+    (root / "agents" / "runs").mkdir(parents=True)
+    (root / "agents" / "traces").mkdir(parents=True)
+
+
+def _checkpoint_session(root: Path, session_id: str) -> list[bytes]:
+    root.mkdir(parents=True)
+    _common_directories(root)
+    _json(root / "session.json", _session_value(session_id, 1, origin=False))
+    expected = [b"checkpoint one", b"checkpoint two"]
+    for generation, content in enumerate(expected, 1):
+        checkpoint_id = f"checkpoint-{generation}"
+        snapshot = root / "snapshots" / checkpoint_id
+        snapshot.mkdir(parents=True)
         (snapshot / "file.bin").write_bytes(content)
-        manifest = StepManifest(
-            session.session_id,
-            step,
-            "now",
-            f"snapshots/{step}",
-            [SnapshotEntry("file.bin", "file", 0o644, len(content))],
+        _json(
+            root / "checkpoints" / f"{checkpoint_id}.json",
+            {
+                "session_id": session_id,
+                "checkpoint_id": checkpoint_id,
+                "schema_version": 1,
+                "generation": generation,
+                "created_utc": f"time-{generation}",
+                "snapshot": f"snapshots/{checkpoint_id}",
+                "entries": [asdict(SnapshotEntry("file.bin", "file", 0o644, len(content)))],
+            },
         )
-        store.publish(session, manifest, snapshot)
-        expected.append(content)
+    (root / "HEAD").write_text("checkpoint-2\n")
+    return expected
 
-    tree_ids, expected_entries = _convert_snapshots(session_root, session.session_id)
-    manifests = store.steps(session.session_id)
 
-    assert len(tree_ids) == 3
-    assert tree_ids[-1] == tree_ids[-2]
-    assert expected_entries == [[], [], []]
-    assert all(manifest.snapshot_commit for manifest in manifests)
-    for index, content in enumerate((*expected, expected[-1])):
-        restored = tmp_path / f"restored-{index}"
-        store.restore_manifest(session.session_id, manifests[index], restored)
+def _numeric_session(
+    root: Path,
+    session_id: str,
+    schemas: list[int],
+    *,
+    complete_fields: bool = False,
+) -> list[bytes]:
+    root.mkdir(parents=True)
+    _common_directories(root)
+    session_value = _session_value(session_id, 2)
+    if complete_fields:
+        session_value.update(
+            last_pushed_step=None,
+            last_pushed_digest=None,
+            remote_object=None,
+        )
+    _json(root / "session.json", session_value)
+    expected = [f"step {step}".encode() for step in range(len(schemas))]
+    repository = GitSnapshotStore(root / "snapshots.git")
+    parent = None
+    for step, (schema, content) in enumerate(zip(schemas, expected, strict=True)):
+        snapshot = root / "snapshots" / str(step)
+        snapshot.mkdir(parents=True)
+        (snapshot / "file.bin").write_bytes(content)
+        entries = [
+            SnapshotEntry("file.bin", "file", 0o644, len(content)),
+            SnapshotEntry("ignored", "ignored-policy", 0),
+        ]
+        commit = None
+        entries_digest = None
+        stored_entries = entries
+        if schema >= 2:
+            commit = repository.commit(snapshot, parent, f"old step {step}")
+            parent = commit
+            shutil.rmtree(snapshot)
+        if schema == STEP_SCHEMA_VERSION:
+            stored_entries = [entries[-1]]
+            entries_digest = digest_entries(stored_entries)
+            (root / "entries").mkdir(exist_ok=True)
+            (root / "entries" / f"{entries_digest}.json").write_bytes(
+                encode_entries(stored_entries)
+            )
+        manifest = StepManifest(
+            session_id,
+            step,
+            f"time-{step}",
+            f"snapshots/{step}",
+            stored_entries,
+            schema_version=schema,
+            snapshot_commit=commit,
+            entries_digest=entries_digest,
+        )
+        _json(root / "steps" / f"{step}.json", manifest.to_stored_dict())
+    (root / "HEAD").write_text(f"{len(schemas) - 1}\n")
+    return expected
+
+
+def _assert_latest(root: Path, session_id: str, expected: list[bytes], *, boundary: bool) -> None:
+    session = DirectorySession.load(root / "session.json")
+    assert session.origin == ORIGIN
+    store = SessionStore(
+        StoragePaths(
+            root.parent,
+            archive=root.parent,
+            runtime=root.parent / "runtime-test",
+            spool=root.parent / "spool-test",
+        )
+    )
+    manifests = store.steps(session_id)
+    assert len(manifests) == len(expected) + int(boundary)
+    assert all(manifest.schema_version == STEP_SCHEMA_VERSION for manifest in manifests)
+    assert all(manifest.snapshot_commit and manifest.entries_digest for manifest in manifests)
+    for step, content in enumerate(expected + ([expected[-1]] if boundary else [])):
+        restored = root.parent / f"restore-{session_id}-{step}"
+        store.restore_manifest(session_id, manifests[step], restored)
         assert (restored / "file.bin").read_bytes() == content
 
-    prepared = prepare_generation(store, session)
-    try:
-        packaged = tmp_path / "packaged" / session.session_id
-        packaged.mkdir(parents=True)
-        with prepared.path.open("rb") as archive:
-            safe_extract_tar_zst_stream(archive, packaged)
-        assert (packaged / "snapshots.bundle").is_file()
-        remote_sessions._restore_snapshot_bundle(packaged, session.session_id)
-        packaged_store = SessionStore(
-            StoragePaths(
-                packaged.parent,
-                archive=packaged.parent,
-                runtime=tmp_path / "packaged-runtime",
-                spool=tmp_path / "packaged-spool",
-            )
+
+@pytest.mark.parametrize(
+    ("builder", "schemas", "source_format"),
+    [
+        ("checkpoint", [], "directory-v1-checkpoints"),
+        ("numeric", [1, 1], "directory-v2-steps-1-directories"),
+        ("numeric", [1, 2], "directory-v2-steps-1-2-repository"),
+        ("numeric", [2, 2], "directory-v2-steps-2-repository"),
+        ("numeric", [3, 3], "directory-v2-steps-3-repository"),
+    ],
+)
+def test_upgrade_session_handles_every_directory_representation(
+    tmp_path: Path, builder: str, schemas: list[int], source_format: str
+) -> None:
+    root = tmp_path / "session"
+    expected = (
+        _checkpoint_session(root, "session")
+        if builder == "checkpoint"
+        else _numeric_session(root, "session", schemas)
+    )
+
+    result = upgrade_session(
+        root,
+        "session",
+        ORIGIN,
+        transport_is_current=False,
+        archive_had_bundle=False,
+    )
+
+    assert result.source_format == source_format
+    _assert_latest(root, "session", expected, boundary=False)
+
+
+def test_upgrade_session_recognizes_fully_current_bundle(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "session"
+    _numeric_session(source, "session", [3], complete_fields=True)
+    store = SessionStore(
+        StoragePaths(
+            source.parent,
+            archive=source.parent,
+            runtime=tmp_path / "runtime",
+            spool=tmp_path / "spool",
         )
-        packaged_manifests = packaged_store.steps(session.session_id)
-        assert [manifest.entries for manifest in packaged_manifests] == expected_entries
-        assert not (packaged / "snapshots.bundle").exists()
+    )
+    prepared = prepare_generation(store, DirectorySession.load(source / "session.json"))
+    extracted = tmp_path / "extracted" / "session"
+    extracted.mkdir(parents=True)
+    try:
+        with prepared.path.open("rb") as archive:
+            safe_extract_tar_zst_stream(archive, extracted)
+    finally:
+        prepared.cleanup()
+
+    with pytest.raises(AlreadyLatest):
+        upgrade_session(
+            extracted,
+            "session",
+            ORIGIN,
+            transport_is_current=True,
+            archive_had_bundle=True,
+        )
+
+
+def _tar_zst(root: Path) -> bytes:
+    store = SessionStore(
+        StoragePaths(
+            root.parent,
+            archive=root.parent,
+            runtime=root.parent / "archive-runtime",
+            spool=root.parent / "archive-spool",
+        )
+    )
+    prepared = prepare_generation(store, DirectorySession.load(root / "session.json"))
+    try:
+        return prepared.path.read_bytes()
     finally:
         prepared.cleanup()
 
 
-def test_install_replacement_verifies_before_removing_original(tmp_path: Path) -> None:
-    client = FakeS3()
-    remote, replacement, old_generation = _replacement(tmp_path, client)
+def _tar_gz(root: Path) -> bytes:
+    target = root.parent / "archive.tar.gz"
+    with target.open("wb") as raw:
+        with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w") as archive:
+                for path in sorted(root.rglob("*")):
+                    archive.add(path, arcname=path.relative_to(root), recursive=False)
+    return target.read_bytes()
 
-    _install_replacement(remote, remote.config, replacement)
 
-    assert old_generation not in client.objects
-    remove_original = client.operations.index(("remove", old_generation))
-    candidate_gets = [
-        index
-        for index, operation in enumerate(client.operations)
-        if operation[0] == "get" and "migration-staging" not in operation[1]
-    ]
-    assert candidate_gets
-    assert remove_original > max(candidate_gets)
-    selected = remote_sessions._select_generation(
-        remote,
-        remote.config,
-        old_generation.rsplit("/generations/", 1)[0],
-        "session",
+def _put_mutable(
+    client: FakeS3,
+    config: S3Config,
+    archive: bytes,
+    *,
+    schema: int,
+    checkpoint: bool = False,
+    compressed: str = "tar.zst",
+) -> str:
+    base = (
+        f"{config.prefix}/user/host/sessions/session"
+        if schema == 3
+        else f"{config.prefix}/legacy/session"
     )
-    assert selected[0] == 1
-    assert selected[3] is True
+    directory = "generations" if checkpoint else "steps"
+    digest = hashlib.sha256(archive).hexdigest()
+    object_key = f"{base}/{directory}/1-{digest}.{compressed}"
+    latest = f"{base}/latest.json"
+    client.objects[object_key] = archive
+    client.objects[f"{object_key}.sha256"] = f"{digest}  archive.{compressed}\n".encode()
+    pointer: dict[str, object] = {
+        "schema_version": schema,
+        "session_id": "session",
+        "step" if not checkpoint else "generation": 1,
+        "object": object_key,
+        "checksum": f"{object_key}.sha256",
+        "digest": digest,
+    }
+    if schema == 3:
+        pointer["origin"] = asdict(ORIGIN)
+        client.objects[f"{config.prefix}/index/sessions/session.json"] = json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": "session",
+                **asdict(ORIGIN),
+                "latest": latest,
+            }
+        ).encode()
+    else:
+        pointer["namespace"] = "legacy"
+    client.objects[latest] = json.dumps(pointer).encode()
+    return object_key
 
 
-def test_install_replacement_preserves_original_when_staging_is_corrupt(
-    tmp_path: Path,
+def _put_sidecar(client: FakeS3, config: S3Config, archive: bytes) -> str:
+    base = f"{config.prefix}/user/host/sessions/session"
+    object_key = f"{base}/generations/00000001.tar.zst"
+    checksum_key = f"{base}/generations/00000001.sha256"
+    completion_key = f"{base}/completion.json"
+    digest = hashlib.sha256(archive).hexdigest()
+    client.objects[object_key] = archive
+    client.objects[checksum_key] = f"{digest}  00000001.tar.zst\n".encode()
+    client.objects[completion_key] = json.dumps(
+        {
+            "schema_version": 1,
+            "session_id": "session",
+            "final_step": 1,
+            "generation": object_key,
+            "sha256": digest,
+        }
+    ).encode()
+    index = f"{config.prefix}/index/sessions/session.json"
+    client.objects[index] = json.dumps(
+        {
+            "schema_version": 1,
+            "session_id": "session",
+            **asdict(ORIGIN),
+        }
+    ).encode()
+    return object_key
+
+
+def _put_content_addressed(client: FakeS3, config: S3Config, archive: bytes) -> str:
+    session = DirectorySession(
+        "session", "/recorded/root", "created", "updated", ORIGIN, state="complete"
+    )
+    base = remote_sessions._session_base(config, ORIGIN, "session")
+    digest = hashlib.sha256(archive).hexdigest()
+    object_key = remote_sessions._generation_key(base, 1, digest)
+    completion = remote_sessions._completion_key(base, 1, digest)
+    index_key, index_data = remote_sessions._index_record(config, session)
+    client.objects[object_key] = archive
+    client.objects[completion] = remote_sessions._canonical_json(
+        {
+            "schema_version": 1,
+            "session_id": "session",
+            "final_step": 1,
+            "generation": object_key,
+            "sha256": digest,
+        }
+    )
+    client.objects[index_key] = index_data
+    return object_key
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["mutable-v1", "mutable-v2", "mutable-v3", "sidecar", "content-addressed"],
+)
+def test_remote_upgrade_handles_every_transport_and_removes_source_last(
+    tmp_path: Path, layout: str
 ) -> None:
+    config = S3Config("bucket", "prefix")
     client = FakeS3()
-    remote, replacement, old_generation = _replacement(tmp_path, client)
-    original = client.objects[old_generation]
+    source_root = tmp_path / "source" / "session"
+    if layout == "mutable-v1":
+        _checkpoint_session(source_root, "session")
+        original = _put_mutable(
+            client,
+            config,
+            _tar_gz(source_root),
+            schema=1,
+            checkpoint=True,
+            compressed="tar.gz",
+        )
+    else:
+        _numeric_session(source_root, "session", [1, 1])
+        archive = _tar_zst(source_root)
+        if layout.startswith("mutable-"):
+            original = _put_mutable(client, config, archive, schema=int(layout[-1]))
+        elif layout == "sidecar":
+            original = _put_sidecar(client, config, archive)
+        else:
+            original = _put_content_addressed(client, config, archive)
+
+    dry_run_objects = dict(client.objects)
+    dry_run = recompress_s3(config, client, dry_run=True)
+    assert not dry_run.failed
+    assert dry_run.migrated == ["session"]
+    assert client.objects == dry_run_objects
+
+    summary = recompress_s3(config, client)
+
+    assert summary.migrated == ["session"]
+    assert not summary.failed
+    assert original not in client.objects
+    original_removal = client.operations.index(("remove", original))
+    later_source_removals = [
+        operation
+        for operation in client.operations[original_removal + 1 :]
+        if operation[0] == "remove" and "migration-staging" not in operation[1]
+    ]
+    assert not later_source_removals
+    selected_index = remote_sessions._load_index(S3Store(config, client), config, "session")
+    selected_base = remote_sessions._session_base(config, selected_index, "session")
+    assert remote_sessions._select_generation(
+        S3Store(config, client), config, selected_base, "session"
+    )[3]
+
+
+def test_install_preserves_original_when_staging_is_corrupt(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    original = _put_content_addressed(client, config, _tar_zst(source_root))
+    remote = S3Store(config, client)
+    source = source_for_candidate(
+        remote, config, RemoteCandidate("session", "content-addressed", "session")
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    replacement = _prepare_replacement(remote, source, work)
+    original_data = client.objects[original]
     client.corrupt_uploads = True
+    try:
+        with pytest.raises(ValueError, match="staged replacement"):
+            _install_replacement(remote, config, replacement)
+    finally:
+        replacement.prepared.cleanup()
 
-    with pytest.raises(ValueError, match="staged replacement"):
-        _install_replacement(remote, remote.config, replacement)
+    assert client.objects[original] == original_data
+    assert source.completion_key in client.objects
+    assert ("remove", original) not in client.operations
 
-    assert client.objects[old_generation] == original
-    assert replacement.source.completion_key in client.objects
-    assert ("remove", old_generation) not in client.operations
+
+def test_discovery_rejects_competing_layouts() -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    client.objects["prefix/index/sessions/session.json"] = b"{}"
+    client.objects["prefix/index/sessions/session/" + "a" * 64 + ".json"] = b"{}"
+
+    assert discover_remote_candidates(S3Store(config, client), config) == [
+        RemoteCandidate("session", "conflict", "")
+    ]

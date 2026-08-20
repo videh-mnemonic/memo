@@ -1,29 +1,21 @@
-"""Recompress pre-Git remote session generations without risking source data."""
+"""Upgrade historical S3 session and transport formats without risking source data."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import tempfile
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-from memo.recording.filesystem import atomic_write
 from memo.recording.git_snapshots import GitSnapshotStore
-from memo.recording.metadata import (
-    STEP_SCHEMA_VERSION,
-    DirectorySession,
-    SnapshotEntry,
-    StepManifest,
-    digest_entries,
-    encode_entries,
-    entries_directory,
-    snapshot_exceptions,
-)
+from memo.recording.metadata import DirectorySession, SessionOrigin
 from memo.recording.paths import StoragePaths
-from memo.recording.store import SessionStore
+from memo.recording.store import SessionStore, validate_session_id
 from memo.transport import remote_sessions
 from memo.transport.archive import (
     PreparedGeneration,
@@ -32,6 +24,12 @@ from memo.transport.archive import (
 )
 from memo.transport.config import S3Config
 from memo.transport.s3 import STREAM_READ_SIZE, S3Store
+
+from .migrate import _safe_extract_tar
+from .session_upgrade import AlreadyLatest, UpgradeResult, upgrade_session
+
+SIDECAR_GENERATION = re.compile(r"^(\d{8,})\.tar\.zst$")
+SIDECAR_CHECKSUM = re.compile(r"^(\d{8,})\.sha256$")
 
 
 @dataclass
@@ -42,40 +40,307 @@ class S3RecompressionSummary:
     failed: list[tuple[str, str]] = field(default_factory=list)
     original_bytes: int = 0
     replacement_bytes: int = 0
+    formats: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
-class _RemoteSource:
+class RemoteCandidate:
     session_id: str
+    layout: str
+    locator: str
+
+
+@dataclass(frozen=True)
+class RemoteSource:
+    candidate: RemoteCandidate
+    origin: SessionOrigin
     step: int
     object_key: str
     digest: str
+    archive_kind: str
+    base: str
     completion_key: str | None
     completion_data: bytes | None
+    cleanup_keys: tuple[str, ...]
+
+    @property
+    def session_id(self) -> str:
+        return self.candidate.session_id
 
 
 @dataclass
-class _Replacement:
-    source: _RemoteSource
+class Replacement:
+    source: RemoteSource
     session: DirectorySession
     prepared: PreparedGeneration
     original_size: int
+    source_format: str
 
 
-class _NotEligible(ValueError):
+class NotEligible(ValueError):
     pass
 
 
-class _AlreadyCompressed(_NotEligible):
-    pass
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
-class _NotSmaller(_NotEligible):
-    pass
+def _key(config: S3Config, *parts: object) -> str:
+    suffix = "/".join(str(part).strip("/") for part in parts)
+    return f"{config.prefix}/{suffix}" if config.prefix else suffix
 
 
-def _json_bytes(value: dict[str, object]) -> bytes:
-    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+def _read_json(remote: S3Store, key: str) -> dict[str, Any]:
+    value = json.loads(remote.read_bytes(key))
+    if not isinstance(value, dict):
+        raise ValueError(f"remote metadata is not an object: {key}")
+    return value
+
+
+def _valid_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _origin(value: object, fallback: str) -> SessionOrigin:
+    if isinstance(value, dict):
+        try:
+            fields = tuple(value[key] for key in ("memo_version_id", "username", "hostname"))
+            if not all(isinstance(field, str) for field in fields):
+                raise TypeError("origin fields must be strings")
+            result = SessionOrigin(*fields)
+            result.validate()
+            return result
+        except (KeyError, TypeError, ValueError):
+            pass
+    component = fallback.strip("/").split("/")[-1] or "unknown"
+    return SessionOrigin("pre-origin", "legacy", component)
+
+
+def discover_remote_candidates(remote: S3Store, config: S3Config) -> list[RemoteCandidate]:
+    """Find sessions in every S3 hierarchy Memo has used."""
+    prefix = f"{config.prefix}/" if config.prefix else ""
+    index_prefix = f"{prefix}index/sessions/"
+    current: set[str] = set()
+    sidecar: dict[str, str] = {}
+    latest: dict[str, list[str]] = {}
+    for key in remote.list(prefix):
+        if key.startswith(index_prefix):
+            relative = key[len(index_prefix) :]
+            parts = relative.split("/")
+            if len(parts) == 2 and remote_sessions.INDEX_NAME.fullmatch(parts[1]):
+                with suppress(ValueError):
+                    current.add(validate_session_id(parts[0]))
+            elif len(parts) == 1 and parts[0].endswith(".json"):
+                with suppress(ValueError):
+                    sidecar[validate_session_id(Path(parts[0]).stem)] = key
+        if key.endswith("/latest.json"):
+            try:
+                session_id = validate_session_id(key.rsplit("/", 2)[-2])
+            except ValueError:
+                continue
+            latest.setdefault(session_id, []).append(key)
+
+    candidates: list[RemoteCandidate] = []
+    all_ids = sorted(current | set(sidecar) | set(latest))
+    for session_id in all_ids:
+        layouts = (
+            int(session_id in current) + int(session_id in sidecar) + int(session_id in latest)
+        )
+        if layouts > 1:
+            # A flat index containing a `latest` pointer belongs to the mutable
+            # layout and is not a second copy of the session.
+            flat = sidecar.get(session_id)
+            if flat and session_id in latest:
+                try:
+                    value = _read_json(remote, flat)
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    value = {}
+                if value.get("latest") in latest[session_id]:
+                    sidecar.pop(session_id)
+                    layouts -= 1
+        if layouts != 1:
+            candidates.append(RemoteCandidate(session_id, "conflict", ""))
+        elif session_id in current:
+            candidates.append(RemoteCandidate(session_id, "content-addressed", session_id))
+        elif session_id in sidecar:
+            candidates.append(RemoteCandidate(session_id, "sidecar", sidecar[session_id]))
+        elif len(latest[session_id]) == 1:
+            candidates.append(RemoteCandidate(session_id, "mutable-pointer", latest[session_id][0]))
+        else:
+            candidates.append(RemoteCandidate(session_id, "conflict", ""))
+    return candidates
+
+
+def _current_source(remote: S3Store, config: S3Config, candidate: RemoteCandidate) -> RemoteSource:
+    session_id = candidate.session_id
+    index = remote_sessions._load_index(remote, config, session_id)
+    origin = SessionOrigin(index["memo_version_id"], index["username"], index["hostname"])
+    base = remote_sessions._session_base(config, origin, session_id)
+    step, object_key, digest, complete = remote_sessions._select_generation(
+        remote, config, base, session_id
+    )
+    if not complete:
+        raise NotEligible("remote session is not complete")
+    generations = remote_sessions._list_generations(remote, f"{base}/generations/")
+    if not generations or max(generations) != step:
+        raise NotEligible("selected archive is not the latest remote generation")
+    completion_key = remote_sessions._completion_key(base, step, digest)
+    completion_data = remote.read_bytes(completion_key)
+    return RemoteSource(
+        candidate,
+        origin,
+        step,
+        object_key,
+        digest,
+        "tar.zst",
+        base,
+        completion_key,
+        completion_data,
+        (completion_key, object_key),
+    )
+
+
+def _sidecar_pairs(remote: S3Store, prefix: str) -> dict[int, tuple[str, str]]:
+    packages: dict[int, str] = {}
+    checksums: dict[int, str] = {}
+    for key in remote.list(prefix):
+        relative = key[len(prefix) :]
+        package = SIDECAR_GENERATION.fullmatch(relative)
+        checksum = SIDECAR_CHECKSUM.fullmatch(relative)
+        if package:
+            packages[int(package.group(1))] = key
+        elif checksum:
+            checksums[int(checksum.group(1))] = key
+    return {
+        step: (package, checksums[step]) for step, package in packages.items() if step in checksums
+    }
+
+
+def _sidecar_source(remote: S3Store, config: S3Config, candidate: RemoteCandidate) -> RemoteSource:
+    index = _read_json(remote, candidate.locator)
+    if index.get("schema_version") != 1 or index.get("session_id") != candidate.session_id:
+        raise ValueError("legacy sidecar index is invalid")
+    origin = _origin(index, "sidecar")
+    base = remote_sessions._session_base(config, origin, candidate.session_id)
+    pairs = _sidecar_pairs(remote, f"{base}/generations/")
+    completion_key = f"{base}/completion.json"
+    if not remote.exists(completion_key):
+        raise NotEligible("remote session is not complete")
+    completion_data = remote.read_bytes(completion_key)
+    completion = json.loads(completion_data)
+    if (
+        not isinstance(completion, dict)
+        or completion.get("schema_version") != 1
+        or completion.get("session_id") != candidate.session_id
+    ):
+        raise ValueError("legacy completion record is invalid")
+    step = completion.get("final_step")
+    digest = completion.get("sha256")
+    if not isinstance(step, int) or isinstance(step, bool) or not _valid_digest(digest):
+        raise ValueError("legacy completion record is invalid")
+    pair = pairs.get(step)
+    if pair is None or max(pairs) != step or completion.get("generation") != pair[0]:
+        raise ValueError("legacy completion does not select the latest complete generation")
+    checksum_data = remote.read_bytes(pair[1]).decode().split()
+    if not checksum_data or checksum_data[0] != digest:
+        raise ValueError("legacy checksum and completion record disagree")
+    return RemoteSource(
+        candidate,
+        origin,
+        step,
+        pair[0],
+        str(digest),
+        "tar.zst",
+        base,
+        completion_key,
+        completion_data,
+        (completion_key, candidate.locator, pair[1], pair[0]),
+    )
+
+
+def _mutable_source(remote: S3Store, config: S3Config, candidate: RemoteCandidate) -> RemoteSource:
+    pointer = _read_json(remote, candidate.locator)
+    if pointer.get("schema_version") not in {1, 2, 3}:
+        raise ValueError("unsupported mutable pointer schema")
+    if pointer.get("session_id") != candidate.session_id:
+        raise ValueError("mutable pointer session identity mismatch")
+    object_key = pointer.get("object")
+    checksum_key = pointer.get("checksum")
+    digest = pointer.get("digest")
+    base = candidate.locator.removesuffix("/latest.json")
+    if (
+        not isinstance(object_key, str)
+        or not object_key.startswith(f"{base}/")
+        or not isinstance(checksum_key, str)
+        or checksum_key != f"{object_key}.sha256"
+        or not _valid_digest(digest)
+    ):
+        raise ValueError("mutable pointer object metadata is invalid")
+    checksum = remote.read_bytes(checksum_key).decode().split()
+    if not checksum or checksum[0] != digest:
+        raise ValueError("mutable pointer and checksum disagree")
+    step_value = pointer.get("step", pointer.get("generation", 1))
+    if not isinstance(step_value, int) or isinstance(step_value, bool) or step_value < 0:
+        raise ValueError("mutable pointer has an invalid generation")
+    origin = _origin(pointer.get("origin"), str(pointer.get("namespace") or base))
+    schema = int(pointer["schema_version"])
+    if schema in {1, 2}:
+        namespace = pointer.get("namespace")
+        expected_base = _key(config, namespace, candidate.session_id)
+        allowed_prefixes = (
+            f"{base}/generations/",
+            f"{base}/steps/",
+        )
+        if not isinstance(namespace, str) or not namespace or base != expected_base:
+            raise ValueError("mutable pointer namespace does not match its object hierarchy")
+    else:
+        expected_base = remote_sessions._session_base(config, origin, candidate.session_id)
+        allowed_prefixes = (f"{base}/steps/",)
+        if base != expected_base:
+            raise ValueError("mutable pointer origin does not match its object hierarchy")
+    if not object_key.startswith(allowed_prefixes):
+        raise ValueError("mutable pointer object is outside its generation hierarchy")
+    if object_key.endswith(".tar.gz"):
+        archive_kind = "tar.gz"
+    elif object_key.endswith(".tar.zst"):
+        archive_kind = "tar.zst"
+    else:
+        raise ValueError("mutable pointer has an unsupported archive type")
+    flat_index = _key(config, "index", "sessions", f"{candidate.session_id}.json")
+    cleanup = [candidate.locator, checksum_key]
+    if remote.exists(flat_index):
+        index = _read_json(remote, flat_index)
+        if index.get("latest") == candidate.locator:
+            cleanup.append(flat_index)
+    cleanup.append(object_key)
+    return RemoteSource(
+        candidate,
+        origin,
+        int(step_value),
+        object_key,
+        str(digest),
+        archive_kind,
+        base,
+        None,
+        None,
+        tuple(cleanup),
+    )
+
+
+def source_for_candidate(
+    remote: S3Store, config: S3Config, candidate: RemoteCandidate
+) -> RemoteSource:
+    if candidate.layout == "content-addressed":
+        return _current_source(remote, config, candidate)
+    if candidate.layout == "sidecar":
+        return _sidecar_source(remote, config, candidate)
+    if candidate.layout == "mutable-pointer":
+        return _mutable_source(remote, config, candidate)
+    raise ValueError("multiple remote layouts advertise this session")
 
 
 def _file_digest(path: Path) -> str:
@@ -96,58 +361,25 @@ def _stream_digest(remote: S3Store, key: str) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _preserved_files(root: Path) -> dict[str, tuple[str, int, str | None]]:
-    """Fingerprint archive data that the snapshot conversion must not touch."""
-    result: dict[str, tuple[str, int, str | None]] = {}
+def _preserved_files(root: Path) -> dict[str, tuple[int, str]]:
+    result: dict[str, tuple[int, str]] = {}
+    transformed_roots = {"checkpoints", "entries", "snapshots", "snapshots.git", "steps"}
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
-        transformed = (
-            relative.as_posix() == "HEAD"
-            or relative.parts[0] in {"entries", "snapshots", "snapshots.git"}
-            or (
-                len(relative.parts) == 2
-                and relative.parts[0] == "steps"
-                and relative.suffix == ".json"
-                and relative.stem.isdigit()
-            )
-        )
-        if transformed:
+        if (
+            relative.as_posix() in {"HEAD", "session.json"}
+            or relative.parts[0] in transformed_roots
+        ):
             continue
         if path.is_file():
-            result[relative.as_posix()] = (
-                "file",
-                path.stat().st_mode & 0o777,
-                _file_digest(path),
-            )
-        elif path.is_dir():
-            result[relative.as_posix()] = (
-                "directory",
-                path.stat().st_mode & 0o777,
-                None,
-            )
+            result[relative.as_posix()] = (path.stat().st_mode & 0o777, _file_digest(path))
     return result
 
 
-def _source_for_session(remote: S3Store, config: S3Config, session_id: str) -> _RemoteSource:
-    origin = remote_sessions._load_index(remote, config, session_id)
-    base = remote_sessions._session_base(config, origin, session_id)
-    step, object_key, digest, complete = remote_sessions._select_generation(
-        remote, config, base, session_id
-    )
-    if not complete:
-        raise _NotEligible("remote session is not complete")
-    generations = remote_sessions._list_generations(remote, f"{base}/generations/")
-    if not generations or max(generations) != step:
-        raise _NotEligible("selected archive is not the latest remote generation")
-    completion_key = remote_sessions._completion_key(base, step, digest)
-    completion_data = remote.read_bytes(completion_key)
-    return _RemoteSource(session_id, step, object_key, digest, completion_key, completion_data)
-
-
-def _download(remote: S3Store, source: _RemoteSource, destination: Path) -> int:
+def _download(remote: S3Store, source: RemoteSource, destination: Path) -> tuple[int, bool]:
     expected_size = remote.size(source.object_key)
+    archive_path = destination.parent / f".{source.session_id}.original.{source.archive_kind}"
     body = remote.open(source.object_key)
-    archive_path = destination.parent / f".{source.session_id}.original.tar.zst"
     digest = hashlib.sha256()
     downloaded_size = 0
     try:
@@ -160,160 +392,97 @@ def _download(remote: S3Store, source: _RemoteSource, destination: Path) -> int:
             os.fsync(archive.fileno())
     finally:
         remote.close(body)
-    actual_digest = digest.hexdigest()
-    if actual_digest != source.digest:
+    if digest.hexdigest() != source.digest:
         raise ValueError(
-            f"download checksum mismatch: expected {source.digest}, got {actual_digest}"
+            f"download checksum mismatch: expected {source.digest}, got {digest.hexdigest()}"
         )
     if expected_size is None or downloaded_size != expected_size:
         raise ValueError(f"download size mismatch: expected {expected_size}, got {downloaded_size}")
-    with archive_path.open("rb") as archive:
-        extracted_digest = safe_extract_tar_zst_stream(archive, destination)
-    if extracted_digest != actual_digest:
-        raise ValueError("scratch archive changed between download and extraction")
+    if source.archive_kind == "tar.zst":
+        with archive_path.open("rb") as archive:
+            extracted_digest = safe_extract_tar_zst_stream(archive, destination)
+        if extracted_digest != source.digest:
+            raise ValueError("scratch archive changed between download and extraction")
+    else:
+        _safe_extract_tar(archive_path, destination)
+        if _file_digest(archive_path) != source.digest:
+            raise ValueError("scratch archive changed between download and extraction")
     archive_path.unlink()
-    return downloaded_size
+    had_bundle = (destination / "snapshots.bundle").is_file()
+    return downloaded_size, had_bundle
 
 
-def _convert_snapshots(
-    session_root: Path, session_id: str
-) -> tuple[list[str], list[list[SnapshotEntry]]]:
-    paths = StoragePaths(
-        session_root.parent,
-        archive=session_root.parent,
-        runtime=session_root.parent / "runtime",
-        spool=session_root.parent / "spool",
-    )
-    store = SessionStore(paths)
-    manifests = store.steps(session_id)
-    if not manifests:
-        raise ValueError("downloaded session has no published steps")
-    if all(manifest.snapshot_commit for manifest in manifests):
-        raise _AlreadyCompressed("filesystem snapshots already use Git storage")
-    if any(manifest.snapshot_commit for manifest in manifests):
-        raise ValueError("session mixes directory and Git-backed snapshots")
-
-    repository = GitSnapshotStore(session_root / "snapshots.git")
-    expected_trees: list[str] = []
-    expected_entries: list[list[SnapshotEntry]] = []
-    parent: str | None = None
-    converted: list[StepManifest] = []
-    for manifest in manifests:
-        snapshot = session_root / manifest.snapshot
-        tree_id = repository.write_tree(snapshot)
-        commit = repository.commit_tree(
-            tree_id, parent, f"Memo filesystem snapshot {manifest.step}"
+def _store(root: Path) -> SessionStore:
+    return SessionStore(
+        StoragePaths(
+            root.parent,
+            archive=root.parent,
+            runtime=root.parent / "runtime-verify",
+            spool=root.parent / "spool-verify",
         )
-        expected_trees.append(tree_id)
-        exceptions = snapshot_exceptions(manifest.entries)
-        entries_digest = digest_entries(exceptions)
-        converted_manifest = replace(
-            manifest,
-            entries=exceptions,
-            schema_version=STEP_SCHEMA_VERSION,
-            snapshot_commit=commit,
-            entries_digest=entries_digest,
-        )
-        entries_path = entries_directory(session_root) / f"{entries_digest}.json"
-        if not entries_path.is_file():
-            atomic_write(entries_path, encode_entries(exceptions))
-        atomic_write(
-            session_root / "steps" / f"{manifest.step}.json",
-            _json_bytes(converted_manifest.to_stored_dict()),
-        )
-        converted.append(converted_manifest)
-        expected_entries.append(exceptions)
-        parent = commit
-
-    # A higher generation avoids a same-step fork while the verified replacement
-    # and the original coexist in object storage.
-    head = converted[-1]
-    boundary = replace(
-        head,
-        step=head.step + 1,
-        snapshot=f"snapshots/{head.step + 1}",
     )
-    atomic_write(
-        session_root / "steps" / f"{boundary.step}.json",
-        _json_bytes(boundary.to_stored_dict()),
-    )
-    atomic_write(session_root / "HEAD", f"{boundary.step}\n".encode())
-    expected_trees.append(expected_trees[-1])
-    expected_entries.append(expected_entries[-1])
-    return expected_trees, expected_entries
 
 
 def _verify_replacement(
-    replacement_root: Path,
-    session_id: str,
-    expected_trees: list[str],
-    expected_entries: list[list[SnapshotEntry]],
-    expected_preserved: dict[str, tuple[str, int, str | None]],
+    root: Path,
+    result: UpgradeResult,
+    expected_preserved: dict[str, tuple[int, str]],
 ) -> None:
-    paths = StoragePaths(
-        replacement_root.parent,
-        archive=replacement_root.parent,
-        runtime=replacement_root.parent / "runtime-verify",
-        spool=replacement_root.parent / "spool-verify",
-    )
-    store = SessionStore(paths)
-    manifests = store.steps(session_id)
-    if len(manifests) != len(expected_trees):
-        raise ValueError("replacement step history does not match the source")
-    repository = GitSnapshotStore(replacement_root / "snapshots.git")
-    actual_trees = [repository.tree_id(manifest.snapshot_commit or "") for manifest in manifests]
-    if actual_trees != expected_trees:
+    remote_sessions._restore_snapshot_bundle(root, result.session.session_id)
+    session = DirectorySession.load(root / "session.json")
+    if session != result.session:
+        raise ValueError("replacement session metadata does not match the upgrade")
+    manifests = _store(root).steps(session.session_id)
+    repository = GitSnapshotStore(root / "snapshots.git")
+    trees = [repository.tree_id(manifest.snapshot_commit or "") for manifest in manifests]
+    if trees != result.tree_ids:
         raise ValueError("replacement filesystem content does not match the source")
-    if [manifest.entries for manifest in manifests] != expected_entries:
+    if [manifest.entries for manifest in manifests] != result.entries:
         raise ValueError("replacement snapshot metadata does not match the source")
-    if _preserved_files(replacement_root) != expected_preserved:
-        raise ValueError("replacement changed non-snapshot session data")
+    actual_preserved = _preserved_files(root)
+    if actual_preserved != expected_preserved:
+        missing = sorted(expected_preserved.keys() - actual_preserved.keys())
+        added = sorted(actual_preserved.keys() - expected_preserved.keys())
+        changed = sorted(
+            key
+            for key in expected_preserved.keys() & actual_preserved.keys()
+            if expected_preserved[key] != actual_preserved[key]
+        )
+        raise ValueError(
+            "replacement changed non-snapshot session data "
+            f"(missing={missing}, added={added}, changed={changed})"
+        )
 
 
-def _prepare_replacement(remote: S3Store, source: _RemoteSource, work: Path) -> _Replacement:
+def _prepare_replacement(remote: S3Store, source: RemoteSource, work: Path) -> Replacement:
     extracted = work / source.session_id
     extracted.mkdir()
-    original_size = _download(remote, source, extracted)
+    original_size, had_bundle = _download(remote, source, extracted)
     expected_preserved = _preserved_files(extracted)
-    expected_trees, expected_entries = _convert_snapshots(extracted, source.session_id)
-    session = DirectorySession.load(extracted / "session.json")
-    paths = StoragePaths(
-        work,
-        archive=work,
-        runtime=work / "runtime",
-        spool=work / "spool",
+    result = upgrade_session(
+        extracted,
+        source.session_id,
+        source.origin,
+        transport_is_current=source.candidate.layout == "content-addressed",
+        archive_had_bundle=had_bundle,
     )
-    prepared = prepare_generation(SessionStore(paths), session)
+    prepared = prepare_generation(_store(extracted), result.session)
     try:
-        if prepared.step != source.step + 1:
-            raise ValueError("replacement generation did not advance exactly one step")
         verified = work / "verified" / source.session_id
         verified.mkdir(parents=True)
         with prepared.path.open("rb") as archive:
             digest = safe_extract_tar_zst_stream(archive, verified)
         if digest != prepared.digest:
             raise ValueError("locally prepared replacement checksum mismatch")
-        remote_sessions._restore_snapshot_bundle(verified, source.session_id)
-        _verify_replacement(
-            verified,
-            source.session_id,
-            expected_trees,
-            expected_entries,
-            expected_preserved,
-        )
-        if prepared.size_bytes >= original_size:
-            raise _NotSmaller(
-                f"verified replacement is not smaller ({original_size} -> "
-                f"{prepared.size_bytes} bytes)"
-            )
-        return _Replacement(source, session, prepared, original_size)
+        _verify_replacement(verified, result, expected_preserved)
+        return Replacement(source, result.session, prepared, original_size, result.source_format)
     except BaseException:
         prepared.cleanup()
         raise
 
 
-def _completion_data(replacement: _Replacement, generation: str) -> bytes:
-    return remote_sessions._canonical_json(
+def _completion_data(replacement: Replacement, generation: str) -> bytes:
+    return _canonical_json(
         {
             "schema_version": 1,
             "session_id": replacement.source.session_id,
@@ -324,75 +493,87 @@ def _completion_data(replacement: _Replacement, generation: str) -> bytes:
     )
 
 
-def _install_replacement(remote: S3Store, config: S3Config, replacement: _Replacement) -> None:
+def _same_source(remote: S3Store, config: S3Config, source: RemoteSource) -> bool:
+    try:
+        return source_for_candidate(remote, config, source.candidate) == source
+    except Exception:
+        return False
+
+
+def _install_replacement(remote: S3Store, config: S3Config, replacement: Replacement) -> None:
     source = replacement.source
-    base = source.object_key.rsplit("/generations/", 1)[0]
+    base = remote_sessions._session_base(config, replacement.session.origin, source.session_id)
     generation = remote_sessions._generation_key(
         base, replacement.prepared.step, replacement.prepared.digest
     )
+    completion_key = remote_sessions._completion_key(
+        base, replacement.prepared.step, replacement.prepared.digest
+    )
+    index_key, index_data = remote_sessions._index_record(config, replacement.session)
     staging = f"{base}/migration-staging/{replacement.prepared.path.name}"
-    if remote.exists(staging) or remote.exists(generation):
-        raise FileExistsError("replacement or staging object already exists")
+    if remote.exists(staging) or remote.exists(generation) or remote.exists(completion_key):
+        raise FileExistsError(
+            "replacement generation, completion, or staging object already exists"
+        )
 
-    # The source object and its completion record remain untouched throughout
-    # candidate upload and byte-for-byte remote verification.
     remote.upload_file(staging, replacement.prepared.path)
     try:
         staged_digest, staged_size = _stream_digest(remote, staging)
-        if (
-            staged_digest != replacement.prepared.digest
-            or staged_size != replacement.prepared.size_bytes
+        if (staged_digest, staged_size) != (
+            replacement.prepared.digest,
+            replacement.prepared.size_bytes,
         ):
             raise ValueError("staged replacement is not byte-identical to the local candidate")
-
-        if _source_for_session(remote, config, source.session_id) != source:
+        if not _same_source(remote, config, source):
             raise ValueError("remote session changed while its replacement was prepared")
 
         remote.upload_file(generation, replacement.prepared.path)
         final_digest, final_size = _stream_digest(remote, generation)
-        if (
-            final_digest != replacement.prepared.digest
-            or final_size != replacement.prepared.size_bytes
+        if (final_digest, final_size) != (
+            replacement.prepared.digest,
+            replacement.prepared.size_bytes,
         ):
             remote.remove(generation)
             raise ValueError("uploaded replacement is not byte-identical to the local candidate")
-        try:
-            generations = remote_sessions._list_generations(remote, f"{base}/generations/")
-        except BaseException:
-            remote.remove(generation)
-            raise
-        if (
-            generations.get(replacement.prepared.step) != (generation, replacement.prepared.digest)
-            or max(generations) != replacement.prepared.step
-        ):
-            remote.remove(generation)
-            raise ValueError("remote session advanced while the replacement was uploaded")
 
-        assert source.completion_key is not None
-        assert source.completion_data is not None
-        new_completion_key = remote_sessions._completion_key(
-            base, replacement.prepared.step, replacement.prepared.digest
-        )
-        remote.remove(source.completion_key)
+        old_completion_removed = False
+        index_written = False
         try:
-            remote.put_bytes(new_completion_key, _completion_data(replacement, generation))
+            if source.candidate.layout == "content-addressed":
+                assert source.completion_key is not None
+                remote.remove(source.completion_key)
+                old_completion_removed = True
+            remote.put_bytes(index_key, index_data)
+            index_written = source.candidate.layout != "content-addressed"
+            remote.put_bytes(completion_key, _completion_data(replacement, generation))
+
+            selected_index = remote_sessions._load_index(remote, config, source.session_id)
+            selected_base = remote_sessions._session_base(config, selected_index, source.session_id)
+            selected = remote_sessions._select_generation(
+                remote, config, selected_base, source.session_id
+            )
+            if selected[0:3] != (
+                replacement.prepared.step,
+                generation,
+                replacement.prepared.digest,
+            ):
+                raise ValueError("replacement was uploaded but is not the selected generation")
         except BaseException:
-            try:
+            with suppress(Exception):
+                remote.remove(completion_key)
+            if old_completion_removed and source.completion_key and source.completion_data:
                 remote.put_bytes(source.completion_key, source.completion_data)
-            finally:
+            if index_written:
                 with suppress(Exception):
-                    remote.remove(generation)
+                    remote.remove(index_key)
+            with suppress(Exception):
+                remote.remove(generation)
             raise
 
-        selected = remote_sessions._select_generation(remote, config, base, source.session_id)
-        if selected[0:3] != (
-            replacement.prepared.step,
-            generation,
-            replacement.prepared.digest,
-        ):
-            raise ValueError("replacement was uploaded but is not the selected generation")
-
-        # This is the first operation that removes original session data.
+        for key in source.cleanup_keys:
+            if key != source.object_key:
+                remote.remove(key)
+        # The source archive is always the final destructive operation.
         remote.remove(source.object_key)
     finally:
         with suppress(Exception):
@@ -405,30 +586,38 @@ def recompress_s3(
     *,
     dry_run: bool = False,
 ) -> S3RecompressionSummary:
-    """Find, verify, Git-compress, and safely replace legacy S3 generations."""
+    """Detect and upgrade every indexed historical S3 session format."""
     config = config or S3Config.discover(required=True)
     assert config is not None
     remote = client if isinstance(client, S3Store) else S3Store(config, client)
-    summary = S3RecompressionSummary()
-    session_ids = remote_sessions.list_archived_session_ids(config, remote)
-    summary.sources = len(session_ids)
-    for session_id in session_ids:
+    candidates = discover_remote_candidates(remote, config)
+    summary = S3RecompressionSummary(sources=len(candidates))
+    for candidate in candidates:
         prepared: PreparedGeneration | None = None
         try:
-            source = _source_for_session(remote, config, session_id)
-            with tempfile.TemporaryDirectory(prefix="memo-s3-recompress-") as work_name:
+            source = source_for_candidate(remote, config, candidate)
+            with tempfile.TemporaryDirectory(prefix="memo-s3-upgrade-") as work_name:
                 replacement = _prepare_replacement(remote, source, Path(work_name))
                 prepared = replacement.prepared
+                summary.formats[candidate.session_id] = replacement.source_format
                 summary.original_bytes += replacement.original_size
                 summary.replacement_bytes += replacement.prepared.size_bytes
                 if not dry_run:
                     _install_replacement(remote, config, replacement)
-                summary.migrated.append(session_id)
-        except _NotEligible as error:
-            summary.skipped.append((session_id, str(error)))
+                summary.migrated.append(candidate.session_id)
+        except (AlreadyLatest, NotEligible) as error:
+            summary.skipped.append((candidate.session_id, str(error)))
         except Exception as error:
-            summary.failed.append((session_id, str(error)))
+            summary.failed.append((candidate.session_id, str(error)))
         finally:
             if prepared is not None:
                 prepared.cleanup()
     return summary
+
+
+# The old public name remains import-compatible while the CLI moves to upgrade language.
+upgrade_s3 = recompress_s3
+
+# Tests and downstream callers used the original private type names.
+_RemoteSource = RemoteSource
+_Replacement = Replacement

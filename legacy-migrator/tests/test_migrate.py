@@ -103,10 +103,10 @@ def test_cli_dry_run_reports_without_writing(monkeypatch, capsys) -> None:
     )
 
 
-def test_cli_s3_recompression_dry_run_is_forwarded(monkeypatch, capsys) -> None:
+def test_cli_s3_upgrade_dry_run_is_forwarded(monkeypatch, capsys) -> None:
     received: dict[str, object] = {}
 
-    def fake_recompress_s3(*, dry_run: bool) -> SimpleNamespace:
+    def fake_upgrade_s3(*, dry_run: bool) -> SimpleNamespace:
         received["dry_run"] = dry_run
         return SimpleNamespace(
             sources=1,
@@ -118,17 +118,17 @@ def test_cli_s3_recompression_dry_run_is_forwarded(monkeypatch, capsys) -> None:
         )
 
     monkeypatch.setattr(
-        "memo_legacy_migrator.cli.recompress_s3",
-        fake_recompress_s3,
+        "memo_legacy_migrator.cli.upgrade_s3",
+        fake_upgrade_s3,
     )
 
-    assert main(["--recompress-s3", "--dry-run"]) == 0
+    assert main(["--upgrade-s3", "--dry-run"]) == 0
     assert received == {"dry_run": True}
     assert capsys.readouterr().out == (
-        "would recompress: 1\n"
+        "would upgrade: 1\n"
         "skipped: 0\n"
         "failed: 0\n"
-        "would recompress: remote-session\n"
+        "would upgrade: remote-session\n"
         "bytes: 100 -> 25 (75 saved)\n"
     )
 

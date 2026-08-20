@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .migrate import migrate_legacy
-from .s3_recompress import recompress_s3
+from .s3_recompress import upgrade_s3
 
 
 def parser() -> argparse.ArgumentParser:
@@ -23,9 +23,11 @@ def parser() -> argparse.ArgumentParser:
         help="read unpacked legacy recording directories from DIRECTORY",
     )
     source.add_argument(
+        "--upgrade-s3",
         "--recompress-s3",
+        dest="upgrade_s3",
         action="store_true",
-        help="replace pre-Git S3 generations after exhaustive local and remote verification",
+        help="upgrade historical S3 session and transport formats after exhaustive verification",
     )
     result.add_argument("--dry-run", action="store_true", help="report without writing recordings")
     return result
@@ -34,15 +36,15 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        if args.recompress_s3:
-            summary = recompress_s3(dry_run=args.dry_run)
+        if args.upgrade_s3:
+            summary = upgrade_s3(dry_run=args.dry_run)
         else:
             summary = migrate_legacy(legacy_dir=args.legacy_dir, dry_run=args.dry_run)
     except Exception as error:
         print(f"memo-migrate-legacy: {error}", file=sys.stderr)
         return 1
-    if args.recompress_s3:
-        label = "would recompress" if args.dry_run else "recompressed"
+    if args.upgrade_s3:
+        label = "would upgrade" if args.dry_run else "upgraded"
     else:
         label = "would migrate" if args.dry_run else "migrated"
     print(f"{label}: {len(summary.migrated)}")
@@ -54,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         len(summary.migrated) + len(summary.skipped) + len(summary.failed),
     )
     if source_count == 0:
-        if args.recompress_s3:
+        if args.upgrade_s3:
             print("memo-migrate-legacy: no indexed S3 recordings found", file=sys.stderr)
         else:
             print(
@@ -68,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"skipped: {source}: {reason}")
     for source, error in summary.failed:
         print(f"failed: {source}: {error}", file=sys.stderr)
-    if args.recompress_s3 and summary.migrated:
+    if args.upgrade_s3 and summary.migrated:
         saved = summary.original_bytes - summary.replacement_bytes
         print(f"bytes: {summary.original_bytes} -> {summary.replacement_bytes} ({saved} saved)")
     return 1 if summary.failed else 0
