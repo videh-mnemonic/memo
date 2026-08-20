@@ -508,9 +508,10 @@ def test_git_session_round_trips_through_remote_transport(tmp_path: Path) -> Non
     assert manifest.snapshot_commit
     assert (restored / "note.txt").read_text() == "captured"
     # Steps keep their entry list in a shared pool, so the archive has to carry
-    # it or a pulled recording cannot say what it captured.
+    # it or a pulled recording cannot say what it captured. A plainly captured
+    # file is not listed: the Git tree already records it.
     assert manifest.entries_digest
-    assert [entry.path for entry in manifest.entries] == ["note.txt"]
+    assert manifest.entries == []
     assert (pulled_path / "entries" / f"{manifest.entries_digest}.json").is_file()
 
 
@@ -1178,8 +1179,13 @@ def test_origin_values_are_encoded_and_preserved_across_pull_and_repush(tmp_path
     assert any(key.startswith(f"{base}/completions/") for key in second.objects)
 
 
-def _strip_from_remote_package(client: FakeS3, prefix: str) -> None:
-    """Rewrite the published generation without any member under ``prefix``."""
+def _strip_from_remote_package(client: FakeS3, removed: str) -> None:
+    """Rewrite the published generation without ``removed`` or anything beneath it.
+
+    A directory named as the target keeps its own entry, so the archive still
+    claims to carry snapshot content while holding none -- which is the state a
+    real archive was found in.
+    """
     completion_key = next(key for key in client.objects if "/completions/" in key)
     generation = json.loads(client.objects[completion_key])["generation"]
     uncompressed = zstandard.ZstdDecompressor().decompress(
@@ -1190,7 +1196,9 @@ def _strip_from_remote_package(client: FakeS3, prefix: str) -> None:
         with zstandard.ZstdCompressor(level=3).stream_writer(raw, closefd=False) as compressed:
             with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as target:
                 for member in source.getmembers():
-                    if member.name.startswith(prefix) and member.name != prefix:
+                    if member.name == removed and not member.isdir():
+                        continue
+                    if member.name.startswith(removed) and member.name != removed:
                         continue
                     target.addfile(member, source.extractfile(member) if member.isfile() else None)
     _replace_remote_package(client, raw.getvalue())
@@ -1221,7 +1229,7 @@ def test_verify_reports_a_generation_with_no_snapshot_content(tmp_path: Path) ->
     # An archive whose steps reference snapshot commits but whose object store
     # never made it up. The bytes are intact and the checksum matches, so the
     # push bookkeeping shows nothing wrong; only reading it back finds this.
-    _strip_from_remote_package(client, "snapshots.git/")
+    _strip_from_remote_package(client, "snapshots.bundle")
 
     with pytest.raises(ValueError, match="missing snapshot commit"):
         remote_sessions.verify_archived_session(

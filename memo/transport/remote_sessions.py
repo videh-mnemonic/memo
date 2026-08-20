@@ -650,6 +650,7 @@ def verify_archived_session(
             raise ValueError(f"checksum mismatch: expected {digest}, got {actual_digest}")
         if progress is not None:
             progress(92, 100, f"validating {session_id}")
+        _restore_snapshot_bundle(temporary, session_id)
         manifests = SessionStore._validate_history(temporary, session_id)
         if not manifests:
             raise ValueError("archived generation has no published steps")

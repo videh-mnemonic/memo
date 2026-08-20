@@ -221,8 +221,9 @@ def test_compact_manifest_rejects_redundant_entries_but_reads_schema_two() -> No
         "snapshot_commit": "a" * 40,
     }
     StepManifest(**values, schema_version=2).validate()
+    # A compact step also carries the digest of the list it stores out of line.
     with pytest.raises(ValueError, match="redundant snapshot entry"):
-        StepManifest(**values, schema_version=3).validate()
+        StepManifest(**values, schema_version=3, entries_digest="b" * 64).validate()
     without_commit = {**values, "snapshot_commit": None}
     with pytest.raises(ValueError, match="missing its snapshot commit"):
         StepManifest(**without_commit, schema_version=2).validate()
