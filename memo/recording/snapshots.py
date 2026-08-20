@@ -201,7 +201,8 @@ class StepPublisher:
         self.store = store
         self.seal_streams = seal_streams or (lambda _session: {})
 
-    def publish(self, session: DirectorySession) -> StepManifest:
+    def publish(self, session: DirectorySession, *, force: bool = False) -> StepManifest:
+        """Publish changed recording state, or return HEAD for a semantic no-op."""
         high_water = self.seal_streams(session)
         previous_manifest = self.store.head(session.session_id)
         session_path = self.store.session_path(session.session_id)
@@ -227,10 +228,20 @@ class StepPublisher:
                 entries = scan_tree(
                     Path(session.root), temporary, previous=previous, paths=self.store.paths
                 )
-                commit = repository.commit(
-                    temporary,
-                    previous_manifest.snapshot_commit if previous_manifest else None,
-                    f"Memo filesystem snapshot {step}",
+                tree_id = repository.write_tree(temporary)
+                if (
+                    not force
+                    and previous_manifest is not None
+                    and previous_manifest.snapshot_commit is not None
+                    and repository.tree_id(previous_manifest.snapshot_commit) == tree_id
+                    and previous_manifest.entries == entries
+                    and previous_manifest.stream_high_water == high_water
+                    and previous_manifest.agent_runs == agent_runs
+                ):
+                    return previous_manifest
+                parent = previous_manifest.snapshot_commit if previous_manifest else None
+                commit = repository.commit_tree(
+                    tree_id, parent, f"Memo filesystem snapshot {step}"
                 )
                 manifest = StepManifest(
                     session.session_id,

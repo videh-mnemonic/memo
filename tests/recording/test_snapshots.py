@@ -130,6 +130,53 @@ def test_step_publisher_uses_git_commits_and_restores_files(tmp_path: Path) -> N
     assert store.head("session").snapshot_commit == second.snapshot_commit
 
 
+def test_step_publisher_skips_semantic_no_op_and_can_force_boundary(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "untracked.txt").write_text("captured without a project repository")
+    store = SessionStore(_paths(tmp_path))
+    session = DirectorySession(
+        "session", str(root.resolve()), "now", "now", SessionOrigin("1.0.0", "user", "host")
+    )
+    store.create(session)
+    publisher = StepPublisher(store)
+
+    first = publisher.publish(session)
+    unchanged = publisher.publish(session)
+    boundary = publisher.publish(session, force=True)
+
+    assert unchanged == first
+    assert boundary.step == 1
+    assert boundary.snapshot_commit != first.snapshot_commit
+    repository = GitSnapshotStore(store.session_path("session") / "snapshots.git")
+    assert repository.tree_id(boundary.snapshot_commit) == repository.tree_id(
+        first.snapshot_commit
+    )
+    assert [manifest.step for manifest in store.steps("session")] == [0, 1]
+
+
+def test_step_publisher_publishes_stream_metadata_without_tree_change(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(_paths(tmp_path))
+    session = DirectorySession(
+        "session", str(root.resolve()), "now", "now", SessionOrigin("1.0.0", "user", "host")
+    )
+    store.create(session)
+    high_water = iter(({"terminal": 0}, {"terminal": 1}))
+    publisher = StepPublisher(store, lambda _session: next(high_water))
+
+    first = publisher.publish(session)
+    second = publisher.publish(session)
+
+    assert second.step == first.step + 1
+    assert second.stream_high_water == {"terminal": 1}
+    repository = GitSnapshotStore(store.session_path("session") / "snapshots.git")
+    assert repository.tree_id(second.snapshot_commit) == repository.tree_id(
+        first.snapshot_commit
+    )
+
+
 def test_git_restore_rejects_symlink_entries(tmp_path: Path) -> None:
     tree = tmp_path / "tree"
     tree.mkdir()

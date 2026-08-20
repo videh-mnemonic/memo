@@ -38,6 +38,7 @@ STEP_INTERVAL_SECONDS = 15.0
 WATCHER_DEBOUNCE_SECONDS = 0.25
 PUSH_INTERVAL_SECONDS = 15 * 60.0
 TERMINAL_STALE_SECONDS = 5 * 60.0
+MUTATING_EVENT_TYPES = frozenset({"created", "modified", "deleted", "moved", "closed"})
 
 
 class DaemonAlreadyRunning(RuntimeError):
@@ -96,10 +97,10 @@ class MemoDaemon:
         cutoff = time.time_ns() - int(TERMINAL_STALE_SECONDS * 1_000_000_000)
         self.registry.expire_stale_attachments(cutoff, utcnow())
 
-    def _publish(self, session: DirectorySession):
+    def _publish(self, session: DirectorySession, *, force: bool = False):
         with self._session_lock(session.session_id):
             self.trace_ingester.ingest(session.session_id)
-            return self.publisher.publish(session)
+            return self.publisher.publish(session, force=force)
 
     def _ensure_worker(self, active: ActiveSession) -> None:
         with self._worker_lock:
@@ -122,7 +123,7 @@ class MemoDaemon:
 
         class Handler(FileSystemEventHandler):
             def on_any_event(self, event) -> None:
-                if not event.is_directory or event.event_type != "opened":
+                if event.event_type in MUTATING_EVENT_TYPES:
                     request_event.set()
 
         observer = Observer()
@@ -145,10 +146,9 @@ class MemoDaemon:
             ):
                 return
             if request_event.is_set():
-                request_event.clear()
-                if self._stop.wait(WATCHER_DEBOUNCE_SECONDS):
+                self._wait_for_quiet(request_event, deadline)
+                if self._stop.is_set():
                     return
-                request_event.clear()
             try:
                 # The session can begin (and finish) ending after the lookup above.
                 # Recheck it while holding the same lock used by finalization so a
@@ -162,6 +162,17 @@ class MemoDaemon:
             except Exception as error:
                 print(f"memo daemon: step failed for {active.session_id}: {error}", file=sys.stderr)
             deadline = time.monotonic() + self.interval
+
+    def _wait_for_quiet(self, request_event: threading.Event, deadline: float) -> None:
+        """Coalesce mutations until the tree is quiet or the periodic deadline arrives."""
+        while request_event.is_set() and not self._stop.is_set():
+            request_event.clear()
+            remaining = min(
+                WATCHER_DEBOUNCE_SECONDS,
+                max(0.0, deadline - time.monotonic()),
+            )
+            if remaining == 0.0 or not request_event.wait(remaining):
+                return
 
     def _create(self, root: Path) -> dict[str, Any]:
         canonical = root.expanduser().resolve(strict=True)
@@ -386,7 +397,7 @@ class MemoDaemon:
             session.updated_utc = utcnow()
             self.store.update_session(session)
         self.streams.drain_and_detach(active.session_id, utcnow())
-        manifest = self._publish(session)
+        manifest = self._publish(session, force=True)
         session.state = "complete"
         session.updated_utc = manifest.created_utc
         self.store.update_session(session)
@@ -504,7 +515,7 @@ class MemoDaemon:
             self._archive_launch(completed, "agent")
             active = self.registry.lookup_session(completed.session_id)
             if active is not None:
-                self._publish(self._session_model(active))
+                self._publish(self._session_model(active), force=True)
         return {"launch_id": launch_id, "capture": "complete"}
 
     def _sandbox_shell_launch(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -560,7 +571,7 @@ class MemoDaemon:
             self._archive_launch(completed, "sandbox-shell")
             active = self.registry.lookup_session(completed.session_id)
             if active is not None:
-                self._publish(self._session_model(active))
+                self._publish(self._session_model(active), force=True)
         return {"launch_id": launch_id, "capture": "complete"}
 
     def _archive_launch(self, launch: AgentLaunch | SandboxShellLaunch, kind: str) -> None:
