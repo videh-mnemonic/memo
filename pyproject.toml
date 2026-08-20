@@ -40,6 +40,11 @@ version = {attr = "memo.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import the package from the checkout rather than requiring it to be
+# installed. A working copy of Memo is a development tool, not a dependency of
+# its own tests, and an installed copy shadowing the tree under test is exactly
+# the confusion this avoids.
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py311"

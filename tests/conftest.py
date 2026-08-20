@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
+
+import memo
 
 #: Settings that would point Memo at a real archive or a real S3 account. Tests
 #: start daemons that inherit the environment, and a daemon that finds live
@@ -43,4 +46,12 @@ def isolated_memo_environment(
     home = tmp_path_factory.mktemp("memo-home")
     monkeypatch.setenv("MEMO_HOME", str(home))
     monkeypatch.setenv("MEMO_S3_BUCKET", UNREACHABLE_BUCKET)
+    # Tests that spawn a Python subprocess need it to import the same checkout.
+    # `pythonpath` in pyproject.toml only applies to the pytest process itself,
+    # and the working directory is wherever pytest was started from.
+    checkout = str(Path(memo.__file__).resolve().parents[1])
+    inherited = os.environ.get("PYTHONPATH")
+    monkeypatch.setenv(
+        "PYTHONPATH", checkout if not inherited else f"{checkout}{os.pathsep}{inherited}"
+    )
     return home
