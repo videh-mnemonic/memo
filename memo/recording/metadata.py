@@ -183,10 +183,9 @@ class StepManifest:
         expected = f"snapshots/{self.step}"
         if self.snapshot != expected:
             raise ValueError(f"step snapshot must be {expected}")
-        if (
-            self.schema_version in {FULL_ENTRY_SCHEMA_VERSION, STEP_SCHEMA_VERSION}
-            and not self.snapshot_commit
-        ):
+        # Schema 1 copied snapshots into a directory; every version since is
+        # Git-backed, so the commit is the only pointer to a step's content.
+        if self.schema_version >= FULL_ENTRY_SCHEMA_VERSION and not self.snapshot_commit:
             raise ValueError("Git-backed step is missing its snapshot commit")
         if self.schema_version >= STEP_SCHEMA_VERSION and not self.entries_digest:
             raise ValueError("step is missing its snapshot entry digest")
