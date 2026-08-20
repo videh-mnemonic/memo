@@ -91,7 +91,11 @@ def _high_water(value: object) -> dict[str, int]:
 
 
 def _session(
-    raw: dict[str, Any], session_id: str, fallback_origin: SessionOrigin
+    raw: dict[str, Any],
+    session_id: str,
+    fallback_origin: SessionOrigin,
+    *,
+    remote_complete: bool,
 ) -> DirectorySession:
     if raw.get("format") != "memo-directory-session":
         raise ValueError("unsupported session format")
@@ -113,7 +117,10 @@ def _session(
     )
     session.validate()
     if session.state != "complete":
-        raise ValueError("remote session is not complete")
+        if not remote_complete:
+            raise ValueError("remote session is not complete")
+        session.state = "complete"
+        session.validate()
     return session
 
 
@@ -328,6 +335,7 @@ def upgrade_session(
     transport_is_current: bool,
     archive_had_bundle: bool,
     expected_step: int | None = None,
+    remote_complete: bool = False,
 ) -> UpgradeResult:
     """Upgrade an extracted session and return its verified semantic state."""
     session_id = validate_session_id(session_id)
@@ -365,6 +373,7 @@ def upgrade_session(
             and complete_session_fields
             and schemas
             and all(schema == STEP_SCHEMA_VERSION for schema in schemas)
+            and raw_session.get("state") == "complete"
         ):
             session = DirectorySession.from_dict(raw_session)
             manifests = _store(root).steps(session_id)
@@ -372,7 +381,12 @@ def upgrade_session(
                 raise ValueError("session has no published steps")
             raise AlreadyLatest("already uses the latest session and archive formats")
 
-    session = _session(raw_session, session_id, fallback_origin)
+    session = _session(
+        raw_session,
+        session_id,
+        fallback_origin,
+        remote_complete=remote_complete,
+    )
     atomic_write(root / "session.json", _json_bytes(session.to_dict()))
     trees, entries, snapshots = _rebuild_history(
         root,

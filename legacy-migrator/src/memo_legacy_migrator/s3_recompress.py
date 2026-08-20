@@ -476,6 +476,7 @@ def _prepare_replacement(remote: S3Store, source: RemoteSource, work: Path) -> R
         transport_is_current=source.candidate.layout == "content-addressed",
         archive_had_bundle=had_bundle,
         expected_step=source.step,
+        remote_complete=source.completion_key is not None,
     )
     prepared = prepare_generation(_store(extracted), result.session)
     try:

@@ -119,6 +119,12 @@ def _common_directories(root: Path) -> None:
     (root / "agents" / "traces").mkdir(parents=True)
 
 
+def _set_session_state(root: Path, state: str) -> None:
+    value = json.loads((root / "session.json").read_text())
+    value["state"] = state
+    _json(root / "session.json", value)
+
+
 def _checkpoint_session(root: Path, session_id: str) -> list[bytes]:
     root.mkdir(parents=True)
     _common_directories(root)
@@ -590,6 +596,37 @@ def test_remote_step_must_match_downloaded_archive_head(tmp_path: Path) -> None:
 
     assert summary.migrated == []
     assert summary.failed == [("session", "archive HEAD 0 does not match selected remote step 1")]
+    assert client.objects == original_objects
+
+
+def test_verified_completion_promotes_embedded_active_session(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    _set_session_state(source_root, "active")
+    _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+
+    summary = recompress_s3(config, client, dry_run=True)
+
+    assert summary.migrated == ["session"]
+    assert not summary.failed
+
+
+def test_mutable_pointer_cannot_promote_embedded_active_session(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    _set_session_state(source_root, "active")
+    archive = _tar_zst(source_root)
+    _put_mutable(client, config, archive, schema=2, step=0)
+    original_objects = dict(client.objects)
+
+    summary = recompress_s3(config, client, dry_run=True)
+
+    assert summary.migrated == []
+    assert summary.failed == [("session", "remote session is not complete")]
     assert client.objects == original_objects
 
 
