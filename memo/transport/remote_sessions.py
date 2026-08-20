@@ -360,12 +360,21 @@ def push_session(
 
 
 def list_archived_session_ids(
-    config: S3Config | None = None, client: Any | None = None
+    config: S3Config | None = None,
+    client: Any | None = None,
+    *,
+    origin: SessionOrigin | None = None,
 ) -> list[str]:
-    """List session IDs advertised by the remote archive index."""
+    """List session IDs advertised by the remote archive index.
+
+    An archive is shared: the index spans every machine and user that pushes to
+    it. Pass ``origin`` to list only what one of them recorded.
+    """
     config = config or S3Config.discover(required=True)
     assert config is not None
     remote = _store(config, client)
+    if origin is not None:
+        return _same_origin_remote_session_ids(origin, config, remote)
     prefix = _key(config, "index", "sessions") + "/"
     session_ids: set[str] = set()
     for key in remote.list(prefix):
