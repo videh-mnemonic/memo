@@ -177,6 +177,10 @@ class S3Store:
     def close(self, response: BinaryIO) -> None:
         _close_response(response)
 
+    def remove(self, key: str) -> None:
+        """Remove one object from the configured bucket."""
+        self.client.remove_object(self.config.bucket, key)
+
     def list(self, prefix: str) -> Iterator[str]:
         for item in self.client.list_objects(
             self.config.bucket,

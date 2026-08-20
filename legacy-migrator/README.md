@@ -54,3 +54,33 @@ legacy source directories and tarballs untouched.
 Migration preserves the final state, not the complete timeline: old per-leg Git
 history is not expanded into separate current-format steps. Keep the original
 legacy data if that history may still be useful.
+
+## Recompress existing S3 recordings
+
+Recordings uploaded before Memo adopted Git-backed filesystem snapshots can be
+recompressed in place. First run a read-only preview:
+
+```console
+memo-migrate-legacy --recompress-s3 --dry-run
+```
+
+The preview downloads every indexed session's selected generation into
+temporary storage, verifies its SHA-256 digest and size, converts every
+filesystem step to Git storage, creates a replacement generation, extracts it
+again, and verifies every Git tree and all non-snapshot session files. It does
+not write to S3. Replacements that would not save space are skipped.
+Active sessions and sessions with an unselected newer generation are also
+skipped so the migrator cannot race an in-progress upload.
+
+After reviewing the preview, apply the migration explicitly:
+
+```console
+memo-migrate-legacy --recompress-s3
+```
+
+For each eligible session, the applying run repeats all preview checks, uploads
+the replacement to a staging key, downloads it to confirm byte identity, then
+uploads and verifies the final generation. Only after the replacement is
+selected and valid does it delete the original generation. A completed
+session's old completion record remains unchanged until the final archive has
+been remotely verified. Already Git-backed sessions are skipped.

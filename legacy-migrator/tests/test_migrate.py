@@ -107,6 +107,36 @@ def test_cli_dry_run_reports_without_writing(monkeypatch, capsys) -> None:
     )
 
 
+def test_cli_s3_recompression_dry_run_is_forwarded(monkeypatch, capsys) -> None:
+    received: dict[str, object] = {}
+
+    def fake_recompress_s3(*, dry_run: bool) -> SimpleNamespace:
+        received["dry_run"] = dry_run
+        return SimpleNamespace(
+            sources=1,
+            migrated=["remote-session"],
+            skipped=[],
+            failed=[],
+            original_bytes=100,
+            replacement_bytes=25,
+        )
+
+    monkeypatch.setattr(
+        "memo_legacy_migrator.cli.recompress_s3",
+        fake_recompress_s3,
+    )
+
+    assert main(["--recompress-s3", "--dry-run"]) == 0
+    assert received == {"dry_run": True}
+    assert capsys.readouterr().out == (
+        "would recompress: 1\n"
+        "skipped: 0\n"
+        "failed: 0\n"
+        "would recompress: remote-session\n"
+        "bytes: 100 -> 25 (75 saved)\n"
+    )
+
+
 def test_legacy_sources_can_use_explicit_directory(tmp_path: Path) -> None:
     paths = StoragePaths(tmp_path / "current-home")
     legacy_dir = tmp_path / "old-recordings"
