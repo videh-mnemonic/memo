@@ -657,6 +657,91 @@ def test_local_scratch_survives_install_then_is_removed(
     assert not scratch.exists()
 
 
+def test_explicit_scratch_parent_contains_only_disposable_run_directories(
+    tmp_path: Path,
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+    scratch = tmp_path / "scratch"
+
+    summary = recompress_s3(config, client, dry_run=True, scratch_dir=scratch)
+
+    assert summary.migrated == ["session"]
+    assert scratch.is_dir()
+    assert list(scratch.iterdir()) == []
+
+
+def test_default_scratch_uses_user_cache_and_removes_run_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+
+    summary = recompress_s3(config, client, dry_run=True)
+
+    assert summary.migrated == ["session"]
+    scratch = cache / "memo" / "legacy-migrator"
+    assert scratch.is_dir()
+    assert list(scratch.iterdir()) == []
+
+
+def test_progress_covers_discovery_download_and_completion(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+    updates: list[tuple[int, int, str]] = []
+
+    summary = recompress_s3(
+        config,
+        client,
+        dry_run=True,
+        scratch_dir=tmp_path / "scratch",
+        progress=lambda completed, total, message: updates.append((completed, total, message)),
+    )
+
+    assert summary.migrated == ["session"]
+    assert updates[0] == (0, 1, "discovering indexed S3 sessions")
+    assert any("downloading source archive" in message for _, _, message in updates)
+    assert updates[-1][0] == updates[-1][1]
+    assert "finished" in updates[-1][2]
+
+
+def test_interruption_removes_in_progress_scratch_data(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+    scratch = tmp_path / "scratch"
+
+    def interrupt(_completed: int, _total: int, message: str) -> None:
+        if "downloading source archive" in message:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        recompress_s3(
+            config,
+            client,
+            dry_run=True,
+            scratch_dir=scratch,
+            progress=interrupt,
+        )
+
+    assert scratch.is_dir()
+    assert list(scratch.iterdir()) == []
+
+
 def test_discovery_rejects_competing_layouts() -> None:
     config = S3Config("bucket", "prefix")
     client = FakeS3()

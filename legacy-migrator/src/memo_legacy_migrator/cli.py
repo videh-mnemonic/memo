@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 from pathlib import Path
+from types import FrameType
+
+from memo.cli.progress import ProgressBar
 
 from .migrate import migrate_legacy
 from .s3_recompress import upgrade_s3
@@ -30,19 +34,50 @@ def parser() -> argparse.ArgumentParser:
         help="upgrade historical S3 session and transport formats after exhaustive verification",
     )
     result.add_argument("--dry-run", action="store_true", help="report without writing recordings")
+    result.add_argument(
+        "--scratch-dir",
+        type=Path,
+        metavar="DIRECTORY",
+        help=(
+            "place disposable S3 upgrade data under DIRECTORY; defaults to the user cache directory"
+        ),
+    )
     return result
+
+
+def _stop_on_terminate() -> signal.Handlers:
+    def terminate(_signum: int, _frame: FrameType | None) -> None:
+        raise KeyboardInterrupt
+
+    return signal.signal(signal.SIGTERM, terminate)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.scratch_dir is not None and not args.upgrade_s3:
+        print("memo-migrate-legacy: --scratch-dir requires --upgrade-s3", file=sys.stderr)
+        return 2
+    previous_handler: signal.Handlers | None = None
     try:
         if args.upgrade_s3:
-            summary = upgrade_s3(dry_run=args.dry_run)
+            previous_handler = _stop_on_terminate()
+            with ProgressBar(show_eta=True) as bar:
+                summary = upgrade_s3(
+                    dry_run=args.dry_run,
+                    scratch_dir=args.scratch_dir,
+                    progress=bar.update if bar.enabled else None,
+                )
         else:
             summary = migrate_legacy(legacy_dir=args.legacy_dir, dry_run=args.dry_run)
+    except KeyboardInterrupt:
+        print("memo-migrate-legacy: interrupted; local scratch data removed", file=sys.stderr)
+        return 130
     except Exception as error:
         print(f"memo-migrate-legacy: {error}", file=sys.stderr)
         return 1
+    finally:
+        if previous_handler is not None:
+            signal.signal(signal.SIGTERM, previous_handler)
     if args.upgrade_s3:
         label = "would upgrade" if args.dry_run else "upgraded"
     else:

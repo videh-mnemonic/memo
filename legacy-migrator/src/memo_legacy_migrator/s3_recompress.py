@@ -7,6 +7,7 @@ import json
 import os
 import re
 import tempfile
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,8 @@ from .session_upgrade import (
 
 SIDECAR_GENERATION = re.compile(r"^(\d{8,})\.tar\.zst$")
 SIDECAR_CHECKSUM = re.compile(r"^(\d{8,})\.sha256$")
+PROGRESS_BYTES = 8 * 1024 * 1024
+ProgressCallback = Callable[[int, int, str], None]
 
 
 @dataclass
@@ -84,6 +87,42 @@ class Replacement:
 
 class NotEligible(ValueError):
     pass
+
+
+def default_scratch_directory() -> Path:
+    """Return a persistent parent for disposable migration run directories."""
+    cache = os.environ.get("XDG_CACHE_HOME")
+    root = Path(cache).expanduser() if cache else Path.home() / ".cache"
+    return root / "memo" / "legacy-migrator"
+
+
+def _scratch_directory(requested: Path | None) -> Path:
+    root = (requested or default_scratch_directory()).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir():
+        raise NotADirectoryError(f"migration scratch path is not a directory: {root}")
+    return root.resolve()
+
+
+def _progress_range(
+    progress: ProgressCallback | None,
+    start: int,
+    end: int,
+) -> ProgressCallback | None:
+    if progress is None:
+        return None
+
+    def report(completed: int, total: int, message: str) -> None:
+        denominator = max(total, 1)
+        fraction = max(0.0, min(completed / denominator, 1.0))
+        progress(round(start + ((end - start) * fraction)), 100, message)
+
+    return report
+
+
+def _report(progress: ProgressCallback | None, completed: int, message: str) -> None:
+    if progress is not None:
+        progress(completed, 100, message)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -353,16 +392,29 @@ def _file_digest(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def _stream_digest(remote: S3Store, key: str) -> tuple[str, int]:
+def _stream_digest(
+    remote: S3Store,
+    key: str,
+    progress: ProgressCallback | None = None,
+) -> tuple[str, int]:
     body = remote.open(key)
     digest = hashlib.sha256()
     size = 0
+    expected_size = remote.size(key)
+    if progress is not None:
+        progress(0, expected_size or 1, "verifying uploaded bytes")
+    reported = 0
     try:
         while chunk := body.read(STREAM_READ_SIZE):
             digest.update(chunk)
             size += len(chunk)
+            if progress is not None and size - reported >= PROGRESS_BYTES:
+                progress(size, expected_size or max(size, 1), "verifying uploaded bytes")
+                reported = size
     finally:
         remote.close(body)
+    if progress is not None:
+        progress(size, expected_size or max(size, 1), "verified uploaded bytes")
     return digest.hexdigest(), size
 
 
@@ -381,18 +433,32 @@ def _preserved_files(root: Path) -> dict[str, tuple[int, str]]:
     return result
 
 
-def _download(remote: S3Store, source: RemoteSource, destination: Path) -> tuple[int, bool]:
+def _download(
+    remote: S3Store,
+    source: RemoteSource,
+    destination: Path,
+    progress: ProgressCallback | None = None,
+) -> tuple[int, bool]:
     expected_size = remote.size(source.object_key)
+    if expected_size is None:
+        raise ValueError("remote object size is unavailable")
     archive_path = destination.parent / f".{source.session_id}.original.{source.archive_kind}"
     body = remote.open(source.object_key)
     digest = hashlib.sha256()
     downloaded_size = 0
+    reported = 0
+    download_progress = _progress_range(progress, 0, 60)
+    if download_progress is not None:
+        download_progress(0, expected_size, "downloading source archive")
     try:
         with archive_path.open("wb") as archive:
             while chunk := body.read(STREAM_READ_SIZE):
                 archive.write(chunk)
                 digest.update(chunk)
                 downloaded_size += len(chunk)
+                if download_progress is not None and downloaded_size - reported >= PROGRESS_BYTES:
+                    download_progress(downloaded_size, expected_size, "downloading source archive")
+                    reported = downloaded_size
             archive.flush()
             os.fsync(archive.fileno())
     finally:
@@ -401,17 +467,27 @@ def _download(remote: S3Store, source: RemoteSource, destination: Path) -> tuple
         raise ValueError(
             f"download checksum mismatch: expected {source.digest}, got {digest.hexdigest()}"
         )
-    if expected_size is None or downloaded_size != expected_size:
+    if downloaded_size != expected_size:
         raise ValueError(f"download size mismatch: expected {expected_size}, got {downloaded_size}")
+    if download_progress is not None:
+        download_progress(downloaded_size, expected_size, "downloaded source archive")
     if source.archive_kind == "tar.zst":
         with archive_path.open("rb") as archive:
-            extracted_digest = safe_extract_tar_zst_stream(archive, destination)
+            extracted_digest = safe_extract_tar_zst_stream(
+                archive,
+                destination,
+                progress=_progress_range(progress, 60, 100),
+                progress_total=expected_size,
+                progress_message="extracting source archive",
+            )
         if extracted_digest != source.digest:
             raise ValueError("scratch archive changed between download and extraction")
     else:
+        _report(progress, 60, "extracting source archive")
         _safe_extract_tar(archive_path, destination)
         if _file_digest(archive_path) != source.digest:
             raise ValueError("scratch archive changed between download and extraction")
+        _report(progress, 100, "extracted source archive")
     had_bundle = (destination / "snapshots.bundle").is_file()
     return downloaded_size, had_bundle
 
@@ -431,7 +507,9 @@ def _verify_replacement(
     root: Path,
     result: UpgradeResult,
     expected_preserved: dict[str, tuple[int, str]],
+    progress: ProgressCallback | None = None,
 ) -> None:
+    _report(progress, 0, "checking replacement metadata")
     remote_sessions._restore_snapshot_bundle(root, result.session.session_id)
     session = DirectorySession.load(root / "session.json")
     if session != result.session:
@@ -443,12 +521,17 @@ def _verify_replacement(
         raise ValueError("replacement filesystem content does not match the source")
     if [manifest.entries for manifest in manifests] != result.entries:
         raise ValueError("replacement snapshot metadata does not match the source")
-    for manifest, expected_snapshot in zip(manifests, result.snapshots, strict=True):
+    total_snapshots = max(len(manifests), 1)
+    for index, (manifest, expected_snapshot) in enumerate(
+        zip(manifests, result.snapshots, strict=True), start=1
+    ):
         with tempfile.TemporaryDirectory(prefix="verify-snapshot-", dir=root.parent) as name:
             restored = Path(name) / "tree"
             _store(root).restore_manifest(session.session_id, manifest, restored)
             if snapshot_fingerprint(restored) != expected_snapshot:
                 raise ValueError("replacement filesystem bytes do not match the source")
+        if progress is not None:
+            progress(index, total_snapshots, f"verified snapshot {index}/{total_snapshots}")
     actual_preserved = _preserved_files(root)
     if actual_preserved != expected_preserved:
         missing = sorted(expected_preserved.keys() - actual_preserved.keys())
@@ -464,11 +547,23 @@ def _verify_replacement(
         )
 
 
-def _prepare_replacement(remote: S3Store, source: RemoteSource, work: Path) -> Replacement:
+def _prepare_replacement(
+    remote: S3Store,
+    source: RemoteSource,
+    work: Path,
+    progress: ProgressCallback | None = None,
+) -> Replacement:
     extracted = work / source.session_id
     extracted.mkdir()
-    original_size, had_bundle = _download(remote, source, extracted)
+    original_size, had_bundle = _download(
+        remote,
+        source,
+        extracted,
+        progress=_progress_range(progress, 0, 45),
+    )
+    _report(progress, 48, "fingerprinting source data")
     expected_preserved = _preserved_files(extracted)
+    _report(progress, 52, "upgrading session in scratch")
     result = upgrade_session(
         extracted,
         source.session_id,
@@ -478,15 +573,31 @@ def _prepare_replacement(remote: S3Store, source: RemoteSource, work: Path) -> R
         expected_step=source.step,
         remote_complete=source.completion_key is not None,
     )
-    prepared = prepare_generation(_store(extracted), result.session)
+    prepared = prepare_generation(
+        _store(extracted),
+        result.session,
+        progress=_progress_range(progress, 60, 70),
+    )
     try:
         verified = work / "verified" / source.session_id
         verified.mkdir(parents=True)
         with prepared.path.open("rb") as archive:
-            digest = safe_extract_tar_zst_stream(archive, verified)
+            digest = safe_extract_tar_zst_stream(
+                archive,
+                verified,
+                progress=_progress_range(progress, 70, 80),
+                progress_total=prepared.size_bytes,
+                progress_message="extracting prepared replacement",
+            )
         if digest != prepared.digest:
             raise ValueError("locally prepared replacement checksum mismatch")
-        _verify_replacement(verified, result, expected_preserved)
+        _verify_replacement(
+            verified,
+            result,
+            expected_preserved,
+            progress=_progress_range(progress, 80, 100),
+        )
+        _report(progress, 100, "replacement verified locally")
         return Replacement(source, result.session, prepared, original_size, result.source_format)
     except BaseException:
         prepared.cleanup()
@@ -512,7 +623,12 @@ def _same_source(remote: S3Store, config: S3Config, source: RemoteSource) -> boo
         return False
 
 
-def _install_replacement(remote: S3Store, config: S3Config, replacement: Replacement) -> None:
+def _install_replacement(
+    remote: S3Store,
+    config: S3Config,
+    replacement: Replacement,
+    progress: ProgressCallback | None = None,
+) -> None:
     source = replacement.source
     base = remote_sessions._session_base(config, replacement.session.origin, source.session_id)
     generation = remote_sessions._generation_key(
@@ -528,9 +644,18 @@ def _install_replacement(remote: S3Store, config: S3Config, replacement: Replace
             "replacement generation, completion, or staging object already exists"
         )
 
-    remote.upload_file(staging, replacement.prepared.path)
+    _report(progress, 0, "uploading staging replacement")
+    remote.upload_file(
+        staging,
+        replacement.prepared.path,
+        progress=_progress_range(progress, 0, 20),
+    )
     try:
-        staged_digest, staged_size = _stream_digest(remote, staging)
+        staged_digest, staged_size = _stream_digest(
+            remote,
+            staging,
+            progress=_progress_range(progress, 20, 40),
+        )
         if (staged_digest, staged_size) != (
             replacement.prepared.digest,
             replacement.prepared.size_bytes,
@@ -539,8 +664,17 @@ def _install_replacement(remote: S3Store, config: S3Config, replacement: Replace
         if not _same_source(remote, config, source):
             raise ValueError("remote session changed while its replacement was prepared")
 
-        remote.upload_file(generation, replacement.prepared.path)
-        final_digest, final_size = _stream_digest(remote, generation)
+        _report(progress, 45, "uploading final replacement")
+        remote.upload_file(
+            generation,
+            replacement.prepared.path,
+            progress=_progress_range(progress, 45, 65),
+        )
+        final_digest, final_size = _stream_digest(
+            remote,
+            generation,
+            progress=_progress_range(progress, 65, 85),
+        )
         if (final_digest, final_size) != (
             replacement.prepared.digest,
             replacement.prepared.size_bytes,
@@ -551,6 +685,7 @@ def _install_replacement(remote: S3Store, config: S3Config, replacement: Replace
         old_completion_removed = False
         index_written = False
         try:
+            _report(progress, 88, "publishing verified replacement")
             if source.candidate.layout == "content-addressed":
                 assert source.completion_key is not None
                 remote.remove(source.completion_key)
@@ -587,6 +722,7 @@ def _install_replacement(remote: S3Store, config: S3Config, replacement: Replace
                 remote.remove(key)
         # The source archive is always the final destructive operation.
         remote.remove(source.object_key)
+        _report(progress, 100, "replacement installed")
     finally:
         with suppress(Exception):
             remote.remove(staging)
@@ -597,25 +733,70 @@ def recompress_s3(
     client: object | None = None,
     *,
     dry_run: bool = False,
+    scratch_dir: Path | None = None,
+    progress: ProgressCallback | None = None,
 ) -> S3RecompressionSummary:
     """Detect and upgrade every indexed historical S3 session format."""
     config = config or S3Config.discover(required=True)
     assert config is not None
     remote = client if isinstance(client, S3Store) else S3Store(config, client)
+    if progress is not None:
+        progress(0, 1, "discovering indexed S3 sessions")
     candidates = discover_remote_candidates(remote, config)
     summary = S3RecompressionSummary(sources=len(candidates))
-    for candidate in candidates:
+    if not candidates:
+        if progress is not None:
+            progress(1, 1, "no indexed S3 sessions found")
+        return summary
+    scratch = _scratch_directory(scratch_dir)
+    progress_total = len(candidates) * 1000
+    for position, candidate in enumerate(candidates, start=1):
         prepared: PreparedGeneration | None = None
+
+        def session_progress(completed: int, total: int, message: str) -> None:
+            if progress is None:
+                return
+            fraction = max(0.0, min(completed / max(total, 1), 1.0))
+            overall = ((position - 1) * 1000) + round(fraction * 1000)
+            progress(
+                overall,
+                progress_total,
+                f"({position}/{len(candidates)}) {candidate.session_id} {message}",
+            )
+
+        session_progress(0, 1, "checking eligibility")
         try:
             source = source_for_candidate(remote, config, candidate)
-            with tempfile.TemporaryDirectory(prefix="memo-s3-upgrade-") as work_name:
-                replacement = _prepare_replacement(remote, source, Path(work_name))
+            with tempfile.TemporaryDirectory(
+                prefix=f"memo-s3-upgrade-{candidate.session_id}-",
+                dir=scratch,
+            ) as work_name:
+                if progress is None:
+                    replacement = _prepare_replacement(remote, source, Path(work_name))
+                else:
+                    prepare_progress = (
+                        session_progress if dry_run else _progress_range(session_progress, 0, 70)
+                    )
+                    replacement = _prepare_replacement(
+                        remote,
+                        source,
+                        Path(work_name),
+                        progress=prepare_progress,
+                    )
                 prepared = replacement.prepared
                 summary.formats[candidate.session_id] = replacement.source_format
                 summary.original_bytes += replacement.original_size
                 summary.replacement_bytes += replacement.prepared.size_bytes
                 if not dry_run:
-                    _install_replacement(remote, config, replacement)
+                    if progress is None:
+                        _install_replacement(remote, config, replacement)
+                    else:
+                        _install_replacement(
+                            remote,
+                            config,
+                            replacement,
+                            progress=_progress_range(session_progress, 70, 100),
+                        )
                 summary.migrated.append(candidate.session_id)
         except (AlreadyLatest, NotEligible) as error:
             summary.skipped.append((candidate.session_id, str(error)))
@@ -624,6 +805,7 @@ def recompress_s3(
         finally:
             if prepared is not None:
                 prepared.cleanup()
+            session_progress(1, 1, "finished")
     return summary
 
 

@@ -68,6 +68,16 @@ preview:
 memo-migrate-legacy --upgrade-s3 --dry-run
 ```
 
+The command creates a unique disposable work directory under
+`$XDG_CACHE_HOME/memo/legacy-migrator` (normally
+`~/.cache/memo/legacy-migrator`) instead of relying on a potentially
+memory-backed system `/tmp`. Each session's work directory is removed before
+the next one proceeds, including on validation failure, Ctrl-C, or SIGTERM.
+Use `--scratch-dir DIRECTORY` to select another filesystem. The parent
+directory may remain, but completed runs leave no session archives or extracted
+copies inside it. As with any process, SIGKILL or a machine power loss can
+prevent cleanup.
+
 The preview downloads every indexed session's selected generation into
 temporary storage, verifies its SHA-256 digest and size, converts every
 filesystem step to Git storage, creates a replacement generation, extracts it
@@ -77,6 +87,9 @@ executable mode; non-snapshot session files must also match by path, mode, and
 digest. It does not write to S3. Sessions already in the latest format are
 skipped. Active sessions and sessions with an unselected newer generation are
 also skipped so the migrator cannot race an in-progress upload.
+An interactive terminal shows the current session and phase in a progress bar
+with an estimated time remaining. The estimate becomes more stable as sessions
+complete; archive sizes and conversion costs can differ substantially.
 
 After reviewing the preview, apply the migration explicitly:
 

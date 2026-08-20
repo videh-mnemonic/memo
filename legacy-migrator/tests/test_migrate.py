@@ -103,11 +103,11 @@ def test_cli_dry_run_reports_without_writing(monkeypatch, capsys) -> None:
     )
 
 
-def test_cli_s3_upgrade_dry_run_is_forwarded(monkeypatch, capsys) -> None:
+def test_cli_s3_upgrade_options_are_forwarded(monkeypatch, capsys, tmp_path: Path) -> None:
     received: dict[str, object] = {}
 
-    def fake_upgrade_s3(*, dry_run: bool) -> SimpleNamespace:
-        received["dry_run"] = dry_run
+    def fake_upgrade_s3(*, dry_run: bool, scratch_dir: Path, progress) -> SimpleNamespace:
+        received.update(dry_run=dry_run, scratch_dir=scratch_dir, progress=progress)
         return SimpleNamespace(
             sources=1,
             migrated=["remote-session"],
@@ -122,8 +122,9 @@ def test_cli_s3_upgrade_dry_run_is_forwarded(monkeypatch, capsys) -> None:
         fake_upgrade_s3,
     )
 
-    assert main(["--upgrade-s3", "--dry-run"]) == 0
-    assert received == {"dry_run": True}
+    scratch = tmp_path / "scratch"
+    assert main(["--upgrade-s3", "--dry-run", "--scratch-dir", str(scratch)]) == 0
+    assert received == {"dry_run": True, "scratch_dir": scratch, "progress": None}
     assert capsys.readouterr().out == (
         "would upgrade: 1\n"
         "skipped: 0\n"
@@ -131,6 +132,11 @@ def test_cli_s3_upgrade_dry_run_is_forwarded(monkeypatch, capsys) -> None:
         "would upgrade: remote-session\n"
         "bytes: 100 -> 25 (75 saved)\n"
     )
+
+
+def test_cli_rejects_scratch_for_local_migration(capsys, tmp_path: Path) -> None:
+    assert main(["--scratch-dir", str(tmp_path)]) == 2
+    assert "--scratch-dir requires --upgrade-s3" in capsys.readouterr().err
 
 
 def test_legacy_sources_can_use_explicit_directory(tmp_path: Path) -> None:
