@@ -70,10 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"failed: {source}: {error}", file=sys.stderr)
     if args.recompress_s3 and summary.migrated:
         saved = summary.original_bytes - summary.replacement_bytes
-        print(
-            f"bytes: {summary.original_bytes} -> {summary.replacement_bytes} "
-            f"({saved} saved)"
-        )
+        print(f"bytes: {summary.original_bytes} -> {summary.replacement_bytes} ({saved} saved)")
     return 1 if summary.failed else 0
 
 

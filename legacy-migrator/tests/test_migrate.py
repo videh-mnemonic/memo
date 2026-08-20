@@ -33,8 +33,7 @@ def test_migrate_legacy_scratch_recording(tmp_path: Path) -> None:
     (legacy / "traces").mkdir()
     _git(["bundle", "create", str(legacy / "git" / "initial.bundle"), "HEAD"], source_repo)
     (legacy / "traces" / "leg-001.jsonl").write_text(
-        json.dumps({"session_id": "legacy-session", "type": "user", "content": "old prompt"})
-        + "\n"
+        json.dumps({"session_id": "legacy-session", "type": "user", "content": "old prompt"}) + "\n"
     )
     (legacy / "meta.json").write_text(
         json.dumps(
@@ -100,10 +99,7 @@ def test_cli_dry_run_reports_without_writing(monkeypatch, capsys) -> None:
     assert main(["--legacy-dir", str(requested_directory), "--dry-run"]) == 0
     assert received == {"legacy_dir": requested_directory, "dry_run": True}
     assert capsys.readouterr().out == (
-        "would migrate: 1\n"
-        "skipped: 0\n"
-        "failed: 0\n"
-        "would migrate: legacy-session\n"
+        "would migrate: 1\nskipped: 0\nfailed: 0\nwould migrate: legacy-session\n"
     )
 
 

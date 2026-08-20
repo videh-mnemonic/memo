@@ -2,25 +2,28 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from memo_legacy_migrator.s3_recompress import (
+    _convert_snapshots,
+    _install_replacement,
+    _RemoteSource,
+    _Replacement,
+)
 
 from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore
 from memo.transport import remote_sessions
-from memo.transport.archive import PreparedGeneration
+from memo.transport.archive import (
+    PreparedGeneration,
+    prepare_generation,
+    safe_extract_tar_zst_stream,
+)
 from memo.transport.config import S3Config
 from memo.transport.s3 import S3Store
-from memo_legacy_migrator.s3_recompress import (
-    _RemoteSource,
-    _Replacement,
-    _convert_snapshots,
-    _install_replacement,
-)
 
 
 class FakeS3:
@@ -144,16 +147,39 @@ def test_convert_snapshots_preserves_every_filesystem_step(tmp_path: Path) -> No
         store.publish(session, manifest, snapshot)
         expected.append(content)
 
-    tree_ids = _convert_snapshots(session_root, session.session_id)
+    tree_ids, expected_entries = _convert_snapshots(session_root, session.session_id)
     manifests = store.steps(session.session_id)
 
     assert len(tree_ids) == 3
     assert tree_ids[-1] == tree_ids[-2]
+    assert expected_entries == [[], [], []]
     assert all(manifest.snapshot_commit for manifest in manifests)
     for index, content in enumerate((*expected, expected[-1])):
         restored = tmp_path / f"restored-{index}"
         store.restore_manifest(session.session_id, manifests[index], restored)
         assert (restored / "file.bin").read_bytes() == content
+
+    prepared = prepare_generation(store, session)
+    try:
+        packaged = tmp_path / "packaged" / session.session_id
+        packaged.mkdir(parents=True)
+        with prepared.path.open("rb") as archive:
+            safe_extract_tar_zst_stream(archive, packaged)
+        assert (packaged / "snapshots.bundle").is_file()
+        remote_sessions._restore_snapshot_bundle(packaged, session.session_id)
+        packaged_store = SessionStore(
+            StoragePaths(
+                packaged.parent,
+                archive=packaged.parent,
+                runtime=tmp_path / "packaged-runtime",
+                spool=tmp_path / "packaged-spool",
+            )
+        )
+        packaged_manifests = packaged_store.steps(session.session_id)
+        assert [manifest.entries for manifest in packaged_manifests] == expected_entries
+        assert not (packaged / "snapshots.bundle").exists()
+    finally:
+        prepared.cleanup()
 
 
 def test_install_replacement_verifies_before_removing_original(tmp_path: Path) -> None:

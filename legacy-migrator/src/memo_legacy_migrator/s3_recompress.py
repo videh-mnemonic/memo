@@ -103,7 +103,7 @@ def _preserved_files(root: Path) -> dict[str, tuple[str, int, str | None]]:
         relative = path.relative_to(root)
         transformed = (
             relative.as_posix() == "HEAD"
-            or relative.parts[0] in {"snapshots", "snapshots.git"}
+            or relative.parts[0] in {"entries", "snapshots", "snapshots.git"}
             or (
                 len(relative.parts) == 2
                 and relative.parts[0] == "steps"
@@ -141,9 +141,7 @@ def _source_for_session(remote: S3Store, config: S3Config, session_id: str) -> _
         raise _NotEligible("selected archive is not the latest remote generation")
     completion_key = remote_sessions._completion_key(base, step, digest)
     completion_data = remote.read_bytes(completion_key)
-    return _RemoteSource(
-        session_id, step, object_key, digest, completion_key, completion_data
-    )
+    return _RemoteSource(session_id, step, object_key, digest, completion_key, completion_data)
 
 
 def _download(remote: S3Store, source: _RemoteSource, destination: Path) -> int:
@@ -168,9 +166,7 @@ def _download(remote: S3Store, source: _RemoteSource, destination: Path) -> int:
             f"download checksum mismatch: expected {source.digest}, got {actual_digest}"
         )
     if expected_size is None or downloaded_size != expected_size:
-        raise ValueError(
-            f"download size mismatch: expected {expected_size}, got {downloaded_size}"
-        )
+        raise ValueError(f"download size mismatch: expected {expected_size}, got {downloaded_size}")
     with archive_path.open("rb") as archive:
         extracted_digest = safe_extract_tar_zst_stream(archive, destination)
     if extracted_digest != actual_digest:
@@ -179,7 +175,9 @@ def _download(remote: S3Store, source: _RemoteSource, destination: Path) -> int:
     return downloaded_size
 
 
-def _convert_snapshots(session_root: Path, session_id: str) -> list[str]:
+def _convert_snapshots(
+    session_root: Path, session_id: str
+) -> tuple[list[str], list[list[SnapshotEntry]]]:
     paths = StoragePaths(
         session_root.parent,
         archive=session_root.parent,
@@ -197,6 +195,7 @@ def _convert_snapshots(session_root: Path, session_id: str) -> list[str]:
 
     repository = GitSnapshotStore(session_root / "snapshots.git")
     expected_trees: list[str] = []
+    expected_entries: list[list[SnapshotEntry]] = []
     parent: str | None = None
     converted: list[StepManifest] = []
     for manifest in manifests:
@@ -206,24 +205,24 @@ def _convert_snapshots(session_root: Path, session_id: str) -> list[str]:
             tree_id, parent, f"Memo filesystem snapshot {manifest.step}"
         )
         expected_trees.append(tree_id)
-        # A converted step has to be written the way the current publisher
-        # writes one: entries reduced to what a Git tree cannot express, and the
-        # list itself stored once under the digest the step records.
         exceptions = snapshot_exceptions(manifest.entries)
-        digest = digest_entries(exceptions)
+        entries_digest = digest_entries(exceptions)
         converted_manifest = replace(
             manifest,
+            entries=exceptions,
             schema_version=STEP_SCHEMA_VERSION,
             snapshot_commit=commit,
-            entries=exceptions,
-            entries_digest=digest,
+            entries_digest=entries_digest,
         )
-        _write_entry_list(session_root, digest, exceptions)
+        entries_path = entries_directory(session_root) / f"{entries_digest}.json"
+        if not entries_path.is_file():
+            atomic_write(entries_path, encode_entries(exceptions))
         atomic_write(
             session_root / "steps" / f"{manifest.step}.json",
             _json_bytes(converted_manifest.to_stored_dict()),
         )
         converted.append(converted_manifest)
+        expected_entries.append(exceptions)
         parent = commit
 
     # A higher generation avoids a same-step fork while the verified replacement
@@ -240,20 +239,15 @@ def _convert_snapshots(session_root: Path, session_id: str) -> list[str]:
     )
     atomic_write(session_root / "HEAD", f"{boundary.step}\n".encode())
     expected_trees.append(expected_trees[-1])
-    return expected_trees
-
-
-def _write_entry_list(session_root: Path, digest: str, entries: list[SnapshotEntry]) -> None:
-    """Add one entry list to the session's shared pool if it is not there yet."""
-    target = entries_directory(session_root) / f"{digest}.json"
-    if not target.is_file():
-        atomic_write(target, encode_entries(entries))
+    expected_entries.append(expected_entries[-1])
+    return expected_trees, expected_entries
 
 
 def _verify_replacement(
     replacement_root: Path,
     session_id: str,
     expected_trees: list[str],
+    expected_entries: list[list[SnapshotEntry]],
     expected_preserved: dict[str, tuple[str, int, str | None]],
 ) -> None:
     paths = StoragePaths(
@@ -263,30 +257,25 @@ def _verify_replacement(
         spool=replacement_root.parent / "spool-verify",
     )
     store = SessionStore(paths)
-    # A prepared generation ships its snapshots as a bundle, so reconstitute the
-    # repository before reading the replacement back, exactly as a pull does.
-    remote_sessions._restore_snapshot_bundle(replacement_root, session_id)
     manifests = store.steps(session_id)
     if len(manifests) != len(expected_trees):
         raise ValueError("replacement step history does not match the source")
     repository = GitSnapshotStore(replacement_root / "snapshots.git")
-    actual_trees = [
-        repository.tree_id(manifest.snapshot_commit or "") for manifest in manifests
-    ]
+    actual_trees = [repository.tree_id(manifest.snapshot_commit or "") for manifest in manifests]
     if actual_trees != expected_trees:
         raise ValueError("replacement filesystem content does not match the source")
+    if [manifest.entries for manifest in manifests] != expected_entries:
+        raise ValueError("replacement snapshot metadata does not match the source")
     if _preserved_files(replacement_root) != expected_preserved:
         raise ValueError("replacement changed non-snapshot session data")
 
 
-def _prepare_replacement(
-    remote: S3Store, source: _RemoteSource, work: Path
-) -> _Replacement:
+def _prepare_replacement(remote: S3Store, source: _RemoteSource, work: Path) -> _Replacement:
     extracted = work / source.session_id
     extracted.mkdir()
     original_size = _download(remote, source, extracted)
     expected_preserved = _preserved_files(extracted)
-    expected_trees = _convert_snapshots(extracted, source.session_id)
+    expected_trees, expected_entries = _convert_snapshots(extracted, source.session_id)
     session = DirectorySession.load(extracted / "session.json")
     paths = StoragePaths(
         work,
@@ -304,7 +293,14 @@ def _prepare_replacement(
             digest = safe_extract_tar_zst_stream(archive, verified)
         if digest != prepared.digest:
             raise ValueError("locally prepared replacement checksum mismatch")
-        _verify_replacement(verified, source.session_id, expected_trees, expected_preserved)
+        remote_sessions._restore_snapshot_bundle(verified, source.session_id)
+        _verify_replacement(
+            verified,
+            source.session_id,
+            expected_trees,
+            expected_entries,
+            expected_preserved,
+        )
         if prepared.size_bytes >= original_size:
             raise _NotSmaller(
                 f"verified replacement is not smaller ({original_size} -> "
@@ -328,9 +324,7 @@ def _completion_data(replacement: _Replacement, generation: str) -> bytes:
     )
 
 
-def _install_replacement(
-    remote: S3Store, config: S3Config, replacement: _Replacement
-) -> None:
+def _install_replacement(remote: S3Store, config: S3Config, replacement: _Replacement) -> None:
     source = replacement.source
     base = source.object_key.rsplit("/generations/", 1)[0]
     generation = remote_sessions._generation_key(
@@ -363,15 +357,12 @@ def _install_replacement(
             remote.remove(generation)
             raise ValueError("uploaded replacement is not byte-identical to the local candidate")
         try:
-            generations = remote_sessions._list_generations(
-                remote, f"{base}/generations/"
-            )
+            generations = remote_sessions._list_generations(remote, f"{base}/generations/")
         except BaseException:
             remote.remove(generation)
             raise
         if (
-            generations.get(replacement.prepared.step)
-            != (generation, replacement.prepared.digest)
+            generations.get(replacement.prepared.step) != (generation, replacement.prepared.digest)
             or max(generations) != replacement.prepared.step
         ):
             remote.remove(generation)
@@ -393,9 +384,7 @@ def _install_replacement(
                     remote.remove(generation)
             raise
 
-        selected = remote_sessions._select_generation(
-            remote, config, base, source.session_id
-        )
+        selected = remote_sessions._select_generation(remote, config, base, source.session_id)
         if selected[0:3] != (
             replacement.prepared.step,
             generation,
