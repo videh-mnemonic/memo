@@ -9,6 +9,7 @@ import pytest
 
 from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.recording.paths import StoragePaths
+from memo.recording.snapshots import StepPublisher
 from memo.recording.store import SessionNotFoundError, SessionStore
 
 
@@ -480,3 +481,71 @@ def test_stream_metadata_cache_notices_a_rewritten_stream(tmp_path: Path) -> Non
     os.utime(metadata, (0, 0))
     with pytest.raises(ValueError, match="does not reach step"):
         store.head("session")
+
+
+def _publisher_session(tmp_path: Path) -> tuple[SessionStore, DirectorySession, Path]:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.txt").write_text("one")
+    (root / "b.txt").write_text("two")
+    store = SessionStore(_paths(tmp_path))
+    session = _session(root)
+    store.create(session)
+    return store, session, root
+
+
+def test_steps_sharing_a_file_list_share_one_entry_list(tmp_path: Path) -> None:
+    store, session, root = _publisher_session(tmp_path)
+    publisher = StepPublisher(store, seal_streams=lambda _session: {})
+    for index in range(6):
+        # Contents change every step; which files exist does not.
+        (root / "a.txt").write_text(f"content {index}")
+        publisher.publish(session, force=True)
+
+    directory = store.session_path("session")
+    assert len(list((directory / "steps").glob("*.json"))) == 6
+    assert len(list((directory / "entries").glob("*.json"))) == 1
+
+    stored = json.loads((directory / "steps" / "5.json").read_text())
+    assert stored["entries"] == []
+    assert stored["entries_digest"]
+    # The step still describes its tree; the description simply lives once.
+    assert [entry.path for entry in store.step("session", -1).entries] == ["a.txt", "b.txt"]
+
+
+def test_a_changed_file_list_gets_its_own_entry_list(tmp_path: Path) -> None:
+    store, session, root = _publisher_session(tmp_path)
+    publisher = StepPublisher(store, seal_streams=lambda _session: {})
+    publisher.publish(session, force=True)
+    (root / "c.txt").write_text("three")
+    publisher.publish(session, force=True)
+
+    directory = store.session_path("session")
+    assert len(list((directory / "entries").glob("*.json"))) == 2
+    assert [entry.path for entry in store.step("session", -1).entries] == [
+        "a.txt",
+        "b.txt",
+        "c.txt",
+    ]
+
+
+def test_history_validation_rejects_a_missing_entry_list(tmp_path: Path) -> None:
+    store, session, _root = _publisher_session(tmp_path)
+    StepPublisher(store, seal_streams=lambda _session: {}).publish(session, force=True)
+    directory = store.session_path("session")
+    next(iter((directory / "entries").glob("*.json"))).unlink()
+    with pytest.raises(OSError):
+        store.steps("session")
+
+
+def test_manifests_with_inline_entries_still_load(tmp_path: Path) -> None:
+    # Recordings written before entry lists were shared keep their entries in
+    # the step itself, and must keep resolving without an entries directory.
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(_paths(tmp_path))
+    session = _session(root)
+    store.create(session)
+    _publish(store, session, 0)
+    assert not (store.session_path("session") / "entries").exists()
+    assert [entry.path for entry in store.step("session", 0).entries] == ["file.txt"]

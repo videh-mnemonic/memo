@@ -14,7 +14,14 @@ from typing import TYPE_CHECKING
 from ..agents.run_metadata import AgentRunMetadata
 from .filesystem import atomic_write
 from .git_snapshots import GitSnapshotStore
-from .metadata import DirectorySession, StepManifest
+from .metadata import (
+    STEP_SCHEMA_VERSION,
+    DirectorySession,
+    StepManifest,
+    digest_entries,
+    encode_entries,
+    entries_directory,
+)
 from .paths import StoragePaths
 
 if TYPE_CHECKING:
@@ -417,9 +424,25 @@ class SessionStore:
         current = self.head(session_id)
         return 0 if current is None else current.step + 1
 
+    def _store_entries(self, session_path: Path, manifest: StepManifest) -> None:
+        """Write a step's entry list to the shared, content-addressed pool.
+
+        Consecutive steps of a recording describe the same tree far more often
+        than not, so naming the list by its hash collapses tens of thousands of
+        near-identical copies into one file each.
+        """
+        if not manifest.entries_digest:
+            return
+        target = entries_directory(session_path) / f"{manifest.entries_digest}.json"
+        if target.is_file():
+            return
+        atomic_write(target, encode_entries(manifest.entries))
+
     def publish(
         self, session: DirectorySession, manifest: StepManifest, prepared_snapshot: Path
     ) -> StepManifest:
+        if manifest.schema_version >= STEP_SCHEMA_VERSION and manifest.entries_digest is None:
+            manifest.entries_digest = digest_entries(manifest.entries)
         manifest.validate()
         if manifest.session_id != session.session_id:
             raise ValueError("step belongs to a different session")
@@ -446,7 +469,8 @@ class SessionStore:
             ) if prepared_snapshot.is_file() else shutil.rmtree(
                 prepared_snapshot, ignore_errors=True
             )
-            atomic_write(manifest_path, _json_bytes(manifest.to_dict()))
+            self._store_entries(path, manifest)
+            atomic_write(manifest_path, _json_bytes(manifest.to_stored_dict()))
             atomic_write(path / "HEAD", f"{manifest.step}\n".encode())
             return manifest
         if snapshot.exists() and not manifest_path.exists():
@@ -460,7 +484,8 @@ class SessionStore:
             raise FileExistsError(f"step already exists: {manifest.step}")
         prepared_snapshot.replace(snapshot)
         self._fsync_tree(snapshot)
-        atomic_write(manifest_path, _json_bytes(manifest.to_dict()))
+        self._store_entries(path, manifest)
+        atomic_write(manifest_path, _json_bytes(manifest.to_stored_dict()))
         atomic_write(path / "HEAD", f"{manifest.step}\n".encode())
         return manifest
 

@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import getpass
+import hashlib
 import json
 import socket
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 DIRECTORY_FORMAT_VERSION = 2
-STEP_SCHEMA_VERSION = 2
+STEP_SCHEMA_VERSION = 3
+
+#: Serialisation of a shared snapshot entry list.
+ENTRIES_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,48 @@ class SnapshotEntry:
         return cls(**value)
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value.lower())
+    )
+
+
+def entries_directory(session_path: Path) -> Path:
+    """Where a session keeps the snapshot entry lists its steps share."""
+    return session_path / "entries"
+
+
+def encode_entries(entries: Sequence[SnapshotEntry]) -> bytes:
+    """Serialise an entry list canonically, so equal lists hash identically."""
+    return json.dumps(
+        {
+            "schema_version": ENTRIES_SCHEMA_VERSION,
+            "entries": [asdict(entry) for entry in entries],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
+def digest_entries(entries: Sequence[SnapshotEntry]) -> str:
+    return hashlib.sha256(encode_entries(entries)).hexdigest()
+
+
+@lru_cache(maxsize=64)
+def read_entries(path: str) -> tuple[SnapshotEntry, ...]:
+    """Read a shared entry list.
+
+    The file is named for the hash of its contents, so a given path can never
+    describe two different lists and the parse is cached indefinitely.
+    """
+    value = json.loads(Path(path).read_text())
+    if value.get("schema_version") != ENTRIES_SCHEMA_VERSION:
+        raise ValueError("unsupported snapshot entry list version")
+    return tuple(SnapshotEntry.from_dict(item) for item in value["entries"])
+
+
 @dataclass
 class StepManifest:
     session_id: str
@@ -110,17 +158,22 @@ class StepManifest:
     schema_version: int = 1
     agent_runs: list[str] = field(default_factory=list)
     snapshot_commit: str | None = None
+    entries_digest: str | None = None
 
     def validate(self) -> None:
-        if self.schema_version not in {1, STEP_SCHEMA_VERSION}:
+        if self.schema_version not in {1, 2, STEP_SCHEMA_VERSION}:
             raise ValueError("unsupported step schema version")
+        if self.entries_digest is not None and not _is_sha256(self.entries_digest):
+            raise ValueError("invalid snapshot entry digest")
         if not isinstance(self.step, int) or self.step < 0:
             raise ValueError("step must be nonnegative")
         expected = f"snapshots/{self.step}"
         if self.snapshot != expected:
             raise ValueError(f"step snapshot must be {expected}")
-        if self.schema_version == STEP_SCHEMA_VERSION and not self.snapshot_commit:
+        if self.schema_version >= 2 and not self.snapshot_commit:
             raise ValueError("Git-backed step is missing its snapshot commit")
+        if self.schema_version >= STEP_SCHEMA_VERSION and not self.entries_digest:
+            raise ValueError("step is missing its snapshot entry digest")
         if self.snapshot_commit and (
             len(self.snapshot_commit) not in {40, 64}
             or any(value not in "0123456789abcdef" for value in self.snapshot_commit.lower())
@@ -152,6 +205,13 @@ class StepManifest:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def to_stored_dict(self) -> dict[str, Any]:
+        """Serialise for the archive, leaving a shared entry list out of line."""
+        value = asdict(self)
+        if self.entries_digest:
+            value["entries"] = []
+        return value
+
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> StepManifest:
         value = dict(value)
@@ -162,4 +222,9 @@ class StepManifest:
 
     @classmethod
     def load(cls, path: Path) -> StepManifest:
-        return cls.from_dict(json.loads(path.read_text()))
+        """Read a step, resolving a shared entry list from beside its session."""
+        manifest = cls.from_dict(json.loads(path.read_text()))
+        if manifest.entries_digest and not manifest.entries:
+            entries_path = entries_directory(path.parent.parent) / f"{manifest.entries_digest}.json"
+            manifest.entries = list(read_entries(str(entries_path)))
+        return manifest
