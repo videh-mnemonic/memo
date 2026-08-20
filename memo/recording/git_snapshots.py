@@ -6,6 +6,7 @@ import os
 import subprocess
 import tarfile
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 
 
@@ -89,6 +90,34 @@ class GitSnapshotStore:
             text=True,
         )
         return result.returncode == 0
+
+    def contains_many(self, commits: Iterable[str]) -> set[str]:
+        """Return which of ``commits`` this repository holds, in one Git invocation.
+
+        Validating a long session means asking about tens of thousands of
+        commits; one process per commit dominates the cost, so resolve them as a
+        single batch.
+        """
+        wanted = list(dict.fromkeys(commits))
+        if not wanted or not self.path.is_dir():
+            return set()
+        result = subprocess.run(
+            ["git", "--git-dir", str(self.path), "cat-file", "--batch-check"],
+            input="".join(f"{commit}^{{commit}}\n" for commit in wanted),
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode != 0:
+            return set()
+        present = set()
+        for commit, line in zip(wanted, result.stdout.splitlines(), strict=False):
+            # Present objects report "<sha> <type> <size>"; missing ones report
+            # the queried name followed by "missing".
+            fields = line.split()
+            if len(fields) == 3 and fields[1] == "commit":
+                present.add(commit)
+        return present
 
     def pin(self, commit: str) -> None:
         """Keep the current snapshot reachable from the repository's branch ref."""

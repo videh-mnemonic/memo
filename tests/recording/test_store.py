@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -19,7 +20,12 @@ def _session(root: Path) -> DirectorySession:
     )
 
 
-def _publish(store: SessionStore, session: DirectorySession, step: int) -> StepManifest:
+def _publish(
+    store: SessionStore,
+    session: DirectorySession,
+    step: int,
+    stream_high_water: dict[str, int] | None = None,
+) -> StepManifest:
     temporary = Path(tempfile.mkdtemp(prefix="prepared-", dir=store.session_path("session")))
     (temporary / "file.txt").write_text(str(step))
     return store.publish(
@@ -30,9 +36,78 @@ def _publish(store: SessionStore, session: DirectorySession, step: int) -> StepM
             "now",
             f"snapshots/{step}",
             [SnapshotEntry("file.txt", "file", 0o644, 1)],
+            stream_high_water=dict(stream_high_water or {}),
         ),
         temporary,
     )
+
+
+TERMINAL = "terminal"
+CHUNK_NAMES = [f"chunks/{index:08d}-{index:08d}.jsonl.gz" for index in range(5)]
+
+
+def _recorded_session(tmp_path: Path, steps: int) -> SessionStore:
+    """Publish ``steps`` steps that all reference one multi-chunk terminal stream."""
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(_paths(tmp_path))
+    session = _session(root)
+    directory = store.create(session)
+    terminal_path = directory / "streams" / "terminals" / TERMINAL
+    (terminal_path / "chunks").mkdir(parents=True)
+    for name in CHUNK_NAMES:
+        (terminal_path / name).write_bytes(b"")
+    (terminal_path / "stream.json").write_text(
+        json.dumps({"highest_sequence": 50, "chunks": CHUNK_NAMES})
+    )
+    for step in range(steps):
+        _publish(store, session, step, stream_high_water={TERMINAL: step + 1})
+    return store
+
+
+def test_history_validation_probes_each_stream_chunk_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    steps = 8
+    store = _recorded_session(tmp_path, steps)
+    original = Path.is_file
+    probed: list[str] = []
+
+    def counting_is_file(self: Path) -> bool:
+        if self.name.endswith(".jsonl.gz"):
+            probed.append(self.name)
+        return original(self)
+
+    monkeypatch.setattr(Path, "is_file", counting_is_file)
+
+    assert len(store.steps("session")) == steps
+
+    # Every step references the same chunk list, so validating per step would
+    # probe each chunk once per step instead of once per recording.
+    assert sorted(probed) == sorted(Path(name).name for name in CHUNK_NAMES)
+
+
+def test_history_validation_still_rejects_a_missing_stream_chunk(tmp_path: Path) -> None:
+    store = _recorded_session(tmp_path, 4)
+    chunk = store.session_path("session") / "streams" / "terminals" / TERMINAL / CHUNK_NAMES[2]
+    chunk.unlink()
+    with pytest.raises(ValueError, match="missing chunk"):
+        store.steps("session")
+
+
+def test_history_validation_still_rejects_a_stream_short_of_a_step(tmp_path: Path) -> None:
+    store = _recorded_session(tmp_path, 4)
+    metadata = store.session_path("session") / "streams" / "terminals" / TERMINAL / "stream.json"
+    metadata.write_text(json.dumps({"highest_sequence": 2, "chunks": CHUNK_NAMES}))
+    with pytest.raises(ValueError, match="does not reach step"):
+        store.steps("session")
+
+
+def test_history_validation_still_rejects_a_missing_snapshot(tmp_path: Path) -> None:
+    store = _recorded_session(tmp_path, 3)
+    shutil.rmtree(store.session_path("session") / "snapshots" / "1")
+    with pytest.raises(ValueError, match="missing snapshot"):
+        store.steps("session")
 
 
 def test_publishes_zero_based_steps_and_numeric_head(tmp_path: Path) -> None:
