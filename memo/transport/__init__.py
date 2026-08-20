@@ -12,6 +12,7 @@ from .remote_sessions import (
     pull_all_sessions,
     pull_session,
     push_session,
+    verify_archived_session,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "publish_generation_metadata",
     "pull_session",
     "push_session",
+    "verify_archived_session",
 ]

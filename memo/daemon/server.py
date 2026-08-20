@@ -698,6 +698,10 @@ class MemoDaemon:
         if not isinstance(excluded, list) or not all(isinstance(value, str) for value in excluded):
             raise ProtocolError("remove_archived exclude must be a list of session IDs")
         excluded_ids = set(excluded)
+        from ..transport.remote_sessions import _store
+
+        config = self._s3_config(payload, required=False)
+        remote = None if config is None else _store(config, None)
         removed: list[str] = []
         retained: list[tuple[str, str]] = []
         failed: list[tuple[str, str]] = []
@@ -708,6 +712,13 @@ class MemoDaemon:
                 continue
             with self._session_lock(session_id):
                 try:
+                    if remote is not None:
+                        current = self.store.load_session(session_id)
+                        if current.remote_object and not remote.exists(current.remote_object):
+                            raise ValueError(
+                                "archived generation is missing from the remote archive: "
+                                f"{current.remote_object}"
+                            )
                     self.store.remove_archived(session_id)
                     removed.append(session_id)
                 except ValueError as error:

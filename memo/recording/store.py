@@ -326,16 +326,18 @@ class SessionStore:
     def remove_archived(self, session_id: str) -> None:
         """Remove a complete session whose published HEAD is recorded as pushed.
 
-        The remote generation digest is already recorded by the successful push.
-        Revalidating every historical snapshot here would reread tens of
-        thousands of files without adding protection against a newer local
-        step, which is already ruled out by the pushed step number.
+        Validate the history before deleting. This removes the only local copy,
+        and the push bookkeeping it would otherwise rely on records that an
+        upload happened, not that the upload contained a restorable recording:
+        an archive can be intact as bytes and still reference snapshot content
+        that was never stored. Retaining a recording costs disk; deleting one
+        that cannot be restored costs the recording.
         """
         path = self.session_path(session_id)
         session = self.load_session(session_id)
         if session.state != "complete":
             raise ValueError("recording is not complete")
-        head = self.head(session_id)
+        head = self.check_integrity(session_id)
         if head is None:
             raise ValueError("recording has no published step")
         if (

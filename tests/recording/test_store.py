@@ -299,7 +299,7 @@ def test_remove_archived_requires_complete_fully_pushed_head(tmp_path: Path) -> 
     assert not directory.exists()
 
 
-def test_remove_archived_does_not_revalidate_old_history(tmp_path: Path, monkeypatch) -> None:
+def _archived(tmp_path: Path) -> tuple[SessionStore, Path]:
     root = tmp_path / "root"
     root.mkdir()
     store = SessionStore(_paths(tmp_path / "home"))
@@ -311,17 +311,24 @@ def test_remove_archived_does_not_revalidate_old_history(tmp_path: Path, monkeyp
     session.last_pushed_digest = "0" * 64
     session.remote_object = "remote"
     store.update_session(session)
+    return store, directory
 
-    monkeypatch.setattr(
-        store,
-        "check_integrity",
-        lambda _session_id: (_ for _ in ()).throw(
-            AssertionError("full history validation should not run")
-        ),
-    )
 
+def test_remove_archived_validates_history_before_deleting(tmp_path: Path) -> None:
+    store, directory = _archived(tmp_path)
     store.remove_archived("session")
     assert not directory.exists()
+
+
+def test_remove_archived_keeps_a_recording_whose_snapshot_is_gone(tmp_path: Path) -> None:
+    store, directory = _archived(tmp_path)
+    # What was uploaded is a copy of this tree, so a snapshot missing here is
+    # missing in the archive too. Deleting on the strength of the push record
+    # alone is how filesystem history gets lost for good.
+    shutil.rmtree(directory / "snapshots" / "0")
+    with pytest.raises(ValueError, match="missing snapshot"):
+        store.remove_archived("session")
+    assert directory.exists()
 
 
 def test_remove_archived_renames_before_recursive_removal(

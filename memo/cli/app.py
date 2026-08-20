@@ -9,9 +9,31 @@ from pathlib import Path
 
 from ..recording.relay import run as run_relay
 from ..transport.config import S3Config
-from .commands import end, import_sessions, pull, push, replay, sandbox, status, tidy, traces
+from .commands import (
+    end,
+    import_sessions,
+    pull,
+    push,
+    replay,
+    sandbox,
+    status,
+    tidy,
+    traces,
+    verify,
+)
 
-COMMAND_MODULES = (end, import_sessions, tidy, status, traces, replay, push, pull, sandbox)
+COMMAND_MODULES = (
+    end,
+    import_sessions,
+    tidy,
+    status,
+    traces,
+    replay,
+    push,
+    pull,
+    verify,
+    sandbox,
+)
 COMMANDS = {module.NAME for module in COMMAND_MODULES}
 
 
