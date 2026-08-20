@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import memo_legacy_migrator.s3_recompress as s3_recompress
 import pytest
 from memo_legacy_migrator.s3_recompress import (
     RemoteCandidate,
@@ -46,12 +47,16 @@ class FakeS3:
         self.objects: dict[str, bytes] = {}
         self.operations: list[tuple[str, str]] = []
         self.corrupt_uploads = False
+        self.corrupt_final_uploads = False
 
     def fput_object(self, bucket: str, key: str, file_path: str, **kwargs) -> None:
         del bucket, kwargs
         self.operations.append(("upload", key))
         data = Path(file_path).read_bytes()
-        self.objects[key] = data + b"corrupt" if self.corrupt_uploads else data
+        corrupt = self.corrupt_uploads or (
+            self.corrupt_final_uploads and "/migration-staging/" not in key
+        )
+        self.objects[key] = data + b"corrupt" if corrupt else data
 
     def put_object(self, bucket: str, key: str, data, length: int, **kwargs) -> None:
         del bucket, kwargs
@@ -314,6 +319,7 @@ def _put_mutable(
     schema: int,
     checkpoint: bool = False,
     compressed: str = "tar.zst",
+    step: int = 1,
 ) -> str:
     base = (
         f"{config.prefix}/user/host/sessions/session"
@@ -322,14 +328,14 @@ def _put_mutable(
     )
     directory = "generations" if checkpoint else "steps"
     digest = hashlib.sha256(archive).hexdigest()
-    object_key = f"{base}/{directory}/1-{digest}.{compressed}"
+    object_key = f"{base}/{directory}/{step}-{digest}.{compressed}"
     latest = f"{base}/latest.json"
     client.objects[object_key] = archive
     client.objects[f"{object_key}.sha256"] = f"{digest}  archive.{compressed}\n".encode()
     pointer: dict[str, object] = {
         "schema_version": schema,
         "session_id": "session",
-        "step" if not checkpoint else "generation": 1,
+        "step" if not checkpoint else "generation": step,
         "object": object_key,
         "checksum": f"{object_key}.sha256",
         "digest": digest,
@@ -378,21 +384,23 @@ def _put_sidecar(client: FakeS3, config: S3Config, archive: bytes) -> str:
     return object_key
 
 
-def _put_content_addressed(client: FakeS3, config: S3Config, archive: bytes) -> str:
+def _put_content_addressed(
+    client: FakeS3, config: S3Config, archive: bytes, *, step: int = 1
+) -> str:
     session = DirectorySession(
         "session", "/recorded/root", "created", "updated", ORIGIN, state="complete"
     )
     base = remote_sessions._session_base(config, ORIGIN, "session")
     digest = hashlib.sha256(archive).hexdigest()
-    object_key = remote_sessions._generation_key(base, 1, digest)
-    completion = remote_sessions._completion_key(base, 1, digest)
+    object_key = remote_sessions._generation_key(base, step, digest)
+    completion = remote_sessions._completion_key(base, step, digest)
     index_key, index_data = remote_sessions._index_record(config, session)
     client.objects[object_key] = archive
     client.objects[completion] = remote_sessions._canonical_json(
         {
             "schema_version": 1,
             "session_id": "session",
-            "final_step": 1,
+            "final_step": step,
             "generation": object_key,
             "sha256": digest,
         }
@@ -420,6 +428,7 @@ def test_remote_upgrade_handles_every_transport_and_removes_source_last(
             schema=1,
             checkpoint=True,
             compressed="tar.gz",
+            step=2,
         )
     else:
         _numeric_session(source_root, "session", [1, 1])
@@ -439,8 +448,8 @@ def test_remote_upgrade_handles_every_transport_and_removes_source_last(
 
     summary = recompress_s3(config, client)
 
-    assert summary.migrated == ["session"]
     assert not summary.failed
+    assert summary.migrated == ["session"]
     assert original not in client.objects
     original_removal = client.operations.index(("remove", original))
     later_source_removals = [
@@ -461,7 +470,7 @@ def test_install_preserves_original_when_staging_is_corrupt(tmp_path: Path) -> N
     client = FakeS3()
     source_root = tmp_path / "source" / "session"
     _numeric_session(source_root, "session", [1])
-    original = _put_content_addressed(client, config, _tar_zst(source_root))
+    original = _put_content_addressed(client, config, _tar_zst(source_root), step=0)
     remote = S3Store(config, client)
     source = source_for_candidate(
         remote, config, RemoteCandidate("session", "content-addressed", "session")
@@ -480,6 +489,135 @@ def test_install_preserves_original_when_staging_is_corrupt(tmp_path: Path) -> N
     assert client.objects[original] == original_data
     assert source.completion_key in client.objects
     assert ("remove", original) not in client.operations
+
+
+def test_install_preserves_original_when_final_upload_is_corrupt(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    original = _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+    remote = S3Store(config, client)
+    source = source_for_candidate(
+        remote, config, RemoteCandidate("session", "content-addressed", "session")
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    replacement = _prepare_replacement(remote, source, work)
+    original_data = client.objects[original]
+    completion_data = client.objects[source.completion_key]
+    client.corrupt_final_uploads = True
+    try:
+        with pytest.raises(ValueError, match="uploaded replacement"):
+            _install_replacement(remote, config, replacement)
+    finally:
+        replacement.prepared.cleanup()
+
+    assert client.objects[original] == original_data
+    assert client.objects[source.completion_key] == completion_data
+    assert ("remove", original) not in client.operations
+
+
+def test_install_rolls_back_when_replacement_cannot_be_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    original = _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+    remote = S3Store(config, client)
+    source = source_for_candidate(
+        remote, config, RemoteCandidate("session", "content-addressed", "session")
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    replacement = _prepare_replacement(remote, source, work)
+    original_data = client.objects[original]
+    completion_data = client.objects[source.completion_key]
+    select = remote_sessions._select_generation
+    calls = 0
+
+    def fail_final_selection(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("injected final selection failure")
+        return select(*args, **kwargs)
+
+    monkeypatch.setattr(remote_sessions, "_select_generation", fail_final_selection)
+    try:
+        with pytest.raises(ValueError, match="injected final selection failure"):
+            _install_replacement(remote, config, replacement)
+    finally:
+        replacement.prepared.cleanup()
+
+    assert client.objects[original] == original_data
+    assert client.objects[source.completion_key] == completion_data
+    assert ("remove", original) not in client.operations
+    assert all(replacement.prepared.digest not in key for key in client.objects if key != original)
+
+
+def test_independent_snapshot_check_rejects_git_omissions(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    snapshot = source_root / "snapshots" / "0"
+    (snapshot / ".gitignore").write_text("hidden.bin\n")
+    (snapshot / "hidden.bin").write_bytes(b"must not disappear")
+    _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+    remote = S3Store(config, client)
+    source = source_for_candidate(
+        remote, config, RemoteCandidate("session", "content-addressed", "session")
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+
+    with pytest.raises(ValueError, match="filesystem bytes do not match"):
+        _prepare_replacement(remote, source, work)
+
+
+def test_remote_step_must_match_downloaded_archive_head(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    _put_content_addressed(client, config, _tar_zst(source_root), step=1)
+    original_objects = dict(client.objects)
+
+    summary = recompress_s3(config, client)
+
+    assert summary.migrated == []
+    assert summary.failed == [("session", "archive HEAD 0 does not match selected remote step 1")]
+    assert client.objects == original_objects
+
+
+def test_local_scratch_survives_install_then_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+    install = s3_recompress._install_replacement
+    scratch: Path | None = None
+
+    def inspect_scratch(remote, selected_config, replacement):
+        nonlocal scratch
+        scratch = replacement.prepared.path.parents[2]
+        assert (scratch / ".session.original.tar.zst").is_file()
+        install(remote, selected_config, replacement)
+
+    monkeypatch.setattr(s3_recompress, "_install_replacement", inspect_scratch)
+
+    summary = recompress_s3(config, client)
+
+    assert not summary.failed
+    assert summary.migrated == ["session"]
+    assert scratch is not None
+    assert not scratch.exists()
 
 
 def test_discovery_rejects_competing_layouts() -> None:

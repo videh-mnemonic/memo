@@ -26,7 +26,12 @@ from memo.transport.config import S3Config
 from memo.transport.s3 import STREAM_READ_SIZE, S3Store
 
 from .migrate import _safe_extract_tar
-from .session_upgrade import AlreadyLatest, UpgradeResult, upgrade_session
+from .session_upgrade import (
+    AlreadyLatest,
+    UpgradeResult,
+    snapshot_fingerprint,
+    upgrade_session,
+)
 
 SIDECAR_GENERATION = re.compile(r"^(\d{8,})\.tar\.zst$")
 SIDECAR_CHECKSUM = re.compile(r"^(\d{8,})\.sha256$")
@@ -407,7 +412,6 @@ def _download(remote: S3Store, source: RemoteSource, destination: Path) -> tuple
         _safe_extract_tar(archive_path, destination)
         if _file_digest(archive_path) != source.digest:
             raise ValueError("scratch archive changed between download and extraction")
-    archive_path.unlink()
     had_bundle = (destination / "snapshots.bundle").is_file()
     return downloaded_size, had_bundle
 
@@ -439,6 +443,12 @@ def _verify_replacement(
         raise ValueError("replacement filesystem content does not match the source")
     if [manifest.entries for manifest in manifests] != result.entries:
         raise ValueError("replacement snapshot metadata does not match the source")
+    for manifest, expected_snapshot in zip(manifests, result.snapshots, strict=True):
+        with tempfile.TemporaryDirectory(prefix="verify-snapshot-", dir=root.parent) as name:
+            restored = Path(name) / "tree"
+            _store(root).restore_manifest(session.session_id, manifest, restored)
+            if snapshot_fingerprint(restored) != expected_snapshot:
+                raise ValueError("replacement filesystem bytes do not match the source")
     actual_preserved = _preserved_files(root)
     if actual_preserved != expected_preserved:
         missing = sorted(expected_preserved.keys() - actual_preserved.keys())
@@ -465,6 +475,7 @@ def _prepare_replacement(remote: S3Store, source: RemoteSource, work: Path) -> R
         source.origin,
         transport_is_current=source.candidate.layout == "content-addressed",
         archive_had_bundle=had_bundle,
+        expected_step=source.step,
     )
     prepared = prepare_generation(_store(extracted), result.session)
     try:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -44,6 +45,7 @@ class UpgradeResult:
     session: DirectorySession
     tree_ids: list[str]
     entries: list[list[SnapshotEntry]]
+    snapshots: list[dict[str, tuple[int, str]]]
 
 
 class AlreadyLatest(ValueError):
@@ -115,7 +117,7 @@ def _session(
     return session
 
 
-def _checkpoint_steps(root: Path, session_id: str) -> list[SourceStep]:
+def _checkpoint_steps(root: Path, session_id: str) -> tuple[list[SourceStep], int]:
     head = (root / "HEAD").read_text().strip()
     if not head or Path(head).name != head:
         raise ValueError("invalid checkpoint HEAD")
@@ -156,10 +158,10 @@ def _checkpoint_steps(root: Path, session_id: str) -> list[SourceStep]:
                 [],
             )
         )
-    return result
+    return result, head_generation
 
 
-def _numeric_steps(root: Path, session_id: str) -> tuple[list[SourceStep], list[int]]:
+def _numeric_steps(root: Path, session_id: str) -> tuple[list[SourceStep], list[int], int]:
     head_value = (root / "HEAD").read_text().strip()
     if not head_value.isdigit():
         raise ValueError("invalid numeric HEAD step")
@@ -191,7 +193,7 @@ def _numeric_steps(root: Path, session_id: str) -> tuple[list[SourceStep], list[
             )
         )
         schemas.append(manifest.schema_version)
-    return result, schemas
+    return result, schemas, head
 
 
 def _validate_entry_files(step: SourceStep, tree: Path) -> None:
@@ -201,6 +203,18 @@ def _validate_entry_files(step: SourceStep, tree: Path) -> None:
             raise ValueError(f"unsafe snapshot entry: {entry.path}")
         if (entry.kind == "file" or entry.retained) and not (tree / candidate).is_file():
             raise ValueError(f"snapshot entry is missing: {entry.path}")
+
+
+def snapshot_fingerprint(tree: Path) -> dict[str, tuple[int, str]]:
+    """Fingerprint every source file independently of Git's object creation."""
+    result = {}
+    for path in sorted(tree.rglob("*")):
+        if not path.is_file():
+            continue
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        result[path.relative_to(tree).as_posix()] = (path.stat().st_mode & 0o111, digest)
+    return result
 
 
 def _write_entries(root: Path, entries: list[SnapshotEntry]) -> str:
@@ -213,7 +227,11 @@ def _write_entries(root: Path, entries: list[SnapshotEntry]) -> str:
 
 def _rebuild_history(
     root: Path, session_id: str, source_steps: list[SourceStep], *, add_boundary: bool
-) -> tuple[list[str], list[list[SnapshotEntry]]]:
+) -> tuple[
+    list[str],
+    list[list[SnapshotEntry]],
+    list[dict[str, tuple[int, str]]],
+]:
     old_repository = GitSnapshotStore(root / "snapshots.git")
     new_path = root / "snapshots.latest.git"
     if new_path.exists():
@@ -221,6 +239,7 @@ def _rebuild_history(
     repository = GitSnapshotStore(new_path)
     trees: list[str] = []
     compact_entries: list[list[SnapshotEntry]] = []
+    snapshots: list[dict[str, tuple[int, str]]] = []
     converted: list[StepManifest] = []
     parent: str | None = None
     try:
@@ -236,6 +255,7 @@ def _rebuild_history(
                 raise ValueError("step references a missing filesystem snapshot")
             try:
                 _validate_entry_files(source, tree)
+                fingerprint = snapshot_fingerprint(tree)
                 tree_id = repository.write_tree(tree)
             finally:
                 if temporary is not None:
@@ -259,6 +279,7 @@ def _rebuild_history(
             converted.append(manifest)
             trees.append(tree_id)
             compact_entries.append(exceptions)
+            snapshots.append(fingerprint)
             parent = commit
         if add_boundary:
             head = converted[-1]
@@ -267,6 +288,7 @@ def _rebuild_history(
             )
             trees.append(trees[-1])
             compact_entries.append(compact_entries[-1])
+            snapshots.append(snapshots[-1])
 
         shutil.rmtree(root / "steps", ignore_errors=True)
         shutil.rmtree(root / "entries", ignore_errors=True)
@@ -281,7 +303,7 @@ def _rebuild_history(
         if (root / "snapshots.git").exists():
             shutil.rmtree(root / "snapshots.git")
         os.replace(new_path, root / "snapshots.git")
-        return trees, compact_entries
+        return trees, compact_entries, snapshots
     except BaseException:
         shutil.rmtree(new_path, ignore_errors=True)
         raise
@@ -305,6 +327,7 @@ def upgrade_session(
     *,
     transport_is_current: bool,
     archive_had_bundle: bool,
+    expected_step: int | None = None,
 ) -> UpgradeResult:
     """Upgrade an extracted session and return its verified semantic state."""
     session_id = validate_session_id(session_id)
@@ -317,10 +340,17 @@ def upgrade_session(
         remote_sessions._restore_snapshot_bundle(root, session_id)
 
     if format_version == 1:
-        source_steps = _checkpoint_steps(root, session_id)
+        source_steps, source_head = _checkpoint_steps(root, session_id)
         source_format = "directory-v1-checkpoints"
     else:
-        source_steps, schemas = _numeric_steps(root, session_id)
+        source_steps, schemas, source_head = _numeric_steps(root, session_id)
+
+    if expected_step is not None and source_head != expected_step:
+        raise ValueError(
+            f"archive HEAD {source_head} does not match selected remote step {expected_step}"
+        )
+
+    if format_version == 2:
         schema_label = "-".join(str(value) for value in sorted(set(schemas)))
         representation = (
             "bundle"
@@ -344,7 +374,7 @@ def upgrade_session(
 
     session = _session(raw_session, session_id, fallback_origin)
     atomic_write(root / "session.json", _json_bytes(session.to_dict()))
-    trees, entries = _rebuild_history(
+    trees, entries, snapshots = _rebuild_history(
         root,
         session_id,
         source_steps,
@@ -353,4 +383,4 @@ def upgrade_session(
     manifests = _store(root).steps(session_id)
     if [manifest.entries for manifest in manifests] != entries:
         raise ValueError("upgraded entry metadata did not validate")
-    return UpgradeResult(source_format, session, trees, entries)
+    return UpgradeResult(source_format, session, trees, entries, snapshots)

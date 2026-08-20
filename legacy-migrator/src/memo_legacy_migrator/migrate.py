@@ -142,9 +142,7 @@ def _legacy_legs(meta: dict[str, Any]) -> list[dict[str, Any]]:
     return [leg for leg in legs if isinstance(leg, dict)]
 
 
-def _copy_agent_traces(
-    legacy: Path, session_path: Path, meta: dict[str, Any]
-) -> list[str]:
+def _copy_agent_traces(legacy: Path, session_path: Path, meta: dict[str, Any]) -> list[str]:
     run_ids = []
     tool = str(meta.get("tool") or "unknown")
     if tool not in {"claude", "codex"}:
