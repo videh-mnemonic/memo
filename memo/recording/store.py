@@ -7,7 +7,7 @@ import os
 import shutil
 import threading
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -46,6 +46,7 @@ class SessionStore:
         paths.ensure_storage()
         self._amend_locks: dict[str, threading.Lock] = {}
         self._amend_guard = threading.Lock()
+        self._stream_cache: dict[Path, tuple[tuple[int, int], dict[str, object]]] = {}
 
     def session_path(self, session_id: str) -> Path:
         return self.paths.archive / validate_session_id(session_id)
@@ -179,8 +180,42 @@ class SessionStore:
                 raise ValueError(f"step references missing snapshot file: {entry.path}")
 
     @staticmethod
-    def _validate_streams(path: Path, high_water: dict[str, int]) -> None:
-        """Check each terminal stream reaches the highest sequence steps reference."""
+    def _read_stream_metadata(metadata_path: Path) -> dict[str, object]:
+        return json.loads(metadata_path.read_text())
+
+    def _cached_stream_metadata(self, metadata_path: Path) -> dict[str, object]:
+        """Read a terminal's stream metadata, reusing the last parse of that file.
+
+        A long recording's `stream.json` lists tens of thousands of chunks and
+        is consulted on every step. Keying the cache on the file's size and
+        modification time means a sealed stream is parsed exactly once.
+        """
+        stats = metadata_path.stat()
+        fingerprint = (stats.st_mtime_ns, stats.st_size)
+        cached = self._stream_cache.get(metadata_path)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+        metadata = self._read_stream_metadata(metadata_path)
+        self._stream_cache[metadata_path] = (fingerprint, metadata)
+        return metadata
+
+    @classmethod
+    def _validate_streams(
+        cls,
+        path: Path,
+        high_water: dict[str, int],
+        *,
+        chunks: bool = True,
+        reader: Callable[[Path], dict[str, object]] | None = None,
+    ) -> None:
+        """Check each terminal stream reaches the highest sequence steps reference.
+
+        `chunks` additionally confirms every chunk the stream lists is still
+        present. That is an archive-wide sweep -- it costs one probe per chunk
+        -- so callers that merely resolve a step leave it off and the integrity
+        pass does it once.
+        """
+        read = reader or cls._read_stream_metadata
         terminal_root = path / "streams" / "terminals"
         for terminal_id, sequence in high_water.items():
             if not sequence:
@@ -188,11 +223,13 @@ class SessionStore:
             metadata_path = terminal_root / terminal_id / "stream.json"
             if not metadata_path.is_file():
                 raise ValueError(f"HEAD references missing terminal stream: {terminal_id}")
-            metadata = json.loads(metadata_path.read_text())
-            if metadata.get("highest_sequence", -1) < sequence:
+            metadata = read(metadata_path)
+            if int(metadata.get("highest_sequence", -1)) < sequence:
                 raise ValueError(f"terminal stream does not reach step: {terminal_id}")
+            if not chunks:
+                continue
             for chunk in metadata.get("chunks", []):
-                if not (metadata_path.parent / chunk).is_file():
+                if not (metadata_path.parent / str(chunk)).is_file():
                     raise ValueError(
                         f"terminal stream references missing chunk: {terminal_id}/{chunk}"
                     )
@@ -210,17 +247,27 @@ class SessionStore:
             if not (path / "agents" / "traces" / metadata.trace_file).is_file():
                 raise ValueError(f"agent run references missing trace: {run_id}")
 
-    @classmethod
     def _validate_manifest(
-        cls, path: Path, session_id: str, manifest: StepManifest, streams: bool = False
+        self,
+        path: Path,
+        session_id: str,
+        manifest: StepManifest,
+        streams: bool = False,
+        *,
+        chunks: bool = False,
     ) -> None:
         commit_present = bool(manifest.snapshot_commit) and GitSnapshotStore(
             path / "snapshots.git"
         ).contains(manifest.snapshot_commit)
-        cls._validate_snapshot(path, session_id, manifest, commit_present)
+        self._validate_snapshot(path, session_id, manifest, commit_present)
         if streams:
-            cls._validate_streams(path, dict(manifest.stream_high_water))
-        cls._validate_agent_runs(path, manifest.agent_runs)
+            self._validate_streams(
+                path,
+                dict(manifest.stream_high_water),
+                chunks=chunks,
+                reader=self._cached_stream_metadata,
+            )
+        self._validate_agent_runs(path, manifest.agent_runs)
 
     def restore_manifest(
         self, session_id: str, manifest: StepManifest, destination: Path, force: bool = False
@@ -247,7 +294,8 @@ class SessionStore:
         from .streams import merged_timeline
 
         path = self.session_path(session_id)
-        self._validate_manifest(path, session_id, manifest, streams=True)
+        # This is about to read the chunks, so confirm they are all there first.
+        self._validate_manifest(path, session_id, manifest, streams=True, chunks=True)
         terminals = manifest.stream_high_water
         selected = sorted(terminals) if terminal_ids is None else list(terminal_ids)
         unknown = [terminal_id for terminal_id in selected if terminal_id not in terminals]
@@ -357,7 +405,7 @@ class SessionStore:
                     high_water[terminal_id] = sequence
             for run_id in manifest.agent_runs:
                 run_ids.setdefault(run_id, None)
-        cls._validate_streams(path, high_water)
+        cls._validate_streams(path, high_water, chunks=True)
         cls._validate_agent_runs(path, run_ids)
         if manifests[-1].snapshot_commit:
             GitSnapshotStore(path / "snapshots.git").pin(manifests[-1].snapshot_commit)

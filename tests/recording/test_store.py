@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -432,3 +433,43 @@ def test_amend_session_serialises_concurrent_writers(tmp_path: Path) -> None:
     current = store.load_session("session")
     assert current.state == "ending"
     assert current.capture_scope == "full"
+
+
+def test_resolving_head_does_not_probe_every_stream_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _recorded_session(tmp_path, 4)
+    original = Path.is_file
+    probed: list[str] = []
+
+    def counting_is_file(self: Path) -> bool:
+        if self.name.endswith(".jsonl.gz"):
+            probed.append(self.name)
+        return original(self)
+
+    monkeypatch.setattr(Path, "is_file", counting_is_file)
+    assert store.head("session") is not None
+
+    # Resolving a step happens on every publish. Confirming the whole chunk
+    # list still exists is an archive sweep and belongs in the integrity pass.
+    assert probed == []
+
+
+def test_resolving_head_still_rejects_a_stream_short_of_a_step(tmp_path: Path) -> None:
+    store = _recorded_session(tmp_path, 4)
+    metadata = store.session_path("session") / "streams" / "terminals" / TERMINAL / "stream.json"
+    metadata.write_text(json.dumps({"highest_sequence": 1, "chunks": CHUNK_NAMES}))
+    with pytest.raises(ValueError, match="does not reach step"):
+        store.head("session")
+
+
+def test_stream_metadata_cache_notices_a_rewritten_stream(tmp_path: Path) -> None:
+    store = _recorded_session(tmp_path, 4)
+    assert store.head("session") is not None
+    metadata = store.session_path("session") / "streams" / "terminals" / TERMINAL / "stream.json"
+    # A sealed stream grows while the recording runs, so a stale parse would
+    # keep validating against a sequence the stream has long since passed.
+    metadata.write_text(json.dumps({"highest_sequence": 1, "chunks": CHUNK_NAMES}))
+    os.utime(metadata, (0, 0))
+    with pytest.raises(ValueError, match="does not reach step"):
+        store.head("session")
