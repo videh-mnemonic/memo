@@ -66,6 +66,8 @@ Memo uses AWS environment, profile, and IAM credential providers. Credentials
 need `GetObject`, prefix-limited `ListBucket`, `PutObject`, and
 `AbortMultipartUpload`; object deletion is not required. Archives are
 checksummed, validated before installation, and installed atomically.
+Git-backed snapshots travel as self-contained Git bundles inside the Zstandard
+generation archive; pulls reconstruct the normal local `snapshots.git` store.
 
 Memo refuses to upload a generation larger than the configured safety limit
 before starting the remote transfer. Interactive `memo push` offers a
@@ -369,10 +371,11 @@ memo status --include-archive
   without detaching while the daemon stays alive, Memo treats that terminal as
   stale after about five minutes. Starting `memo` in that directory will then
   offer to resume the existing recording or complete it and start a new one.
-- Each step contains a directory snapshot, terminal-stream high-water marks,
-  and references to captured agent runs. New recordings store filesystem
-  snapshots as commits in a session-local Git object store, so unchanged files
-  are shared across steps. `HEAD` points only to a completely published step.
+- Each step contains a Git commit, filesystem-capture exceptions, terminal-stream
+  high-water marks, and references to captured agent runs. Normal file metadata
+  and contents come from the Git tree rather than being repeated in every step.
+  Unchanged files are shared across steps, and `HEAD` points only to a completely
+  published step.
 - Filesystem capture stays rooted at the original directory even if a shell
   changes directories. Git-compatible ignore rules are honored. Files over 100
   MiB and files changing during capture are skipped or retain their previous

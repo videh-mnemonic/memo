@@ -18,7 +18,8 @@ import zstandard
 
 from ..agents.run_metadata import AgentRunMetadata
 from ..recording.filesystem import atomic_write
-from ..recording.metadata import DirectorySession, SessionOrigin
+from ..recording.git_snapshots import GitSnapshotStore
+from ..recording.metadata import DirectorySession, SessionOrigin, StepManifest
 from ..recording.paths import StoragePaths
 from ..recording.store import SessionNotFoundError, SessionStore, validate_session_id
 from .archive import (
@@ -421,6 +422,7 @@ def _stream_agent_run_metadata(store: S3Store, generation: str) -> list[AgentRun
                 elif (
                     name.startswith("agents/traces/")
                     or name.startswith("snapshots/")
+                    or name == "snapshots.bundle"
                     or name == "snapshots.git"
                     or name.startswith("snapshots.git/")
                 ):
@@ -465,6 +467,29 @@ def inspect_archived_agent_runs(
                 }
             )
     return runs, session_ids
+
+
+def _restore_snapshot_bundle(path: Path, session_id: str) -> None:
+    """Reconstruct snapshots.git when a generation uses the compact bundle format."""
+    bundle = path / "snapshots.bundle"
+    if not bundle.exists():
+        return
+    if not bundle.is_file():
+        raise ValueError("snapshot bundle is not a regular file")
+    repository_path = path / "snapshots.git"
+    if repository_path.exists():
+        raise ValueError("archive contains both snapshot bundle and repository")
+    head = path / "HEAD"
+    if not head.is_file():
+        raise ValueError("snapshot bundle archive has no HEAD")
+    head_value = head.read_text().strip()
+    if not head_value.isdigit():
+        raise ValueError("invalid numeric HEAD step")
+    manifest = StepManifest.load(path / "steps" / f"{head_value}.json")
+    if manifest.session_id != session_id or not manifest.snapshot_commit:
+        raise ValueError("snapshot bundle archive has invalid HEAD manifest")
+    GitSnapshotStore(repository_path).import_bundle(bundle, manifest.snapshot_commit)
+    bundle.unlink()
 
 
 def ensure_local_session(
@@ -541,6 +566,7 @@ def pull_session(
             progress(88, 100, f"validating {session_id}")
         if actual_digest != digest:
             raise ValueError(f"checksum mismatch: expected {digest}, got {actual_digest}")
+        _restore_snapshot_bundle(temporary, session_id)
         pulled = DirectorySession.load(temporary / "session.json")
         manifests = SessionStore._validate_history(temporary, session_id)
         if not manifests:

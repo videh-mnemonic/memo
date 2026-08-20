@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from memo.recording.git_snapshots import GitSnapshotError, GitSnapshotStore
-from memo.recording.metadata import DirectorySession, SessionOrigin
+from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.recording.paths import StoragePaths
 from memo.recording.snapshots import StepPublisher, scan_tree
 from memo.recording.store import SessionStore
@@ -99,6 +99,8 @@ def test_step_publisher_uses_git_commits_and_restores_files(tmp_path: Path) -> N
     store.restore_manifest("session", second, restored)
     assert (restored / "unchanged.txt").read_text() == "same"
     assert (restored / "changed.txt").read_text() == "two"
+    assert first.entries == []
+    assert second.entries == []
 
     repository = store.session_path("session") / "snapshots.git"
     first_blob = subprocess.run(
@@ -189,6 +191,43 @@ def test_step_publisher_publishes_stream_metadata_without_tree_change(tmp_path: 
     assert repository.tree_id(second.snapshot_commit) == repository.tree_id(first.snapshot_commit)
 
 
+def test_git_step_manifest_keeps_only_capture_exceptions(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / ".gitignore").write_text("ignored.txt\n")
+    (root / "captured.txt").write_text("captured")
+    (root / "ignored.txt").write_text("ignored")
+    store = SessionStore(_paths(tmp_path))
+    session = DirectorySession(
+        "session", str(root.resolve()), "now", "now", SessionOrigin("1.0.0", "user", "host")
+    )
+    store.create(session)
+
+    manifest = StepPublisher(store).publish(session)
+
+    assert [(entry.path, entry.kind) for entry in manifest.entries] == [
+        ("ignored.txt", "ignored-policy")
+    ]
+    assert store.step("session", 0).entries == manifest.entries
+
+
+def test_compact_manifest_rejects_redundant_entries_but_reads_schema_two() -> None:
+    values = {
+        "session_id": "session",
+        "step": 0,
+        "created_utc": "now",
+        "snapshot": "snapshots/0",
+        "entries": [SnapshotEntry("file.txt", "file", 0o644, 4)],
+        "snapshot_commit": "a" * 40,
+    }
+    StepManifest(**values, schema_version=2).validate()
+    with pytest.raises(ValueError, match="redundant snapshot entry"):
+        StepManifest(**values, schema_version=3).validate()
+    without_commit = {**values, "snapshot_commit": None}
+    with pytest.raises(ValueError, match="missing its snapshot commit"):
+        StepManifest(**without_commit, schema_version=2).validate()
+
+
 def test_git_restore_rejects_symlink_entries(tmp_path: Path) -> None:
     tree = tmp_path / "tree"
     tree.mkdir()
@@ -211,3 +250,27 @@ def test_git_restore_handles_empty_tree(tmp_path: Path) -> None:
 
     assert destination.is_dir()
     assert list(destination.iterdir()) == []
+
+
+def test_snapshot_bundle_is_deterministic_and_uses_requested_commit(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    repository = GitSnapshotStore(tmp_path / "snapshots.git")
+    (tree / "file.txt").write_text("first")
+    first = repository.commit(tree, None, "first")
+    (tree / "file.txt").write_text("second")
+    second = repository.commit(tree, first, "second")
+    first_bundle = tmp_path / "first.bundle"
+    repeated_bundle = tmp_path / "repeated.bundle"
+
+    repository.create_bundle(first, first_bundle)
+    repository.create_bundle(first, repeated_bundle)
+
+    assert first_bundle.read_bytes() == repeated_bundle.read_bytes()
+    restored = GitSnapshotStore(tmp_path / "restored.git")
+    restored.import_bundle(first_bundle, first)
+    assert restored.contains(first)
+    assert not restored.contains(second)
+    destination = tmp_path / "restored-tree"
+    restored.restore(first, destination)
+    assert (destination / "file.txt").read_text() == "first"

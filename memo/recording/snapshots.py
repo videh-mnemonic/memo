@@ -17,6 +17,7 @@ from .metadata import (
     SnapshotEntry,
     StepManifest,
     digest_entries,
+    snapshot_exceptions,
 )
 from .paths import StoragePaths
 from .store import SessionStore
@@ -236,8 +237,9 @@ class StepPublisher:
                 entries = scan_tree(
                     Path(session.root), temporary, previous=previous, paths=self.store.paths
                 )
+                exceptions = snapshot_exceptions(entries)
                 tree_id = repository.write_tree(temporary)
-                digest = digest_entries(entries)
+                digest = digest_entries(exceptions)
                 if (
                     not force
                     and previous_manifest is not None
@@ -255,7 +257,7 @@ class StepPublisher:
                     step,
                     utcnow(),
                     f"snapshots/{step}",
-                    entries,
+                    exceptions,
                     high_water,
                     schema_version=STEP_SCHEMA_VERSION,
                     agent_runs=agent_runs,
