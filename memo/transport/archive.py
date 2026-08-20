@@ -207,6 +207,10 @@ def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Pa
         session_path / "steps",
         session_path / "snapshots",
     ]
+    entries = session_path / "entries"
+    if entries.is_dir():
+        paths.append(entries)
+        paths.extend(entries.rglob("*"))
     if any(manifest.snapshot_commit for manifest in manifests):
         paths.append(session_path / "snapshots.git")
         paths.extend((session_path / "snapshots.git").rglob("*"))

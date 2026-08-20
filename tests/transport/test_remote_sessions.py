@@ -496,6 +496,11 @@ def test_git_session_round_trips_through_remote_transport(tmp_path: Path) -> Non
     assert pulled_path == pulled_paths.archive / session.session_id
     assert manifest.snapshot_commit
     assert (restored / "note.txt").read_text() == "captured"
+    # Steps keep their entry list in a shared pool, so the archive has to carry
+    # it or a pulled recording cannot say what it captured.
+    assert manifest.entries_digest
+    assert [entry.path for entry in manifest.entries] == ["note.txt"]
+    assert (pulled_path / "entries" / f"{manifest.entries_digest}.json").is_file()
 
 
 def test_corrupt_git_snapshot_archive_does_not_replace_existing_session(tmp_path: Path) -> None:

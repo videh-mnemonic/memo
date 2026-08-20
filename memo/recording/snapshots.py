@@ -11,7 +11,13 @@ from pathlib import Path
 
 from .git_snapshots import GitSnapshotStore
 from .ignore import IgnorePolicy
-from .metadata import STEP_SCHEMA_VERSION, DirectorySession, SnapshotEntry, StepManifest
+from .metadata import (
+    STEP_SCHEMA_VERSION,
+    DirectorySession,
+    SnapshotEntry,
+    StepManifest,
+    digest_entries,
+)
 from .paths import StoragePaths
 from .store import SessionStore
 
@@ -231,12 +237,13 @@ class StepPublisher:
                     Path(session.root), temporary, previous=previous, paths=self.store.paths
                 )
                 tree_id = repository.write_tree(temporary)
+                digest = digest_entries(entries)
                 if (
                     not force
                     and previous_manifest is not None
                     and previous_manifest.snapshot_commit is not None
                     and repository.tree_id(previous_manifest.snapshot_commit) == tree_id
-                    and previous_manifest.entries == entries
+                    and previous_manifest.entries_digest == digest
                     and previous_manifest.stream_high_water == high_water
                     and previous_manifest.agent_runs == agent_runs
                 ):
@@ -253,6 +260,7 @@ class StepPublisher:
                     schema_version=STEP_SCHEMA_VERSION,
                     agent_runs=agent_runs,
                     snapshot_commit=commit,
+                    entries_digest=digest,
                 )
                 return self.store.publish(session, manifest, temporary)
         finally:
