@@ -12,7 +12,16 @@ from pathlib import Path
 
 from memo.recording.filesystem import atomic_write
 from memo.recording.git_snapshots import GitSnapshotStore
-from memo.recording.metadata import STEP_SCHEMA_VERSION, DirectorySession, StepManifest
+from memo.recording.metadata import (
+    STEP_SCHEMA_VERSION,
+    DirectorySession,
+    SnapshotEntry,
+    StepManifest,
+    digest_entries,
+    encode_entries,
+    entries_directory,
+    snapshot_exceptions,
+)
 from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore
 from memo.transport import remote_sessions
@@ -197,14 +206,22 @@ def _convert_snapshots(session_root: Path, session_id: str) -> list[str]:
             tree_id, parent, f"Memo filesystem snapshot {manifest.step}"
         )
         expected_trees.append(tree_id)
+        # A converted step has to be written the way the current publisher
+        # writes one: entries reduced to what a Git tree cannot express, and the
+        # list itself stored once under the digest the step records.
+        exceptions = snapshot_exceptions(manifest.entries)
+        digest = digest_entries(exceptions)
         converted_manifest = replace(
             manifest,
             schema_version=STEP_SCHEMA_VERSION,
             snapshot_commit=commit,
+            entries=exceptions,
+            entries_digest=digest,
         )
+        _write_entry_list(session_root, digest, exceptions)
         atomic_write(
             session_root / "steps" / f"{manifest.step}.json",
-            _json_bytes(converted_manifest.to_dict()),
+            _json_bytes(converted_manifest.to_stored_dict()),
         )
         converted.append(converted_manifest)
         parent = commit
@@ -219,11 +236,18 @@ def _convert_snapshots(session_root: Path, session_id: str) -> list[str]:
     )
     atomic_write(
         session_root / "steps" / f"{boundary.step}.json",
-        _json_bytes(boundary.to_dict()),
+        _json_bytes(boundary.to_stored_dict()),
     )
     atomic_write(session_root / "HEAD", f"{boundary.step}\n".encode())
     expected_trees.append(expected_trees[-1])
     return expected_trees
+
+
+def _write_entry_list(session_root: Path, digest: str, entries: list[SnapshotEntry]) -> None:
+    """Add one entry list to the session's shared pool if it is not there yet."""
+    target = entries_directory(session_root) / f"{digest}.json"
+    if not target.is_file():
+        atomic_write(target, encode_entries(entries))
 
 
 def _verify_replacement(
@@ -239,6 +263,9 @@ def _verify_replacement(
         spool=replacement_root.parent / "spool-verify",
     )
     store = SessionStore(paths)
+    # A prepared generation ships its snapshots as a bundle, so reconstitute the
+    # repository before reading the replacement back, exactly as a pull does.
+    remote_sessions._restore_snapshot_bundle(replacement_root, session_id)
     manifests = store.steps(session_id)
     if len(manifests) != len(expected_trees):
         raise ValueError("replacement step history does not match the source")
