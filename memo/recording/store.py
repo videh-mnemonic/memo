@@ -124,39 +124,48 @@ class SessionStore:
         return self._validate_history(path, session_id)
 
     @staticmethod
-    def _validate_manifest(
-        path: Path, session_id: str, manifest: StepManifest, streams: bool = False
+    def _validate_snapshot(
+        path: Path, session_id: str, manifest: StepManifest, commit_present: bool
     ) -> None:
+        """Check one step against its snapshot, given whether its commit exists."""
         if manifest.session_id != session_id:
             raise ValueError("step belongs to another session")
-        snapshot = path / manifest.snapshot
         if manifest.snapshot_commit:
-            if not GitSnapshotStore(path / "snapshots.git").contains(manifest.snapshot_commit):
-                raise ValueError(f"step references missing snapshot commit: {manifest.snapshot_commit}")
-        elif not snapshot.is_dir():
+            if not commit_present:
+                raise ValueError(
+                    f"step references missing snapshot commit: {manifest.snapshot_commit}"
+                )
+            return
+        snapshot = path / manifest.snapshot
+        if not snapshot.is_dir():
             raise ValueError(f"step references missing snapshot: {manifest.snapshot}")
         for entry in manifest.entries:
-            if (
-                not manifest.snapshot_commit
-                and (entry.kind == "file" or entry.retained)
-                and not (snapshot / entry.path).is_file()
-            ):
+            if (entry.kind == "file" or entry.retained) and not (snapshot / entry.path).is_file():
                 raise ValueError(f"step references missing snapshot file: {entry.path}")
-        if streams:
-            for terminal_id, sequence in manifest.stream_high_water.items():
-                metadata_path = path / "streams" / "terminals" / terminal_id / "stream.json"
-                if sequence and not metadata_path.is_file():
-                    raise ValueError(f"HEAD references missing terminal stream: {terminal_id}")
-                if sequence:
-                    metadata = json.loads(metadata_path.read_text())
-                    if metadata.get("highest_sequence", -1) < sequence:
-                        raise ValueError(f"terminal stream does not reach step: {terminal_id}")
-                    for chunk in metadata.get("chunks", []):
-                        if not (metadata_path.parent / chunk).is_file():
-                            raise ValueError(
-                                f"terminal stream references missing chunk: {terminal_id}/{chunk}"
-                            )
-        for run_id in manifest.agent_runs:
+
+    @staticmethod
+    def _validate_streams(path: Path, high_water: dict[str, int]) -> None:
+        """Check each terminal stream reaches the highest sequence steps reference."""
+        terminal_root = path / "streams" / "terminals"
+        for terminal_id, sequence in high_water.items():
+            if not sequence:
+                continue
+            metadata_path = terminal_root / terminal_id / "stream.json"
+            if not metadata_path.is_file():
+                raise ValueError(f"HEAD references missing terminal stream: {terminal_id}")
+            metadata = json.loads(metadata_path.read_text())
+            if metadata.get("highest_sequence", -1) < sequence:
+                raise ValueError(f"terminal stream does not reach step: {terminal_id}")
+            for chunk in metadata.get("chunks", []):
+                if not (metadata_path.parent / chunk).is_file():
+                    raise ValueError(
+                        f"terminal stream references missing chunk: {terminal_id}/{chunk}"
+                    )
+
+    @staticmethod
+    def _validate_agent_runs(path: Path, run_ids: Iterable[str]) -> None:
+        """Check each distinct agent run has metadata and a captured trace."""
+        for run_id in dict.fromkeys(run_ids):
             metadata_path = path / "agents" / "runs" / f"{run_id}.json"
             if not metadata_path.is_file():
                 raise ValueError(f"step references missing agent run: {run_id}")
@@ -165,6 +174,18 @@ class SessionStore:
                 raise ValueError(f"agent run metadata ID does not match: {run_id}")
             if not (path / "agents" / "traces" / metadata.trace_file).is_file():
                 raise ValueError(f"agent run references missing trace: {run_id}")
+
+    @classmethod
+    def _validate_manifest(
+        cls, path: Path, session_id: str, manifest: StepManifest, streams: bool = False
+    ) -> None:
+        commit_present = bool(manifest.snapshot_commit) and GitSnapshotStore(
+            path / "snapshots.git"
+        ).contains(manifest.snapshot_commit)
+        cls._validate_snapshot(path, session_id, manifest, commit_present)
+        if streams:
+            cls._validate_streams(path, dict(manifest.stream_high_water))
+        cls._validate_agent_runs(path, manifest.agent_runs)
 
     def restore_manifest(
         self, session_id: str, manifest: StepManifest, destination: Path, force: bool = False
@@ -284,8 +305,25 @@ class SessionStore:
             manifest = StepManifest.load(path / "steps" / f"{step}.json")
             if manifest.step != step:
                 raise ValueError("step filename does not match manifest")
-            cls._validate_manifest(path, session_id, manifest, streams=True)
             manifests.append(manifest)
+        # Snapshot commits, terminal streams, and agent runs are shared across
+        # steps, so resolve each distinct one once. Validating them per step
+        # instead costs steps x chunks filesystem probes, which on a long
+        # recording is the difference between seconds and many minutes.
+        present = GitSnapshotStore(path / "snapshots.git").contains_many(
+            item.snapshot_commit for item in manifests if item.snapshot_commit
+        )
+        high_water: dict[str, int] = {}
+        run_ids: dict[str, None] = {}
+        for manifest in manifests:
+            cls._validate_snapshot(path, session_id, manifest, manifest.snapshot_commit in present)
+            for terminal_id, sequence in manifest.stream_high_water.items():
+                if sequence > high_water.get(terminal_id, 0):
+                    high_water[terminal_id] = sequence
+            for run_id in manifest.agent_runs:
+                run_ids.setdefault(run_id, None)
+        cls._validate_streams(path, high_water)
+        cls._validate_agent_runs(path, run_ids)
         if manifests[-1].snapshot_commit:
             GitSnapshotStore(path / "snapshots.git").pin(manifests[-1].snapshot_commit)
         return manifests
@@ -308,7 +346,9 @@ class SessionStore:
         manifest_path = path / "steps" / f"{manifest.step}.json"
         if manifest.snapshot_commit:
             if not GitSnapshotStore(path / "snapshots.git").contains(manifest.snapshot_commit):
-                raise ValueError(f"step references missing snapshot commit: {manifest.snapshot_commit}")
+                raise ValueError(
+                    f"step references missing snapshot commit: {manifest.snapshot_commit}"
+                )
             if manifest_path.exists():
                 existing = StepManifest.load(manifest_path)
                 self._validate_manifest(path, session.session_id, existing, streams=True)
@@ -316,7 +356,11 @@ class SessionStore:
                 return existing
             if snapshot.exists():
                 shutil.rmtree(snapshot) if snapshot.is_dir() else snapshot.unlink()
-            prepared_snapshot.unlink(missing_ok=True) if prepared_snapshot.is_file() else shutil.rmtree(prepared_snapshot, ignore_errors=True)
+            prepared_snapshot.unlink(
+                missing_ok=True
+            ) if prepared_snapshot.is_file() else shutil.rmtree(
+                prepared_snapshot, ignore_errors=True
+            )
             atomic_write(manifest_path, _json_bytes(manifest.to_dict()))
             atomic_write(path / "HEAD", f"{manifest.step}\n".encode())
             return manifest

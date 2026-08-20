@@ -10,6 +10,7 @@ import pty
 import select
 import signal
 import termios
+import time
 import tty
 from contextlib import suppress
 from pathlib import Path
@@ -17,7 +18,7 @@ from types import FrameType
 
 from ..agents.shim import ensure_shims
 from ..daemon.client import attach
-from ..daemon.protocol import request
+from ..daemon.protocol import ProtocolError, request
 from .filesystem import atomic_write
 from .paths import StoragePaths
 
@@ -30,6 +31,16 @@ if [ -n "${MEMO_SHIM_DIR:-}" ]; then
     export PATH
 fi
 """
+
+#: Terminal activity is reported synchronously, so this bounds how long a busy
+#: daemon may stall the terminal. It is deliberately far above the protocol
+#: default: a step publication or archive upload can hold the daemon for many
+#: seconds, and that must not be mistaken for a dead daemon.
+EVENT_TIMEOUT_SECONDS = 60.0
+
+#: How often an idle terminal reports liveness. The daemon only needs this to
+#: keep the attachment fresh and to notice ``memo end`` from another terminal.
+HEARTBEAT_INTERVAL_SECONDS = 1.0
 
 
 def _shell_argv(executable: str, paths: StoragePaths) -> list[str]:
@@ -122,6 +133,49 @@ def run(
         previous_handlers[signal.SIGWINCH] = signal.signal(signal.SIGWINCH, resize)
         input_open = True
         ended = False
+        recording = True
+        last_heartbeat = 0.0
+
+        def report(direction: str | None, data: bytes = b"") -> None:
+            """Report terminal activity, giving up capture rather than the terminal.
+
+            A recording failure must never take the shell down with it. Losing
+            capture costs the tail of one recording; propagating the error would
+            close the PTY master and kill the shell and any agent inside it.
+            """
+            nonlocal ended, recording, sequence
+            if not recording:
+                return
+            events = [] if direction is None else [_event(sequence + 1, direction, data)]
+            try:
+                result = request(
+                    str(paths.socket),
+                    "events",
+                    {
+                        "session_id": session_id,
+                        "terminal_id": terminal_id,
+                        "events": events,
+                    },
+                    timeout=EVENT_TIMEOUT_SECONDS,
+                )
+            except (OSError, ProtocolError, TimeoutError, ValueError):
+                recording = False
+                with suppress(OSError):
+                    os.write(
+                        stdout_fd,
+                        b"\r\nmemo: lost contact with the daemon; "
+                        b"this terminal is no longer being recorded\r\n",
+                    )
+                return
+            if result.get("recording_ended"):
+                ended = True
+                return
+            accepted = result.get("accepted_sequence")
+            if isinstance(accepted, int):
+                sequence = accepted
+            elif direction is not None:
+                sequence += 1
+
         while True:
             readable, _, _ = select.select(
                 [master_fd] + ([stdin_fd] if input_open else []), [], [], 0.1
@@ -129,20 +183,12 @@ def run(
             if stdin_fd in readable:
                 data = os.read(stdin_fd, 65536)
                 if data:
-                    sequence += 1
-                    result = request(
-                        str(paths.socket),
-                        "events",
-                        {
-                            "session_id": session_id,
-                            "terminal_id": terminal_id,
-                            "events": [_event(sequence, "input", data)],
-                        },
-                    )
-                    if result.get("recording_ended"):
-                        ended = True
-                        break
+                    # Forward before reporting so terminal latency never depends
+                    # on how long the daemon takes to durably store the event.
                     os.write(master_fd, data)
+                    report("input", data)
+                    if ended:
+                        break
                 else:
                     input_open = False
             if master_fd in readable:
@@ -154,33 +200,17 @@ def run(
                     raise
                 if not data:
                     break
-                sequence += 1
-                result = request(
-                    str(paths.socket),
-                    "events",
-                    {
-                        "session_id": session_id,
-                        "terminal_id": terminal_id,
-                        "events": [_event(sequence, "output", data)],
-                    },
-                )
-                if result.get("recording_ended"):
-                    ended = True
-                    break
                 os.write(stdout_fd, data)
-            if not readable:
-                result = request(
-                    str(paths.socket),
-                    "events",
-                    {
-                        "session_id": session_id,
-                        "terminal_id": terminal_id,
-                        "events": [],
-                    },
-                )
-                if result.get("recording_ended"):
-                    ended = True
+                report("output", data)
+                if ended:
                     break
+            if not readable:
+                now = time.monotonic()
+                if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                    last_heartbeat = now
+                    report(None)
+                    if ended:
+                        break
         if ended:
             os.write(stdout_fd, b"\r\nmemo: recording ended\r\n")
             with suppress(ProcessLookupError):
