@@ -652,7 +652,9 @@ class MemoDaemon:
                                     update_local=False,
                                 )
                             elif existing[0][2] != completion_key:
-                                raise ValueError("remote session has conflicting completion records")
+                                raise ValueError(
+                                    "remote session has conflicting completion records"
+                                )
                             else:
                                 result = {"status": "skipped"}
                         else:

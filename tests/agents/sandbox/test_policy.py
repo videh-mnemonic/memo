@@ -127,9 +127,7 @@ def test_self_test_mounts_dynamic_loader_paths(tmp_path: Path, monkeypatch) -> N
         commands.append(command)
         return Result()
 
-    monkeypatch.setattr(
-        "memo.agents.sandbox.command.shutil.which", lambda _name: "/usr/bin/bwrap"
-    )
+    monkeypatch.setattr("memo.agents.sandbox.command.shutil.which", lambda _name: "/usr/bin/bwrap")
     monkeypatch.setattr("memo.agents.sandbox.command.subprocess.run", run)
 
     self_test(StoragePaths(tmp_path / "memo-home"), force=True)
@@ -138,9 +136,7 @@ def test_self_test_mounts_dynamic_loader_paths(tmp_path: Path, monkeypatch) -> N
     for library_directory in (Path("/lib"), Path("/lib64")):
         if library_directory.exists():
             mount = ("--ro-bind", str(library_directory), str(library_directory))
-            arguments = zip(
-                self_test_command, self_test_command[1:], self_test_command[2:]
-            )
+            arguments = zip(self_test_command, self_test_command[1:], self_test_command[2:])
             assert mount in set(arguments)
 
 

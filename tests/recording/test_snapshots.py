@@ -102,13 +102,29 @@ def test_step_publisher_uses_git_commits_and_restores_files(tmp_path: Path) -> N
 
     repository = store.session_path("session") / "snapshots.git"
     first_blob = subprocess.run(
-        ["git", "--git-dir", str(repository), "ls-tree", first.snapshot_commit, "--", "unchanged.txt"],
+        [
+            "git",
+            "--git-dir",
+            str(repository),
+            "ls-tree",
+            first.snapshot_commit,
+            "--",
+            "unchanged.txt",
+        ],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.split()[2]
     second_blob = subprocess.run(
-        ["git", "--git-dir", str(repository), "ls-tree", second.snapshot_commit, "--", "unchanged.txt"],
+        [
+            "git",
+            "--git-dir",
+            str(repository),
+            "ls-tree",
+            second.snapshot_commit,
+            "--",
+            "unchanged.txt",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -149,9 +165,7 @@ def test_step_publisher_skips_semantic_no_op_and_can_force_boundary(tmp_path: Pa
     assert boundary.step == 1
     assert boundary.snapshot_commit != first.snapshot_commit
     repository = GitSnapshotStore(store.session_path("session") / "snapshots.git")
-    assert repository.tree_id(boundary.snapshot_commit) == repository.tree_id(
-        first.snapshot_commit
-    )
+    assert repository.tree_id(boundary.snapshot_commit) == repository.tree_id(first.snapshot_commit)
     assert [manifest.step for manifest in store.steps("session")] == [0, 1]
 
 
@@ -172,9 +186,7 @@ def test_step_publisher_publishes_stream_metadata_without_tree_change(tmp_path: 
     assert second.step == first.step + 1
     assert second.stream_high_water == {"terminal": 1}
     repository = GitSnapshotStore(store.session_path("session") / "snapshots.git")
-    assert repository.tree_id(second.snapshot_commit) == repository.tree_id(
-        first.snapshot_commit
-    )
+    assert repository.tree_id(second.snapshot_commit) == repository.tree_id(first.snapshot_commit)
 
 
 def test_git_restore_rejects_symlink_entries(tmp_path: Path) -> None:

@@ -19,7 +19,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "ruff>=0.12",
+    # Pinned exactly: `ruff format --check` runs in CI, and formatting output
+    # changes between releases, so a floating version turns an unrelated ruff
+    # release into a red build on an untouched tree.
+    "ruff==0.16.3",
 ]
 
 [project.scripts]
@@ -37,6 +40,11 @@ version = {attr = "memo.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import the package from the checkout rather than requiring it to be
+# installed. A working copy of Memo is a development tool, not a dependency of
+# its own tests, and an installed copy shadowing the tree under test is exactly
+# the confusion this avoids.
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py311"

@@ -250,7 +250,9 @@ def _metadata(
     )
 
 
-def _continuation_session_id(candidate: Candidate, boundary: int, digest: str, source: KnownRun) -> str:
+def _continuation_session_id(
+    candidate: Candidate, boundary: int, digest: str, source: KnownRun
+) -> str:
     value = (
         "memo-agent-continuation:"
         f"{candidate.harness.name}:{candidate.native_id}:{boundary}:{digest}:"
@@ -422,11 +424,7 @@ def import_native_sessions(
                 if any(run.archived for run in covering):
                     summary.skipped.append(label)
                     continue
-                completed = [
-                    run
-                    for run in prefixes
-                    if run.state == "complete" and run.archived
-                ]
+                completed = [run for run in prefixes if run.state == "complete" and run.archived]
                 continued = [
                     run
                     for run in covering
@@ -459,7 +457,9 @@ def import_native_sessions(
                     continuation = max(completed, key=lambda run: run.complete_size)
                     session_id = _continuation_session_id(candidate, boundary, digest, continuation)
                     if session_id in session_ids:
-                        raise ValueError("native continuation ID collides with an existing Memo session")
+                        raise ValueError(
+                            "native continuation ID collides with an existing Memo session"
+                        )
                     if dry_run:
                         summary.imported.append(session_id)
                     else:

@@ -110,6 +110,7 @@ class S3Store:
     ) -> None:
         progress_adapter = None
         if progress is not None:
+
             class UploadProgress:
                 def set_meta(self, object_name: str, total_length: int) -> None:
                     del object_name

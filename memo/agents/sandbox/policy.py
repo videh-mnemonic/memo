@@ -229,15 +229,11 @@ def resolve_policy(
     missing: list[Path] = []
     for value in config.system_read_only:
         destination = expand_path(value, home).absolute()
-        mounts.append(
-            Mount(destination.resolve(strict=True), destination, "read", "system")
-        )
+        mounts.append(Mount(destination.resolve(strict=True), destination, "read", "system"))
     for value in config.system_read_only_if_present:
         destination = expand_path(value, home).absolute()
         if destination.exists():
-            mounts.append(
-                Mount(destination.resolve(strict=True), destination, "read", "system")
-            )
+            mounts.append(Mount(destination.resolve(strict=True), destination, "read", "system"))
         else:
             missing.append(destination)
     mounts.append(Mount(root, root, "read-write", "recording-root"))

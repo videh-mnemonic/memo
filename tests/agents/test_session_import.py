@@ -132,7 +132,9 @@ def test_import_splits_completed_agent_only_session_continuation(
     assert store.head(summary.imported[0]).step == 0
     assert len(json.loads(trace_json(summary.imported[0], paths=paths))) == 3
     continuation_path = store.session_path(summary.imported[0])
-    run_metadata = AgentRunMetadata.load(next((continuation_path / "agents" / "runs").glob("*.json")))
+    run_metadata = AgentRunMetadata.load(
+        next((continuation_path / "agents" / "runs").glob("*.json"))
+    )
     assert run_metadata.continued_from_session_id == "native-session"
     assert run_metadata.continued_from_trace_size == next(
         AgentRunMetadata.load(path).trace_complete_size
@@ -218,7 +220,11 @@ def test_import_splits_remote_completed_agent_only_session_continuation(
     assert summary.refreshed == []
     assert len(json.loads(trace_json(summary.imported[0], paths=paths))) == 3
     run_metadata = AgentRunMetadata.load(
-        next((SessionStore(paths).session_path(summary.imported[0]) / "agents" / "runs").glob("*.json"))
+        next(
+            (SessionStore(paths).session_path(summary.imported[0]) / "agents" / "runs").glob(
+                "*.json"
+            )
+        )
     )
     assert run_metadata.continued_from_session_id == "remote-memo-session"
     assert run_metadata.continued_from_trace_size == len(original.encode())
@@ -226,9 +232,7 @@ def test_import_splits_remote_completed_agent_only_session_continuation(
     assert pulls == [("remote-memo-session", True)]
 
 
-def test_import_skips_when_completed_full_session_covers_trace(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_import_skips_when_completed_full_session_covers_trace(tmp_path: Path, monkeypatch) -> None:
     _, codex = _roots(monkeypatch, tmp_path)
     root = tmp_path / "project"
     root.mkdir()

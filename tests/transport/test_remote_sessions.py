@@ -562,9 +562,11 @@ def test_push_publishes_immutable_generation_index_and_completion_and_skips_unch
     config = S3Config("bucket", "prefix")
     progress: list[tuple[int, int, str]] = []
     result = push_session(
-        store, session, config, client, progress=lambda completed, total, message: progress.append(
-            (completed, total, message)
-        )
+        store,
+        session,
+        config,
+        client,
+        progress=lambda completed, total, message: progress.append((completed, total, message)),
     )
     assert result["status"] == "pushed"
     assert any(message == "creating archive" for _, _, message in progress)
@@ -850,7 +852,9 @@ def test_completed_already_uploaded_generation_gets_completion_marker(tmp_path: 
     republished = push_session(store, completed, config, client)
 
     assert republished["status"] == "pushed"
-    assert [operation for operation in client.operations if operation[0] == "upload"] == before_uploads
+    assert [
+        operation for operation in client.operations if operation[0] == "upload"
+    ] == before_uploads
     assert any("/completions/" in key for key in client.objects)
 
 
