@@ -488,6 +488,11 @@ def _publisher_session(tmp_path: Path) -> tuple[SessionStore, DirectorySession, 
     root.mkdir()
     (root / "a.txt").write_text("one")
     (root / "b.txt").write_text("two")
+    # A Git tree records the captured files by itself, so only paths it cannot
+    # represent reach the entry list. Ignoring one gives the list something to
+    # hold.
+    (root / ".gitignore").write_text("skipped.log\n")
+    (root / "skipped.log").write_text("noisy")
     store = SessionStore(_paths(tmp_path))
     session = _session(root)
     store.create(session)
@@ -509,23 +514,23 @@ def test_steps_sharing_a_file_list_share_one_entry_list(tmp_path: Path) -> None:
     stored = json.loads((directory / "steps" / "5.json").read_text())
     assert stored["entries"] == []
     assert stored["entries_digest"]
-    # The step still describes its tree; the description simply lives once.
-    assert [entry.path for entry in store.step("session", -1).entries] == ["a.txt", "b.txt"]
+    # The step still records what Git cannot; the record simply lives once.
+    assert [entry.path for entry in store.step("session", -1).entries] == ["skipped.log"]
 
 
 def test_a_changed_file_list_gets_its_own_entry_list(tmp_path: Path) -> None:
     store, session, root = _publisher_session(tmp_path)
     publisher = StepPublisher(store, seal_streams=lambda _session: {})
     publisher.publish(session, force=True)
-    (root / "c.txt").write_text("three")
+    (root / ".gitignore").write_text("skipped.log\nalso-skipped.log\n")
+    (root / "also-skipped.log").write_text("more noise")
     publisher.publish(session, force=True)
 
     directory = store.session_path("session")
     assert len(list((directory / "entries").glob("*.json"))) == 2
     assert [entry.path for entry in store.step("session", -1).entries] == [
-        "a.txt",
-        "b.txt",
-        "c.txt",
+        "also-skipped.log",
+        "skipped.log",
     ]
 
 

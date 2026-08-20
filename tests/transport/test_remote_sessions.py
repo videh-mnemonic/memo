@@ -19,6 +19,7 @@ import zstandard
 from memo.agents.run_metadata import AgentRunMetadata
 from memo.export import replay_session
 from memo.recording.filesystem import atomic_write
+from memo.recording.git_snapshots import GitSnapshotError
 from memo.recording.metadata import DirectorySession, SessionOrigin, SnapshotEntry, StepManifest
 from memo.recording.paths import StoragePaths
 from memo.recording.snapshots import StepPublisher
@@ -455,11 +456,19 @@ def test_git_snapshot_generation_extracts_and_validates_as_a_session(tmp_path: P
     source_store.create(session)
     manifest = StepPublisher(source_store).publish(session)
     prepared = prepare_generation(source_store, session)
+    repeated = prepare_generation(source_store, session)
     try:
+        assert prepared.path.read_bytes() == repeated.path.read_bytes()
+        names = _archive_names(prepared.path.read_bytes())
+        assert "snapshots.bundle" in names
+        assert not any(
+            name == "snapshots.git" or name.startswith("snapshots.git/") for name in names
+        )
         extracted = tmp_path / "extracted"
         extracted.mkdir()
         with prepared.path.open("rb") as archive:
             safe_extract_tar_zst_stream(archive, extracted)
+        remote_sessions._restore_snapshot_bundle(extracted, session.session_id)
 
         pulled_paths = _paths(tmp_path / "pulled-home")
         pulled_paths.archive.mkdir(parents=True)
@@ -471,9 +480,11 @@ def test_git_snapshot_generation_extracts_and_validates_as_a_session(tmp_path: P
         pulled_store.restore_manifest(session.session_id, pulled_manifest, restored)
     finally:
         prepared.cleanup()
+        repeated.cleanup()
 
     assert manifest.snapshot_commit == pulled_manifest.snapshot_commit
     assert (destination / "snapshots.git" / "HEAD").is_file()
+    assert not (destination / "snapshots.bundle").exists()
     assert (restored / "note.txt").read_text() == "captured"
 
 
@@ -497,9 +508,10 @@ def test_git_session_round_trips_through_remote_transport(tmp_path: Path) -> Non
     assert manifest.snapshot_commit
     assert (restored / "note.txt").read_text() == "captured"
     # Steps keep their entry list in a shared pool, so the archive has to carry
-    # it or a pulled recording cannot say what it captured.
+    # it or a pulled recording cannot say what it captured. A plainly captured
+    # file is not listed: the Git tree already records it.
     assert manifest.entries_digest
-    assert [entry.path for entry in manifest.entries] == ["note.txt"]
+    assert manifest.entries == []
     assert (pulled_path / "entries" / f"{manifest.entries_digest}.json").is_file()
 
 
@@ -516,9 +528,6 @@ def test_corrupt_git_snapshot_archive_does_not_replace_existing_session(tmp_path
     original = client.objects[generation]
     manifest = source_store.steps(session.session_id)[-1]
     assert manifest.snapshot_commit
-    commit_object = (
-        f"snapshots.git/objects/{manifest.snapshot_commit[:2]}/{manifest.snapshot_commit[2:]}"
-    )
     uncompressed = zstandard.ZstdDecompressor().decompress(
         original, max_output_size=64 * 1024 * 1024
     )
@@ -527,9 +536,12 @@ def test_corrupt_git_snapshot_archive_does_not_replace_existing_session(tmp_path
         with zstandard.ZstdCompressor(level=3).stream_writer(raw, closefd=False) as compressed:
             with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as target:
                 for member in source.getmembers():
-                    if member.name == commit_object:
-                        continue
-                    target.addfile(member, source.extractfile(member) if member.isfile() else None)
+                    extracted = source.extractfile(member) if member.isfile() else None
+                    data = extracted.read() if extracted is not None else None
+                    if member.name == "snapshots.bundle":
+                        assert data is not None
+                        data = data[:-1] + bytes([data[-1] ^ 0xFF])
+                    target.addfile(member, io.BytesIO(data) if data is not None else None)
     _replace_remote_package(client, raw.getvalue())
 
     existing_paths = _paths(tmp_path / "existing-home")
@@ -537,7 +549,7 @@ def test_corrupt_git_snapshot_archive_does_not_replace_existing_session(tmp_path
     existing.mkdir(parents=True)
     (existing / "sentinel.txt").write_text("preserve")
 
-    with pytest.raises(ValueError, match="missing snapshot commit"):
+    with pytest.raises(GitSnapshotError, match="git snapshot operation failed"):
         pull_session(session.session_id, existing_paths, config, force=True, client=client)
 
     assert (existing / "sentinel.txt").read_text() == "preserve"
@@ -1167,8 +1179,13 @@ def test_origin_values_are_encoded_and_preserved_across_pull_and_repush(tmp_path
     assert any(key.startswith(f"{base}/completions/") for key in second.objects)
 
 
-def _strip_from_remote_package(client: FakeS3, prefix: str) -> None:
-    """Rewrite the published generation without any member under ``prefix``."""
+def _strip_from_remote_package(client: FakeS3, removed: str) -> None:
+    """Rewrite the published generation without ``removed`` or anything beneath it.
+
+    A directory named as the target keeps its own entry, so the archive still
+    claims to carry snapshot content while holding none -- which is the state a
+    real archive was found in.
+    """
     completion_key = next(key for key in client.objects if "/completions/" in key)
     generation = json.loads(client.objects[completion_key])["generation"]
     uncompressed = zstandard.ZstdDecompressor().decompress(
@@ -1179,7 +1196,9 @@ def _strip_from_remote_package(client: FakeS3, prefix: str) -> None:
         with zstandard.ZstdCompressor(level=3).stream_writer(raw, closefd=False) as compressed:
             with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as target:
                 for member in source.getmembers():
-                    if member.name.startswith(prefix) and member.name != prefix:
+                    if member.name == removed and not member.isdir():
+                        continue
+                    if member.name.startswith(removed) and member.name != removed:
                         continue
                     target.addfile(member, source.extractfile(member) if member.isfile() else None)
     _replace_remote_package(client, raw.getvalue())
@@ -1210,7 +1229,7 @@ def test_verify_reports_a_generation_with_no_snapshot_content(tmp_path: Path) ->
     # An archive whose steps reference snapshot commits but whose object store
     # never made it up. The bytes are intact and the checksum matches, so the
     # push bookkeeping shows nothing wrong; only reading it back finds this.
-    _strip_from_remote_package(client, "snapshots.git/")
+    _strip_from_remote_package(client, "snapshots.bundle")
 
     with pytest.raises(ValueError, match="missing snapshot commit"):
         remote_sessions.verify_archived_session(

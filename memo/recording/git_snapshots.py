@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -149,6 +150,93 @@ class GitSnapshotStore:
             if ancestor.returncode != 0:
                 return
         self._run("--git-dir", str(self.path), "update-ref", self.REF, commit)
+
+    def create_bundle(self, commit: str, target: Path) -> None:
+        """Create a compact, self-contained bundle for one published commit."""
+        if not self.contains(commit):
+            raise GitSnapshotError(f"snapshot commit is missing: {commit}")
+        if target.exists():
+            raise FileExistsError(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="bundle-repository-", dir=target.parent
+            ) as name:
+                repository = Path(name)
+                self._run("init", "--bare", "--quiet", str(repository), cwd=target.parent)
+                environment = {
+                    **os.environ,
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": str((self.path / "objects").resolve()),
+                }
+                self._run(
+                    "--git-dir",
+                    str(repository),
+                    "update-ref",
+                    self.REF,
+                    commit,
+                    env=environment,
+                )
+                self._run(
+                    "-c",
+                    "pack.window=10",
+                    "-c",
+                    "pack.depth=50",
+                    "-c",
+                    "pack.threads=1",
+                    "-c",
+                    "pack.windowMemory=64m",
+                    "-c",
+                    "pack.compression=0",
+                    "-c",
+                    "pack.useSparse=true",
+                    "-c",
+                    "core.bigFileThreshold=32m",
+                    "--git-dir",
+                    str(repository),
+                    "bundle",
+                    "create",
+                    str(target),
+                    self.REF,
+                    env=environment,
+                )
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+
+    def import_bundle(self, bundle: Path, expected_commit: str) -> None:
+        """Install a self-contained snapshot bundle as this bare repository."""
+        if self.path.exists():
+            raise FileExistsError(self.path)
+        self.initialize()
+        try:
+            self._run("--git-dir", str(self.path), "bundle", "verify", str(bundle))
+            self._run(
+                "--git-dir",
+                str(self.path),
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                str(bundle),
+                f"{self.REF}:{self.REF}",
+            )
+            actual = self._run(
+                "--git-dir", str(self.path), "rev-parse", "--verify", self.REF
+            ).stdout.strip()
+            if actual != expected_commit:
+                raise GitSnapshotError(
+                    f"snapshot bundle tip mismatch: expected {expected_commit}, received {actual}"
+                )
+            self._run(
+                "--git-dir",
+                str(self.path),
+                "fsck",
+                "--connectivity-only",
+                "--no-dangling",
+                expected_commit,
+            )
+        except BaseException:
+            shutil.rmtree(self.path, ignore_errors=True)
+            raise
 
     def restore(self, commit: str, destination: Path) -> None:
         if not self.contains(commit):

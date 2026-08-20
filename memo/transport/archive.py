@@ -9,7 +9,7 @@ import shutil
 import tarfile
 import tempfile
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -18,6 +18,7 @@ from typing import Any, BinaryIO
 import zstandard
 
 from ..agents.run_metadata import AgentRunMetadata
+from ..recording.git_snapshots import GitSnapshotStore
 from ..recording.metadata import DirectorySession, StepManifest
 from ..recording.store import SessionStore
 
@@ -97,7 +98,13 @@ class HashingReader:
         return self.digest.hexdigest()
 
 
-def write_deterministic_tar_zst(root: Path, paths: Iterable[Path], target: BinaryIO) -> None:
+def write_deterministic_tar_zst(
+    root: Path,
+    paths: Iterable[Path],
+    target: BinaryIO,
+    *,
+    extra_files: Mapping[str, Path] | None = None,
+) -> None:
     """Write a reproducible, streaming tar.zst archive."""
     compressor = zstandard.ZstdCompressor(
         level=3,
@@ -106,13 +113,19 @@ def write_deterministic_tar_zst(root: Path, paths: Iterable[Path], target: Binar
         write_checksum=False,
         write_dict_id=False,
     )
+    entries = [
+        (path.relative_to(root).as_posix(), path)
+        for path in paths
+        if path.relative_to(root).as_posix() != "session.lock" and not path.is_socket()
+    ]
+    entries.extend((name, path) for name, path in (extra_files or {}).items())
+    names = [name for name, _ in entries]
+    if len(names) != len(set(names)):
+        raise ValueError("archive contains duplicate paths")
     with compressor.stream_writer(target, closefd=False) as compressed:
         with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
-            for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
-                relative = path.relative_to(root)
-                if relative.as_posix() == "session.lock" or path.is_socket():
-                    continue
-                info = archive.gettarinfo(str(path), arcname=relative.as_posix())
+            for name, path in sorted(entries):
+                info = archive.gettarinfo(str(path), arcname=name)
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
                 info.mtime = 0
@@ -211,9 +224,6 @@ def _history_paths(session_path: Path, manifests: list[StepManifest]) -> list[Pa
     if entries.is_dir():
         paths.append(entries)
         paths.extend(entries.rglob("*"))
-    if any(manifest.snapshot_commit for manifest in manifests):
-        paths.append(session_path / "snapshots.git")
-        paths.extend((session_path / "snapshots.git").rglob("*"))
     for manifest in manifests:
         paths.append(session_path / "steps" / f"{manifest.step}.json")
         if not manifest.snapshot_commit:
@@ -294,11 +304,24 @@ def prepare_generation(
     try:
         if progress is not None:
             progress(0, 1, "creating archive")
-        with os.fdopen(descriptor, "wb") as handle:
-            hashing = HashingWriter(handle)
-            write_deterministic_tar_zst(root, _history_paths(root, manifests), hashing)
-            handle.flush()
-            os.fsync(handle.fileno())
+        with tempfile.TemporaryDirectory(prefix="bundle-", dir=upload_dir) as bundle_dir:
+            extra_files: dict[str, Path] = {}
+            if manifest.snapshot_commit:
+                bundle = Path(bundle_dir) / "snapshots.bundle"
+                GitSnapshotStore(root / "snapshots.git").create_bundle(
+                    manifest.snapshot_commit, bundle
+                )
+                extra_files["snapshots.bundle"] = bundle
+            with os.fdopen(descriptor, "wb") as handle:
+                hashing = HashingWriter(handle)
+                write_deterministic_tar_zst(
+                    root,
+                    _history_paths(root, manifests),
+                    hashing,
+                    extra_files=extra_files,
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
         prepared = PreparedGeneration(
             session.session_id, manifest.step, hashing.hexdigest(), path, path.stat().st_size
         )

@@ -15,6 +15,9 @@ from typing import Any
 DIRECTORY_FORMAT_VERSION = 2
 STEP_SCHEMA_VERSION = 3
 
+#: Git-backed steps that still list every captured path inline.
+FULL_ENTRY_SCHEMA_VERSION = 2
+
 #: Serialisation of a shared snapshot entry list.
 ENTRIES_SCHEMA_VERSION = 1
 
@@ -104,6 +107,16 @@ class SnapshotEntry:
     def from_dict(cls, value: dict[str, Any]) -> SnapshotEntry:
         return cls(**value)
 
+    @property
+    def is_exception(self) -> bool:
+        """Return whether Git cannot represent this capture result by itself."""
+        return self.kind not in {"file", "directory"} or self.retained
+
+
+def snapshot_exceptions(entries: list[SnapshotEntry]) -> list[SnapshotEntry]:
+    """Keep only capture results that are not already encoded by a Git tree."""
+    return [entry for entry in entries if entry.is_exception]
+
 
 def _is_sha256(value: object) -> bool:
     return (
@@ -161,7 +174,7 @@ class StepManifest:
     entries_digest: str | None = None
 
     def validate(self) -> None:
-        if self.schema_version not in {1, 2, STEP_SCHEMA_VERSION}:
+        if self.schema_version not in {1, FULL_ENTRY_SCHEMA_VERSION, STEP_SCHEMA_VERSION}:
             raise ValueError("unsupported step schema version")
         if self.entries_digest is not None and not _is_sha256(self.entries_digest):
             raise ValueError("invalid snapshot entry digest")
@@ -170,7 +183,9 @@ class StepManifest:
         expected = f"snapshots/{self.step}"
         if self.snapshot != expected:
             raise ValueError(f"step snapshot must be {expected}")
-        if self.schema_version >= 2 and not self.snapshot_commit:
+        # Schema 1 copied snapshots into a directory; every version since is
+        # Git-backed, so the commit is the only pointer to a step's content.
+        if self.schema_version >= FULL_ENTRY_SCHEMA_VERSION and not self.snapshot_commit:
             raise ValueError("Git-backed step is missing its snapshot commit")
         if self.schema_version >= STEP_SCHEMA_VERSION and not self.entries_digest:
             raise ValueError("step is missing its snapshot entry digest")
@@ -193,6 +208,8 @@ class StepManifest:
                 "unstable",
             }:
                 raise ValueError(f"unsupported snapshot entry kind: {entry.kind}")
+            if self.schema_version == STEP_SCHEMA_VERSION and not entry.is_exception:
+                raise ValueError("compact Git-backed step contains a redundant snapshot entry")
         for terminal_id, sequence in self.stream_high_water.items():
             if not terminal_id or Path(terminal_id).name != terminal_id:
                 raise ValueError(f"unsafe terminal stream id: {terminal_id}")
