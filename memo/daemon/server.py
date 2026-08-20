@@ -15,6 +15,7 @@ from multiprocessing.connection import Client, Connection, Listener
 from pathlib import Path
 from typing import IO, Any
 
+from .. import __version__
 from ..agents.harnesses import get_harness
 from ..agents.ingestion import TraceIngester
 from ..agents.trace_files import capture
@@ -23,6 +24,7 @@ from ..recording.metadata import DirectorySession, SessionOrigin
 from ..recording.paths import StoragePaths
 from ..recording.snapshots import StepPublisher, utcnow
 from ..recording.store import SessionStore
+from ..runtime import RUNTIME_ID
 from ..transport.config import S3Config
 from .protocol import (
     DisconnectedError,
@@ -784,7 +786,12 @@ class MemoDaemon:
         progress: Callable[[int, int, str], None] | None = None,
     ) -> dict[str, Any]:
         if message.operation == "health":
-            return {"status": "ok"}
+            return {
+                "status": "ok",
+                "pid": os.getpid(),
+                "version": __version__,
+                "runtime_id": RUNTIME_ID,
+            }
         if message.operation == "attach":
             return self._open(message.payload)
         if message.operation == "events":
@@ -876,8 +883,9 @@ class MemoDaemon:
             except DisconnectedError:
                 return
             except Exception as error:
-                self.log.warning("%s request failed: %s", operation, error)
-                response = Response(False, {}, str(error))
+                detail = str(error).strip() or type(error).__name__
+                self.log.exception("%s request failed: %s", operation, detail)
+                response = Response(False, {}, detail)
             with suppress(BrokenPipeError, ConnectionResetError):
                 send_message(connection, response)
 

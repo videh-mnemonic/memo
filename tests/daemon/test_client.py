@@ -2,7 +2,29 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from memo.daemon import client
+from memo.runtime import RUNTIME_ID
+
+
+def test_ensure_daemon_accepts_matching_runtime(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MEMO_S3_BUCKET", "bucket")
+    monkeypatch.setattr(
+        client,
+        "request",
+        lambda *_args, **_kwargs: {"status": "ok", "runtime_id": RUNTIME_ID},
+    )
+
+    client.ensure_daemon(client.StoragePaths(tmp_path / "home"))
+
+
+def test_ensure_daemon_rejects_legacy_or_stale_runtime(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MEMO_S3_BUCKET", "bucket")
+    monkeypatch.setattr(client, "request", lambda *_args, **_kwargs: {"status": "ok"})
+
+    with pytest.raises(RuntimeError, match="running different code"):
+        client.ensure_daemon(client.StoragePaths(tmp_path / "home"))
 
 
 def test_attach_waits_for_initial_snapshot(monkeypatch, tmp_path) -> None:

@@ -32,6 +32,14 @@ def test_removed_public_commands_are_not_registered() -> None:
     assert "migrate-legacy" not in choices
 
 
+def test_daemon_commands_do_not_require_s3(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.delenv("MEMO_S3_BUCKET", raising=False)
+    monkeypatch.setenv("MEMO_HOME", str(tmp_path / "home"))
+
+    assert main(["daemon", "status"]) == 0
+    assert capsys.readouterr().out == "daemon: stopped\n"
+
+
 def test_default_and_path_invocations_launch_generic_relay(monkeypatch, tmp_path: Path) -> None:
     calls: list[Path] = []
     monkeypatch.setattr("memo.cli.app.run_relay", lambda path: calls.append(path) or 7)
