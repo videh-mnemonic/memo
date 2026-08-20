@@ -8,7 +8,6 @@ from typing import Any
 from ...recording.paths import StoragePaths
 from ...recording.store import SessionStore
 from ...transport import list_archived_session_ids, verify_archived_session
-from ..progress import ProgressBar
 
 NAME = "verify"
 
@@ -40,26 +39,26 @@ def run(args: Any) -> int:
         print("no recordings to verify")
         return 0
     store = None if args.archive else SessionStore(StoragePaths.discover())
-    intact: list[str] = []
-    broken: list[tuple[str, str]] = []
-    with ProgressBar() as progress:
-        for index, session_id in enumerate(targets):
-            progress.update(index, len(targets), f"verifying {session_id}")
-            try:
-                if args.archive:
-                    result = verify_archived_session(session_id)
-                    intact.append(f"{session_id} steps={result['steps']} bytes={result['bytes']}")
-                else:
-                    assert store is not None
-                    head = store.check_integrity(session_id)
-                    intact.append(f"{session_id} steps={0 if head is None else head.step + 1}")
-            except Exception as error:
-                broken.append((session_id, str(error)))
-        progress.update(len(targets), len(targets), "verify complete")
     where = "archive" if args.archive else "local"
-    for line in intact:
-        print(f"intact: {where}: {line}")
-    for session_id, error in broken:
-        print(f"BROKEN: {where}: {session_id}: {error}", file=sys.stderr)
-    print(f"{len(intact)} intact, {len(broken)} broken")
+    intact = 0
+    broken = 0
+    # Report each recording as it is decided rather than at the end. Reading a
+    # whole archive back takes as long as it takes, and a run that is
+    # interrupted partway should still have told you what it learned.
+    for session_id in targets:
+        try:
+            if args.archive:
+                result = verify_archived_session(session_id)
+                detail = f"steps={result['steps']} bytes={result['bytes']}"
+            else:
+                assert store is not None
+                head = store.check_integrity(session_id)
+                detail = f"steps={0 if head is None else head.step + 1}"
+        except Exception as error:
+            broken += 1
+            print(f"BROKEN: {where}: {session_id}: {error}", file=sys.stderr, flush=True)
+        else:
+            intact += 1
+            print(f"intact: {where}: {session_id} {detail}", flush=True)
+    print(f"{intact} intact, {broken} broken", flush=True)
     return 1 if broken else 0
