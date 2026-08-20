@@ -72,6 +72,54 @@ def test_zero_terminal_recording_keeps_publishing(tmp_path: Path) -> None:
         _stop(paths, thread)
 
 
+def test_snapshot_reads_do_not_trigger_more_steps(tmp_path: Path) -> None:
+    paths, root, _, thread = _running(tmp_path, interval=60)
+    try:
+        (root / "untracked.txt").write_text("initial")
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        session_id = str(attached["session_id"])
+        (root / "untracked.txt").write_text("changed")
+        store = SessionStore(paths)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and store.head(session_id).step < 1:
+            time.sleep(0.05)
+
+        assert store.head(session_id).step == 1
+        assert (root / "untracked.txt").read_text() == "changed"
+        time.sleep(0.75)
+        assert store.head(session_id).step == 1
+
+        restored = tmp_path / "restored-untracked"
+        store.restore_manifest(session_id, store.head(session_id), restored)
+        assert (restored / "untracked.txt").read_text() == "changed"
+    finally:
+        _stop(paths, thread)
+
+
+def test_mutation_burst_is_coalesced_into_one_step(tmp_path: Path) -> None:
+    paths, root, _, thread = _running(tmp_path, interval=60)
+    try:
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        session_id = str(attached["session_id"])
+        for value in range(10):
+            (root / "generated.txt").write_text(str(value))
+            time.sleep(0.02)
+
+        store = SessionStore(paths)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and store.head(session_id).step < 1:
+            time.sleep(0.05)
+        time.sleep(0.5)
+
+        manifest = store.head(session_id)
+        assert manifest.step == 1
+        restored = tmp_path / "restored-burst"
+        store.restore_manifest(session_id, manifest, restored)
+        assert (restored / "generated.txt").read_text() == "9"
+    finally:
+        _stop(paths, thread)
+
+
 def test_stale_terminal_attachment_prompts_on_next_attach(tmp_path: Path) -> None:
     paths, root, daemon, thread = _running(tmp_path)
     try:
@@ -204,12 +252,12 @@ def test_queued_worker_cannot_publish_after_end(tmp_path: Path, monkeypatch) -> 
         worker_done = threading.Event()
         original_publish = daemon._publish
 
-        def pause_worker_publish(session):
+        def pause_worker_publish(session, **kwargs):
             if threading.current_thread() is worker:
                 worker_paused.set()
                 assert release_worker.wait(2)
             try:
-                return original_publish(session)
+                return original_publish(session, **kwargs)
             finally:
                 if threading.current_thread() is worker:
                     worker_done.set()

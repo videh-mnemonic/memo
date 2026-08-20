@@ -26,6 +26,11 @@ class GitSnapshotStore:
         self._run("init", "--bare", "--quiet", str(self.path), cwd=self.path.parent)
 
     def commit(self, tree: Path, parent: str | None, message: str) -> str:
+        tree_id = self.write_tree(tree)
+        return self.commit_tree(tree_id, parent, message)
+
+    def write_tree(self, tree: Path) -> str:
+        """Store a filesystem tree and return its content-addressed tree ID."""
         self.initialize()
         index_fd, index_name = tempfile.mkstemp(prefix="git-index-", dir=tree.parent)
         os.close(index_fd)
@@ -42,27 +47,37 @@ class GitSnapshotStore:
                 ".",
                 env=environment,
             )
-            tree_id = self._run(
+            return self._run(
                 "--git-dir", str(self.path), "write-tree", env=environment
             ).stdout.strip()
-            command = ["--git-dir", str(self.path), "commit-tree", tree_id, "-m", message]
-            if parent:
-                command[4:4] = ["-p", parent]
-            result = self._run(
-                *command,
-                env={
-                    **environment,
-                    "GIT_AUTHOR_NAME": "Memo",
-                    "GIT_AUTHOR_EMAIL": "memo@localhost",
-                    "GIT_COMMITTER_NAME": "Memo",
-                    "GIT_COMMITTER_EMAIL": "memo@localhost",
-                },
-            )
         finally:
             Path(index_name).unlink(missing_ok=True)
+
+    def commit_tree(self, tree_id: str, parent: str | None, message: str) -> str:
+        """Commit a previously written tree and advance the snapshot ref."""
+        self.initialize()
+        environment = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Memo",
+            "GIT_AUTHOR_EMAIL": "memo@localhost",
+            "GIT_COMMITTER_NAME": "Memo",
+            "GIT_COMMITTER_EMAIL": "memo@localhost",
+        }
+        command = ["--git-dir", str(self.path), "commit-tree", tree_id, "-m", message]
+        if parent:
+            command[4:4] = ["-p", parent]
+        result = self._run(*command, env=environment)
         commit = result.stdout.strip()
         self._run("--git-dir", str(self.path), "update-ref", self.REF, commit)
         return commit
+
+    def tree_id(self, commit: str) -> str:
+        """Return the tree ID referenced by a snapshot commit."""
+        if not self.contains(commit):
+            raise GitSnapshotError(f"snapshot commit is missing: {commit}")
+        return self._run(
+            "--git-dir", str(self.path), "rev-parse", f"{commit}^{{tree}}"
+        ).stdout.strip()
 
     def contains(self, commit: str) -> bool:
         if not self.path.is_dir():
