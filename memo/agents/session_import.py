@@ -358,7 +358,7 @@ def _refresh(
     refreshed.continued_from_trace_digest = metadata.continued_from_trace_digest
     refreshed.write(metadata_path)
     session.updated_utc = _timestamps(candidate.records, candidate.source)[1]
-    store.update_session(session)
+    store.amend_session(session.session_id, updated_utc=session.updated_utc)
     _publish_empty_step(store, session)
     return session_id
 

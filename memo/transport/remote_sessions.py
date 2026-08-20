@@ -287,7 +287,12 @@ def publish_generation_metadata(
         session.last_pushed_step = step
         session.last_pushed_digest = digest
         session.remote_object = generation
-        store.update_session(session)
+        store.amend_session(
+            session.session_id,
+            last_pushed_step=step,
+            last_pushed_digest=digest,
+            remote_object=generation,
+        )
     return {
         "session_id": session.session_id,
         "step": step,

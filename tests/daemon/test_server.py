@@ -581,3 +581,47 @@ def test_end_fails_on_upload_error_and_completed_session_can_be_retried(
         assert attempts == 2
     finally:
         _stop(paths, thread)
+
+
+def test_completing_a_recording_keeps_a_concurrent_upload_record(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths, root, _daemon, thread = _running(tmp_path)
+    try:
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        store = SessionStore(paths)
+        session_id = str(attached["session_id"])
+        publish = MemoDaemon._publish
+
+        def publish_then_record(self: MemoDaemon, session, *, force: bool = False):
+            manifest = publish(self, session, force=force)
+            # Stand in for the archive publisher landing while the recording is
+            # being completed: it records the uploaded generation on its own.
+            self.store.amend_session(
+                session.session_id,
+                last_pushed_step=manifest.step,
+                last_pushed_digest="0" * 64,
+                remote_object="remote",
+            )
+            return manifest
+
+        monkeypatch.setattr(MemoDaemon, "_publish", publish_then_record)
+        ended = request(
+            str(paths.socket),
+            "end",
+            {
+                "session_id": session_id,
+                "terminal_id": attached["terminal_id"],
+                "capture_scope": "full",
+            },
+        )
+        assert ended["state"] == "complete"
+
+        stored = store.load_session(session_id)
+        assert stored.state == "complete"
+        assert stored.capture_scope == "full"
+        # Completing the recording must not revert what the upload recorded.
+        assert stored.last_pushed_step is not None
+        assert stored.remote_object == "remote"
+    finally:
+        _stop(paths, thread)
