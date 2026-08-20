@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
@@ -43,6 +44,8 @@ class SessionStore:
     def __init__(self, paths: StoragePaths):
         self.paths = paths
         paths.ensure_storage()
+        self._amend_locks: dict[str, threading.Lock] = {}
+        self._amend_guard = threading.Lock()
 
     def session_path(self, session_id: str) -> Path:
         return self.paths.archive / validate_session_id(session_id)
@@ -78,10 +81,42 @@ class SessionStore:
         return DirectorySession.load(self.session_path(session_id) / "session.json")
 
     def update_session(self, session: DirectorySession) -> None:
+        """Store ``session`` wholesale, overwriting every field on disk.
+
+        Prefer :meth:`amend_session` for updates to individual fields: a caller
+        that loaded before another writer stored will otherwise revert that
+        writer's fields back to whatever its own copy happened to hold.
+        """
         session.validate()
         atomic_write(
             self.session_path(session.session_id) / "session.json", _json_bytes(session.to_dict())
         )
+
+    def _amend_lock(self, session_id: str) -> threading.Lock:
+        with self._amend_guard:
+            return self._amend_locks.setdefault(session_id, threading.Lock())
+
+    def amend_session(self, session_id: str, **changes: object) -> DirectorySession:
+        """Apply named field changes on top of whatever is currently on disk.
+
+        Session metadata has several independent writers -- the step publisher
+        records lifecycle, the archive publisher records what reached S3 -- and
+        they do not finish in a fixed order. Re-reading inside the update keeps
+        them from reverting each other, so a completed recording cannot end up
+        pointing at a generation older than the one already uploaded.
+
+        Serialisation is per-process. Every writer outside this daemon reaches
+        session metadata through it, so that is the whole set of writers.
+        """
+        unknown = set(changes) - set(DirectorySession.__dataclass_fields__)
+        if unknown:
+            raise AttributeError(f"unknown directory session fields: {sorted(unknown)}")
+        with self._amend_lock(session_id):
+            session = self.load_session(session_id)
+            for name, value in changes.items():
+                setattr(session, name, value)
+            self.update_session(session)
+        return session
 
     def head(self, session_id: str) -> StepManifest | None:
         path = self.session_path(session_id)

@@ -390,17 +390,27 @@ class MemoDaemon:
             }
         if active.state == "active":
             active = self.registry.transition(active.session_id, "active", "ending")
+        pending: dict[str, object] = {}
         if capture_scope is not None:
             session.capture_scope = capture_scope
+            pending["capture_scope"] = capture_scope
         if session.state != "ending":
             session.state = "ending"
             session.updated_utc = utcnow()
-            self.store.update_session(session)
+            pending["state"] = session.state
+            pending["updated_utc"] = session.updated_utc
+        if pending:
+            self.store.amend_session(active.session_id, **pending)
         self.streams.drain_and_detach(active.session_id, utcnow())
         manifest = self._publish(session, force=True)
         session.state = "complete"
         session.updated_utc = manifest.created_utc
-        self.store.update_session(session)
+        # Publishing the final generation runs concurrently with this, so record
+        # only the lifecycle fields rather than writing back a whole snapshot
+        # taken before the upload started.
+        self.store.amend_session(
+            active.session_id, state="complete", updated_utc=manifest.created_utc
+        )
         self.registry.transition(active.session_id, "ending", "complete")
         self.registry.remove(active.session_id)
         self._cleanup_runtime(active.session_id)
@@ -666,10 +676,12 @@ class MemoDaemon:
                             current.last_pushed_step is None
                             or current.last_pushed_step <= prepared.step
                         ):
-                            current.last_pushed_step = prepared.step
-                            current.last_pushed_digest = prepared.digest
-                            current.remote_object = str(result["object"])
-                            self.store.update_session(current)
+                            self.store.amend_session(
+                                session.session_id,
+                                last_pushed_step=prepared.step,
+                                last_pushed_digest=prepared.digest,
+                                remote_object=str(result["object"]),
+                            )
                 target = summary.skipped if result["status"] == "skipped" else summary.pushed
                 target.append(session.session_id)
             except Exception as error:

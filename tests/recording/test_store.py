@@ -1,6 +1,7 @@
 import json
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -310,9 +311,13 @@ def test_remove_archived_does_not_revalidate_old_history(tmp_path: Path, monkeyp
     session.remote_object = "remote"
     store.update_session(session)
 
-    monkeypatch.setattr(store, "check_integrity", lambda _session_id: (_ for _ in ()).throw(
-        AssertionError("full history validation should not run")
-    ))
+    monkeypatch.setattr(
+        store,
+        "check_integrity",
+        lambda _session_id: (_ for _ in ()).throw(
+            AssertionError("full history validation should not run")
+        ),
+    )
 
     store.remove_archived("session")
     assert not directory.exists()
@@ -347,3 +352,83 @@ def test_remove_archived_renames_before_recursive_removal(
     assert len(destinations) == 1
     assert destinations[0].parent == store.paths.archive / ".removing"
     assert destinations[0].is_dir()
+
+
+def test_amend_session_keeps_a_concurrent_writer_s_fields(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(_paths(tmp_path))
+    store.create(_session(root))
+
+    # The archive publisher records where the upload landed...
+    store.amend_session(
+        "session",
+        last_pushed_step=7,
+        last_pushed_digest="0" * 64,
+        remote_object="remote",
+    )
+    # ...while the lifecycle writer, holding a copy loaded beforehand, completes.
+    store.amend_session("session", state="complete", updated_utc="later")
+
+    current = store.load_session("session")
+    assert current.state == "complete"
+    assert current.last_pushed_step == 7
+    assert current.remote_object == "remote"
+
+
+def test_update_session_reverts_a_concurrent_writer_s_fields(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(_paths(tmp_path))
+    store.create(_session(root))
+    stale = store.load_session("session")
+
+    store.amend_session(
+        "session",
+        last_pushed_step=7,
+        last_pushed_digest="0" * 64,
+        remote_object="remote",
+    )
+    stale.state = "complete"
+    store.update_session(stale)
+
+    # This is the hazard amend_session exists to avoid: the recording now claims
+    # to be complete while pointing at no uploaded generation at all.
+    assert store.load_session("session").last_pushed_step is None
+
+
+def test_amend_session_rejects_unknown_fields(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(_paths(tmp_path))
+    store.create(_session(root))
+    with pytest.raises(AttributeError, match="unknown directory session fields"):
+        store.amend_session("session", nonsense=1)
+
+
+def test_amend_session_serialises_concurrent_writers(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(_paths(tmp_path))
+    store.create(_session(root))
+    start = threading.Barrier(3)
+
+    def amend(**changes: object) -> None:
+        start.wait(timeout=5)
+        for _ in range(20):
+            store.amend_session("session", **changes)
+
+    threads = [
+        threading.Thread(target=amend, kwargs={"state": "ending"}),
+        threading.Thread(target=amend, kwargs={"capture_scope": "full"}),
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    current = store.load_session("session")
+    assert current.state == "ending"
+    assert current.capture_scope == "full"
