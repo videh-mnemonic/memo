@@ -33,14 +33,18 @@ def ensure_daemon(paths: StoragePaths | None = None, timeout: float = 5.0) -> No
             return
     except (OSError, ProtocolError):
         pass
-    subprocess.Popen(
-        [sys.executable, "-m", "memo.daemon"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        env=os.environ.copy(),
-    )
+    # Anything the interpreter itself prints -- a startup failure, a traceback
+    # from a thread -- is the daemon's only account of what went wrong, and it
+    # has no terminal to print it to. Send it where the daemon's own log goes.
+    with paths.log.open("a", encoding="utf-8") as log:
+        subprocess.Popen(
+            [sys.executable, "-m", "memo.daemon"],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+            env=os.environ.copy(),
+        )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:

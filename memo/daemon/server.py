@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
-import sys
 import threading
 import time
 from collections.abc import Callable
@@ -38,6 +38,30 @@ STEP_INTERVAL_SECONDS = 15.0
 WATCHER_DEBOUNCE_SECONDS = 0.25
 PUSH_INTERVAL_SECONDS = 15 * 60.0
 TERMINAL_STALE_SECONDS = 5 * 60.0
+
+#: The daemon runs detached with no terminal to report to, so it keeps a log.
+#: It is rotated once at startup rather than while running: the daemon is a
+#: singleton that opens the file once, and callers redirect the child process's
+#: stderr to the same file, so renaming it underneath them would send anything
+#: the interpreter itself prints to a file nobody reads.
+LOG_ROTATE_BYTES = 8 * 1024 * 1024
+
+
+def configure_log(paths: StoragePaths) -> logging.Logger:
+    """Attach a file handler for daemon diagnostics and return the logger."""
+    paths.ensure_storage()
+    if paths.log.is_file() and paths.log.stat().st_size > LOG_ROTATE_BYTES:
+        paths.log.replace(paths.log.parent / f"{paths.log.name}.1")
+    handler = logging.FileHandler(paths.log, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(process)d] %(message)s"))
+    logger = logging.getLogger(f"memo.daemon.{paths.runtime}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    return logger
+
+
 MUTATING_EVENT_TYPES = frozenset({"created", "modified", "deleted", "moved", "closed"})
 
 
@@ -70,6 +94,8 @@ class MemoDaemon:
         self._root_locks: dict[str, threading.RLock] = {}
         self._push_thread: threading.Thread | None = None
         self._lock_handle: IO[str] | None = None
+        self._push_locks: dict[str, threading.Lock] = {}
+        self.log = logging.getLogger(f"memo.daemon.{self.paths.runtime}")
 
     def _acquire_daemon_lock(self) -> None:
         lock_path = self.paths.runtime / "daemon.lock"
@@ -83,6 +109,19 @@ class MemoDaemon:
 
     def _session_model(self, active: ActiveSession) -> DirectorySession:
         return self.store.load_session(active.session_id)
+
+    def _push_lock(self, session_id: str) -> threading.Lock:
+        """Serialise pushes of one recording without blocking its step publisher.
+
+        Preparing a generation tars the whole archive, so two pushes racing --
+        an automatic one and the final push of `memo end`, say -- would each
+        build and upload the same thing. This gate makes the second wait and
+        then find the work already done. It is deliberately not the session
+        lock: that one is held while steps publish, and an upload can run for
+        minutes.
+        """
+        with self._worker_lock:
+            return self._push_locks.setdefault(session_id, threading.Lock())
 
     def _session_lock(self, session_id: str) -> threading.RLock:
         with self._worker_lock:
@@ -160,7 +199,7 @@ class MemoDaemon:
                         return
                     self._publish(self._session_model(current))
             except Exception as error:
-                print(f"memo daemon: step failed for {active.session_id}: {error}", file=sys.stderr)
+                self.log.exception("step failed for %s: %s", active.session_id, error)
             deadline = time.monotonic() + self.interval
 
     def _wait_for_quiet(self, request_event: threading.Event, deadline: float) -> None:
@@ -624,68 +663,69 @@ class MemoDaemon:
         for session in sessions:
             prepared = None
             try:
-                with self._session_lock(session.session_id):
-                    session = self.store.load_session(session.session_id)
-                    manifest = self.store.head(session.session_id)
-                    if manifest is None:
-                        raise ValueError(f"session has no published step: {session.session_id}")
-                    if session.last_pushed_step == manifest.step:
-                        if (
-                            session.state == "complete"
-                            and session.last_pushed_digest is not None
-                            and session.remote_object is not None
-                        ):
-                            base = _session_base(config, session.origin, session.session_id)
-                            completion_key = _completion_key(
-                                base, manifest.step, session.last_pushed_digest
-                            )
-                            existing = _list_completions(remote, f"{base}/completions/")
-                            if not existing:
-                                result = publish_generation_metadata(
-                                    self.store,
-                                    session,
-                                    manifest.step,
-                                    session.last_pushed_digest,
-                                    session.remote_object,
-                                    config,
-                                    remote,
-                                    update_local=False,
+                with self._push_lock(session.session_id):
+                    with self._session_lock(session.session_id):
+                        session = self.store.load_session(session.session_id)
+                        manifest = self.store.head(session.session_id)
+                        if manifest is None:
+                            raise ValueError(f"session has no published step: {session.session_id}")
+                        if session.last_pushed_step == manifest.step:
+                            if (
+                                session.state == "complete"
+                                and session.last_pushed_digest is not None
+                                and session.remote_object is not None
+                            ):
+                                base = _session_base(config, session.origin, session.session_id)
+                                completion_key = _completion_key(
+                                    base, manifest.step, session.last_pushed_digest
                                 )
-                            elif existing[0][2] != completion_key:
-                                raise ValueError(
-                                    "remote session has conflicting completion records"
-                                )
+                                existing = _list_completions(remote, f"{base}/completions/")
+                                if not existing:
+                                    result = publish_generation_metadata(
+                                        self.store,
+                                        session,
+                                        manifest.step,
+                                        session.last_pushed_digest,
+                                        session.remote_object,
+                                        config,
+                                        remote,
+                                        update_local=False,
+                                    )
+                                elif existing[0][2] != completion_key:
+                                    raise ValueError(
+                                        "remote session has conflicting completion records"
+                                    )
+                                else:
+                                    result = {"status": "skipped"}
                             else:
                                 result = {"status": "skipped"}
                         else:
-                            result = {"status": "skipped"}
-                    else:
-                        prepared = prepare_generation(self.store, session, progress=progress)
-                if prepared is not None:
-                    result = publish_generation(
-                        self.store,
-                        session,
-                        prepared,
-                        config,
-                        remote,
-                        update_local=False,
-                        allow_large=payload.get("allow_large") is True,
-                        progress=progress,
-                    )
-                    with self._session_lock(session.session_id):
-                        current = self.store.load_session(session.session_id)
-                        if (
-                            current.last_pushed_step is None
-                            or current.last_pushed_step <= prepared.step
-                        ):
-                            self.store.amend_session(
-                                session.session_id,
-                                last_pushed_step=prepared.step,
-                                last_pushed_digest=prepared.digest,
-                                remote_object=str(result["object"]),
-                            )
-                target = summary.skipped if result["status"] == "skipped" else summary.pushed
-                target.append(session.session_id)
+                            prepared = prepare_generation(self.store, session, progress=progress)
+                    if prepared is not None:
+                        result = publish_generation(
+                            self.store,
+                            session,
+                            prepared,
+                            config,
+                            remote,
+                            update_local=False,
+                            allow_large=payload.get("allow_large") is True,
+                            progress=progress,
+                        )
+                        with self._session_lock(session.session_id):
+                            current = self.store.load_session(session.session_id)
+                            if (
+                                current.last_pushed_step is None
+                                or current.last_pushed_step <= prepared.step
+                            ):
+                                self.store.amend_session(
+                                    session.session_id,
+                                    last_pushed_step=prepared.step,
+                                    last_pushed_digest=prepared.digest,
+                                    remote_object=str(result["object"]),
+                                )
+                    target = summary.skipped if result["status"] == "skipped" else summary.pushed
+                    target.append(session.session_id)
             except Exception as error:
                 summary.failed.append((session.session_id, str(error)))
             finally:
@@ -736,7 +776,7 @@ class MemoDaemon:
                     session_id, error = result["failed"][0]
                     raise RuntimeError(f"{session_id}: {error}")
             except Exception as error:
-                print(f"memo daemon: automatic push failed: {error}", file=sys.stderr)
+                self.log.exception("automatic push failed: %s", error)
 
     def dispatch(
         self,
@@ -801,8 +841,10 @@ class MemoDaemon:
 
     def _handle(self, connection: Connection) -> None:
         with connection:
+            operation = "unknown"
             try:
                 message = receive_request(connection)
+                operation = message.operation
                 send_progress = message.payload.get("_progress") is True
                 disconnected = False
 
@@ -834,19 +876,32 @@ class MemoDaemon:
             except DisconnectedError:
                 return
             except Exception as error:
+                self.log.warning("%s request failed: %s", operation, error)
                 response = Response(False, {}, str(error))
             with suppress(BrokenPipeError, ConnectionResetError):
                 send_message(connection, response)
 
     def serve_forever(self) -> None:
+        self.log = configure_log(self.paths)
         self._acquire_daemon_lock()
-        self.registry.remove_stale(self.paths.archive)
+        self.log.info("daemon started, archive=%s", self.paths.archive)
+        # Everything below runs because the previous daemon did not shut down
+        # cleanly, so it is exactly what someone investigating will want.
+        for session_id in self.registry.remove_stale(self.paths.archive):
+            self.log.warning("dropped registry entry with no archive: %s", session_id)
         for active in self.registry.list_active():
             self.store.check_integrity(active.session_id)
-        self.streams.recover_all()
-        self.registry.expire_attachments(utcnow())
+        recovered = self.streams.recover_all()
+        for terminal_id, count in recovered.items():
+            if count:
+                self.log.info("recovered %d spooled events for terminal %s", count, terminal_id)
+        for terminal_id in self.registry.expire_attachments(utcnow()):
+            self.log.info("detached terminal left attached by a previous daemon: %s", terminal_id)
         for active in self.registry.list_active():
             if active.state == "ending":
+                self.log.info(
+                    "completing recording interrupted while ending: %s", active.session_id
+                )
                 self._finish(active)
             elif active.state == "complete":
                 self.registry.remove(active.session_id)
@@ -873,6 +928,7 @@ class MemoDaemon:
             server.close()
             self.socket_path.unlink(missing_ok=True)
             self.registry.close()
+            self.log.info("daemon stopped")
             if self._lock_handle:
                 fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_UN)
                 self._lock_handle.close()
@@ -880,7 +936,12 @@ class MemoDaemon:
 
 def main() -> int:
     S3Config.discover(required=True)
-    MemoDaemon().serve_forever()
+    daemon = MemoDaemon()
+    try:
+        daemon.serve_forever()
+    except Exception:
+        configure_log(daemon.paths).exception("daemon exited on an unhandled error")
+        raise
     return 0
 
 

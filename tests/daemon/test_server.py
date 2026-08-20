@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import memo.transport
+from memo.daemon import server as server_module
 from memo.daemon.protocol import ProtocolError, request
 from memo.daemon.server import TERMINAL_STALE_SECONDS, MemoDaemon
 from memo.recording.paths import StoragePaths
@@ -623,5 +625,74 @@ def test_completing_a_recording_keeps_a_concurrent_upload_record(
         # Completing the recording must not revert what the upload recorded.
         assert stored.last_pushed_step is not None
         assert stored.remote_object == "remote"
+    finally:
+        _stop(paths, thread)
+
+
+def test_daemon_records_what_it_could_not_do(tmp_path: Path) -> None:
+    paths, root, _daemon, thread = _running(tmp_path)
+    try:
+        with pytest.raises(ProtocolError):
+            request(str(paths.socket), "end", {"path": str(tmp_path / "absent")})
+    finally:
+        _stop(paths, thread)
+
+    # The daemon runs detached. Anything it cannot report here it cannot report
+    # anywhere, which is how a failing recording stays invisible.
+    written = paths.log.read_text()
+    assert "daemon started" in written
+    assert "end request failed" in written
+    assert "daemon stopped" in written
+
+
+def test_daemon_log_is_rotated_once_at_startup(tmp_path: Path) -> None:
+    paths = StoragePaths(tmp_path / "memo-home")
+    paths.ensure_storage()
+    paths.log.write_text("x" * (server_module.LOG_ROTATE_BYTES + 1))
+
+    server_module.configure_log(paths)
+
+    assert (paths.log.parent / f"{paths.log.name}.1").is_file()
+    assert paths.log.stat().st_size < server_module.LOG_ROTATE_BYTES
+
+
+def test_concurrent_pushes_of_one_recording_prepare_a_generation_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths, root, daemon, thread = _running(tmp_path)
+    try:
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        session_id = str(attached["session_id"])
+        monkeypatch.undo()  # restore the real _push over the fixture's stub
+        prepared: list[str] = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_publish(store, session, *args, **kwargs):
+            prepared.append(session.session_id)
+            started.set()
+            release.wait(timeout=5)
+            return {"status": "pushed", "object": "generation", "digest": "0" * 64}
+
+        monkeypatch.setattr(memo.transport, "publish_generation", slow_publish)
+        config = S3Config("bucket").to_dict()
+        results: list[dict[str, object]] = []
+
+        def push() -> None:
+            results.append(daemon._push({"session_id": session_id, "s3": config}))
+
+        first = threading.Thread(target=push)
+        first.start()
+        assert started.wait(timeout=5)
+        second = threading.Thread(target=push)
+        second.start()
+        release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+        # Preparing a generation tars the whole archive. The second push waits
+        # for the first and then finds nothing left to do.
+        assert prepared == [session_id]
+        assert sorted(len(result["pushed"]) for result in results) == [0, 1]
     finally:
         _stop(paths, thread)

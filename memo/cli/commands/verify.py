@@ -40,26 +40,40 @@ def run(args: Any) -> int:
         print("no recordings to verify")
         return 0
     store = None if args.archive else SessionStore(StoragePaths.discover())
-    intact: list[str] = []
-    broken: list[tuple[str, str]] = []
+    where = "archive" if args.archive else "local"
+    intact = 0
+    broken = 0
+    # Report each recording as it is decided rather than at the end: reading a
+    # whole archive back takes as long as it takes, and a run interrupted
+    # partway should still have said what it learned. The bar redraws in place
+    # on stderr, so it is closed off before each result rather than being
+    # overwritten by it.
     with ProgressBar() as progress:
-        for index, session_id in enumerate(targets):
-            progress.update(index, len(targets), f"verifying {session_id}")
+        position = ""
+
+        def show(completed: int, total: int, message: str) -> None:
+            progress.update(completed, total, f"{position} {message}")
+
+        for index, session_id in enumerate(targets, start=1):
+            position = f"({index}/{len(targets)})"
             try:
                 if args.archive:
-                    result = verify_archived_session(session_id)
-                    intact.append(f"{session_id} steps={result['steps']} bytes={result['bytes']}")
+                    result = verify_archived_session(
+                        session_id, progress=show if progress.enabled else None
+                    )
+                    detail = f"steps={result['steps']} bytes={result['bytes']}"
                 else:
                     assert store is not None
+                    show(0, 1, f"verifying {session_id}")
                     head = store.check_integrity(session_id)
-                    intact.append(f"{session_id} steps={0 if head is None else head.step + 1}")
+                    detail = f"steps={0 if head is None else head.step + 1}"
             except Exception as error:
-                broken.append((session_id, str(error)))
-        progress.update(len(targets), len(targets), "verify complete")
-    where = "archive" if args.archive else "local"
-    for line in intact:
-        print(f"intact: {where}: {line}")
-    for session_id, error in broken:
-        print(f"BROKEN: {where}: {session_id}: {error}", file=sys.stderr)
-    print(f"{len(intact)} intact, {len(broken)} broken")
+                broken += 1
+                progress.finish()
+                print(f"BROKEN: {where}: {session_id}: {error}", file=sys.stderr, flush=True)
+            else:
+                intact += 1
+                progress.finish()
+                print(f"intact: {where}: {session_id} {detail}", flush=True)
+    print(f"{intact} intact, {broken} broken", flush=True)
     return 1 if broken else 0

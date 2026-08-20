@@ -17,6 +17,7 @@ class StoragePaths:
     socket: Path
     registry: Path
     spool: Path
+    log: Path
 
     def __init__(
         self,
@@ -26,6 +27,7 @@ class StoragePaths:
         socket: Path | None = None,
         registry: Path | None = None,
         spool: Path | None = None,
+        log: Path | None = None,
     ) -> None:
         resolved_archive = archive or home / "archive"
         resolved_runtime = runtime or home / "runtime"
@@ -35,6 +37,7 @@ class StoragePaths:
         object.__setattr__(self, "socket", socket or resolved_runtime / "memo.sock")
         object.__setattr__(self, "registry", registry or resolved_runtime / "registry.sqlite")
         object.__setattr__(self, "spool", spool or resolved_runtime / "sessions")
+        object.__setattr__(self, "log", log or resolved_runtime / "daemon.log")
 
     @classmethod
     def discover(cls) -> StoragePaths:
