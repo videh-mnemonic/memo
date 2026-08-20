@@ -58,7 +58,12 @@ def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> No
     root = tmp_path / "root"
     root.mkdir()
     shell = tmp_path / "shell"
-    shell.write_text("#!/bin/sh\nread value\nprintf 'reply:%s\\n' \"$value\"\nexit 7\n")
+    # Touching the recording root makes the daemon publish a step, which is
+    # what archives the terminal stream. Ending the recording would too, but
+    # that blocks on a real upload this test has no business needing.
+    shell.write_text(
+        "#!/bin/sh\nread value\nprintf 'reply:%s\\n' \"$value\"\n: > touched\nexit 7\n"
+    )
     shell.chmod(0o755)
     master, slave = pty.openpty()
     original = termios.tcgetattr(slave)
@@ -89,19 +94,17 @@ def test_real_pty_relay_is_transparent_and_propagates_exit(tmp_path: Path) -> No
         assert b"reply:hello" in output
         assert process.wait(timeout=5) == 7
         assert termios.tcgetattr(slave) == original
+        assert (root / "touched").is_file()
         session = next(path for path in home.glob("archive/*") if path.is_dir())
-        socket_path = home / "runtime" / "memo.sock"
-        request(str(socket_path), "end", {"path": str(root)})
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not list(session.glob("streams/terminals/*")):
+            time.sleep(0.05)
         assert list(session.glob("streams/terminals/*"))
     finally:
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
-        paths = (
-            StoragePaths.discover()
-            if os.environ.get("MEMO_HOME") == str(home)
-            else StoragePaths(home)
-        )
+        paths = StoragePaths(home)
         if paths.socket and paths.socket.exists():
             request(str(paths.socket), "shutdown")
         os.close(master)

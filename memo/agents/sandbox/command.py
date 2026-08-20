@@ -84,9 +84,7 @@ def self_test(paths: StoragePaths | None = None, *, force: bool = False) -> dict
     # (or usr-merge symlinks) and are not created by the /usr bind alone.
     for library_directory in (Path("/lib"), Path("/lib64")):
         if library_directory.exists():
-            command.extend(
-                ["--ro-bind", str(library_directory), str(library_directory)]
-            )
+            command.extend(["--ro-bind", str(library_directory), str(library_directory)])
     command.extend(
         [
             "--proc",

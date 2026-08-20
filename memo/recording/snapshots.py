@@ -212,7 +212,9 @@ class StepPublisher:
         try:
             if previous_manifest is not None:
                 if previous_manifest.snapshot_commit:
-                    previous_temporary = Path(tempfile.mkdtemp(prefix="previous-", dir=session_path))
+                    previous_temporary = Path(
+                        tempfile.mkdtemp(prefix="previous-", dir=session_path)
+                    )
                     previous = previous_temporary
                     repository.restore(previous_manifest.snapshot_commit, previous)
                 else:
@@ -240,9 +242,7 @@ class StepPublisher:
                 ):
                     return previous_manifest
                 parent = previous_manifest.snapshot_commit if previous_manifest else None
-                commit = repository.commit_tree(
-                    tree_id, parent, f"Memo filesystem snapshot {step}"
-                )
+                commit = repository.commit_tree(tree_id, parent, f"Memo filesystem snapshot {step}")
                 manifest = StepManifest(
                     session.session_id,
                     step,

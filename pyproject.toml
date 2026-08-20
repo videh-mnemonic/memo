@@ -19,7 +19,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "ruff>=0.12",
+    # Pinned exactly: `ruff format --check` runs in CI, and formatting output
+    # changes between releases, so a floating version turns an unrelated ruff
+    # release into a red build on an untouched tree.
+    "ruff==0.16.3",
 ]
 
 [project.scripts]
