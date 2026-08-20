@@ -10,6 +10,7 @@ from pathlib import Path
 from ..recording.relay import run as run_relay
 from ..transport.config import S3Config
 from .commands import (
+    daemon,
     end,
     import_sessions,
     pull,
@@ -23,6 +24,7 @@ from .commands import (
 )
 
 COMMAND_MODULES = (
+    daemon,
     end,
     import_sessions,
     tidy,
@@ -58,7 +60,17 @@ def main(argv: list[str] | None = None) -> int:
     handler = getattr(args, "handler", None)
     if handler is None:
         command_parser.error("a command is required")
+    if args.command == daemon.NAME:
+        return _run_without_s3(lambda: handler(args))
     return _run_with_s3(lambda: handler(args))
+
+
+def _run_without_s3(operation: Callable[[], int]) -> int:
+    try:
+        return operation()
+    except Exception as error:
+        print(f"memo: {error}", file=sys.stderr)
+        return 1
 
 
 def _run_with_s3(operation: Callable[[], int]) -> int:

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+repository=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$repository"
+
+python3 -m memo.daemon.install_guard "$@"
+pipx install --force .

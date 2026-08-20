@@ -8,9 +8,18 @@ Memo requires Python 3.11 or newer, Git, and access to a configured
 S3-compatible archive. Agent sandboxing additionally requires Linux and
 Bubblewrap. From a checkout of this repository:
 
+Use the repository installer. It refuses to replace Memo while recorded
+terminals are attached, stops an idle daemon, and then invokes `pipx`:
+
 ```console
-pipx install .
+./install
 ```
+
+If a disconnected terminal was left attached, inspect it with `memo status
+--active` and use `./install --force-stop` only after confirming no recorded
+shell is still running. Direct `pipx install --force .` remains possible, but
+the next Memo invocation will reject a daemon running code from before the
+upgrade and direct you to `memo daemon stop`.
 
 For development:
 
@@ -89,6 +98,18 @@ daemon's periodic automatic upload loop uses the daemon process environment.
 ## CLI guide
 
 Run `memo --help` or `memo <command> --help` for built-in help.
+
+### Manage the daemon
+
+```console
+memo daemon status
+memo daemon stop
+```
+
+Stopping refuses while terminals are attached. `memo daemon stop --force` is
+available for a terminal known to have disappeared without detaching. Daemon
+status reports `stale` when the running process loaded different source from
+the currently installed Memo command.
 
 ### Start or join a recording
 

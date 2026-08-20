@@ -14,6 +14,7 @@ from memo.daemon.protocol import ProtocolError, request
 from memo.daemon.server import TERMINAL_STALE_SECONDS, MemoDaemon
 from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore
+from memo.runtime import RUNTIME_ID
 from memo.transport.config import S3Config
 
 
@@ -49,6 +50,35 @@ def _stop(paths: StoragePaths, thread: threading.Thread) -> None:
         request(str(paths.socket), "shutdown")
     thread.join(timeout=3)
     assert not thread.is_alive()
+
+
+def test_health_identifies_loaded_runtime(tmp_path: Path) -> None:
+    paths, _, _, thread = _running(tmp_path)
+    try:
+        health = request(str(paths.socket), "health")
+        assert health["status"] == "ok"
+        assert health["runtime_id"] == RUNTIME_ID
+        assert health["version"] == "1.0.0"
+        assert isinstance(health["pid"], int)
+    finally:
+        _stop(paths, thread)
+
+
+def test_empty_exception_is_reported_by_type(tmp_path: Path, monkeypatch) -> None:
+    paths, _, daemon, thread = _running(tmp_path)
+    original_dispatch = daemon.dispatch
+
+    def dispatch(message, progress=None):
+        if message.operation == "health":
+            raise AssertionError
+        return original_dispatch(message, progress)
+
+    monkeypatch.setattr(daemon, "dispatch", dispatch)
+    try:
+        with pytest.raises(ProtocolError, match="AssertionError"):
+            request(str(paths.socket), "health")
+    finally:
+        _stop(paths, thread)
 
 
 def test_zero_terminal_recording_keeps_publishing(tmp_path: Path) -> None:

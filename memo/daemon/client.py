@@ -11,11 +11,24 @@ from pathlib import Path
 from typing import Any
 
 from ..recording.paths import StoragePaths
+from ..runtime import RUNTIME_ID
 from ..transport.config import S3Config
 from .protocol import ProtocolError, request
 
 REMOVE_ARCHIVED_TIMEOUT_SECONDS = 15 * 60
 LONG_OPERATION_TIMEOUT_SECONDS = 30 * 60
+
+
+def _compatible_health(health: dict[str, Any]) -> bool:
+    return health.get("status") == "ok" and health.get("runtime_id") == RUNTIME_ID
+
+
+def _raise_stale_daemon(health: dict[str, Any]) -> None:
+    if health.get("status") == "ok" and health.get("runtime_id") != RUNTIME_ID:
+        raise RuntimeError(
+            "memo daemon is running different code; close active Memo shells, run "
+            "`memo daemon stop`, and retry"
+        )
 
 
 def _s3_payload() -> dict[str, Any]:
@@ -29,8 +42,14 @@ def ensure_daemon(paths: StoragePaths | None = None, timeout: float = 5.0) -> No
     paths = paths or StoragePaths.discover()
     paths.ensure_storage()
     try:
-        if request(str(paths.socket), "health", timeout=0.25).get("status") == "ok":
+        health = request(str(paths.socket), "health", timeout=0.25)
+        _raise_stale_daemon(health)
+        if _compatible_health(health):
             return
+    except TimeoutError as error:
+        raise RuntimeError(
+            "memo daemon is running but not responding; inspect it with `memo daemon status`"
+        ) from error
     except (OSError, ProtocolError):
         pass
     # Anything the interpreter itself prints -- a startup failure, a traceback
@@ -48,9 +67,11 @@ def ensure_daemon(paths: StoragePaths | None = None, timeout: float = 5.0) -> No
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if request(str(paths.socket), "health", timeout=0.25).get("status") == "ok":
+            health = request(str(paths.socket), "health", timeout=0.25)
+            _raise_stale_daemon(health)
+            if _compatible_health(health):
                 return
-        except (OSError, ProtocolError):
+        except (OSError, ProtocolError, TimeoutError):
             time.sleep(0.05)
     raise RuntimeError("memo daemon did not start")
 
