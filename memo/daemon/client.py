@@ -138,6 +138,6 @@ def remove_archived(
     return request(
         str(paths.socket),
         "remove_archived",
-        {"exclude": exclude or []},
+        {"exclude": exclude or [], "s3": _s3_payload()},
         timeout=REMOVE_ARCHIVED_TIMEOUT_SECONDS,
     )

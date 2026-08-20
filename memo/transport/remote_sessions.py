@@ -572,6 +572,76 @@ def pull_session(
     return destination
 
 
+def verify_archived_session(
+    session_id: str,
+    paths: StoragePaths | None = None,
+    config: S3Config | None = None,
+    client: Any | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
+    """Read an archived generation back and confirm it is a restorable recording.
+
+    A successful push records that bytes were stored, not that those bytes
+    contain everything the steps reference. Reading the generation back and
+    validating it the way a pull would is the only way to learn that before
+    someone needs it.
+    """
+    session_id = validate_session_id(session_id)
+    config = config or S3Config.discover(required=True)
+    assert config is not None
+    remote = _store(config, client)
+    origin = _load_index(remote, config, session_id)
+    base = _session_base(config, origin, session_id)
+    step, object_key, digest, complete = _select_generation(remote, config, base, session_id)
+    paths = paths or StoragePaths.discover()
+    paths.ensure_storage()
+    object_size = remote.size(object_key)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{session_id}.verify-", dir=paths.runtime
+    ) as temporary_name:
+        temporary = Path(temporary_name)
+
+        def download_progress(completed: int, total: int, message: str) -> None:
+            if progress is None:
+                return
+            del message
+            progress(
+                int((min(completed, total) / max(total, 1)) * 90), 100, f"reading {session_id}"
+            )
+
+        body = remote.open(object_key)
+        try:
+            actual_digest = safe_extract_tar_zst_stream(
+                body,
+                temporary,
+                progress=download_progress if progress is not None else None,
+                progress_total=object_size,
+                progress_message=f"reading {session_id}",
+            )
+        finally:
+            remote.close(body)
+        if actual_digest != digest:
+            raise ValueError(f"checksum mismatch: expected {digest}, got {actual_digest}")
+        if progress is not None:
+            progress(92, 100, f"validating {session_id}")
+        manifests = SessionStore._validate_history(temporary, session_id)
+        if not manifests:
+            raise ValueError("archived generation has no published steps")
+        manifest = manifests[-1]
+        if manifest.step != step:
+            raise ValueError("archived generation does not reach the advertised step")
+    if progress is not None:
+        progress(100, 100, f"verified {session_id}")
+    return {
+        "session_id": session_id,
+        "step": step,
+        "steps": len(manifests),
+        "object": object_key,
+        "bytes": object_size,
+        "complete": complete,
+    }
+
+
 def pull_all_sessions(
     paths: StoragePaths | None = None,
     config: S3Config | None = None,

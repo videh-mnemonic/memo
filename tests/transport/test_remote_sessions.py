@@ -1160,3 +1160,54 @@ def test_origin_values_are_encoded_and_preserved_across_pull_and_repush(tmp_path
     second = FakeS3()
     push_session(pulled_store, pulled, config, second)
     assert any(key.startswith(f"{base}/completions/") for key in second.objects)
+
+
+def _strip_from_remote_package(client: FakeS3, prefix: str) -> None:
+    """Rewrite the published generation without any member under ``prefix``."""
+    completion_key = next(key for key in client.objects if "/completions/" in key)
+    generation = json.loads(client.objects[completion_key])["generation"]
+    uncompressed = zstandard.ZstdDecompressor().decompress(
+        client.objects[generation], max_output_size=64 * 1024 * 1024
+    )
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=io.BytesIO(uncompressed), mode="r:") as source:
+        with zstandard.ZstdCompressor(level=3).stream_writer(raw, closefd=False) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as target:
+                for member in source.getmembers():
+                    if member.name.startswith(prefix) and member.name != prefix:
+                        continue
+                    target.addfile(member, source.extractfile(member) if member.isfile() else None)
+    _replace_remote_package(client, raw.getvalue())
+
+
+def test_verify_accepts_a_restorable_generation(tmp_path: Path) -> None:
+    source_paths = _paths(tmp_path / "source-home")
+    source_store, session = _git_session(source_paths, tmp_path / "source")
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+    push_session(source_store, session, config, client)
+
+    result = remote_sessions.verify_archived_session(
+        session.session_id, _paths(tmp_path / "verify-home"), config, client=client
+    )
+
+    assert result["session_id"] == session.session_id
+    assert result["steps"] >= 1
+
+
+def test_verify_reports_a_generation_with_no_snapshot_content(tmp_path: Path) -> None:
+    source_paths = _paths(tmp_path / "source-home")
+    source_store, session = _git_session(source_paths, tmp_path / "source")
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+    push_session(source_store, session, config, client)
+
+    # An archive whose steps reference snapshot commits but whose object store
+    # never made it up. The bytes are intact and the checksum matches, so the
+    # push bookkeeping shows nothing wrong; only reading it back finds this.
+    _strip_from_remote_package(client, "snapshots.git/")
+
+    with pytest.raises(ValueError, match="missing snapshot commit"):
+        remote_sessions.verify_archived_session(
+            session.session_id, _paths(tmp_path / "verify-home"), config, client=client
+        )

@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -298,7 +299,7 @@ def test_remove_archived_requires_complete_fully_pushed_head(tmp_path: Path) -> 
     assert not directory.exists()
 
 
-def test_remove_archived_does_not_revalidate_old_history(tmp_path: Path, monkeypatch) -> None:
+def _archived(tmp_path: Path) -> tuple[SessionStore, Path]:
     root = tmp_path / "root"
     root.mkdir()
     store = SessionStore(_paths(tmp_path / "home"))
@@ -310,17 +311,24 @@ def test_remove_archived_does_not_revalidate_old_history(tmp_path: Path, monkeyp
     session.last_pushed_digest = "0" * 64
     session.remote_object = "remote"
     store.update_session(session)
+    return store, directory
 
-    monkeypatch.setattr(
-        store,
-        "check_integrity",
-        lambda _session_id: (_ for _ in ()).throw(
-            AssertionError("full history validation should not run")
-        ),
-    )
 
+def test_remove_archived_validates_history_before_deleting(tmp_path: Path) -> None:
+    store, directory = _archived(tmp_path)
     store.remove_archived("session")
     assert not directory.exists()
+
+
+def test_remove_archived_keeps_a_recording_whose_snapshot_is_gone(tmp_path: Path) -> None:
+    store, directory = _archived(tmp_path)
+    # What was uploaded is a copy of this tree, so a snapshot missing here is
+    # missing in the archive too. Deleting on the strength of the push record
+    # alone is how filesystem history gets lost for good.
+    shutil.rmtree(directory / "snapshots" / "0")
+    with pytest.raises(ValueError, match="missing snapshot"):
+        store.remove_archived("session")
+    assert directory.exists()
 
 
 def test_remove_archived_renames_before_recursive_removal(
@@ -432,3 +440,43 @@ def test_amend_session_serialises_concurrent_writers(tmp_path: Path) -> None:
     current = store.load_session("session")
     assert current.state == "ending"
     assert current.capture_scope == "full"
+
+
+def test_resolving_head_does_not_probe_every_stream_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _recorded_session(tmp_path, 4)
+    original = Path.is_file
+    probed: list[str] = []
+
+    def counting_is_file(self: Path) -> bool:
+        if self.name.endswith(".jsonl.gz"):
+            probed.append(self.name)
+        return original(self)
+
+    monkeypatch.setattr(Path, "is_file", counting_is_file)
+    assert store.head("session") is not None
+
+    # Resolving a step happens on every publish. Confirming the whole chunk
+    # list still exists is an archive sweep and belongs in the integrity pass.
+    assert probed == []
+
+
+def test_resolving_head_still_rejects_a_stream_short_of_a_step(tmp_path: Path) -> None:
+    store = _recorded_session(tmp_path, 4)
+    metadata = store.session_path("session") / "streams" / "terminals" / TERMINAL / "stream.json"
+    metadata.write_text(json.dumps({"highest_sequence": 1, "chunks": CHUNK_NAMES}))
+    with pytest.raises(ValueError, match="does not reach step"):
+        store.head("session")
+
+
+def test_stream_metadata_cache_notices_a_rewritten_stream(tmp_path: Path) -> None:
+    store = _recorded_session(tmp_path, 4)
+    assert store.head("session") is not None
+    metadata = store.session_path("session") / "streams" / "terminals" / TERMINAL / "stream.json"
+    # A sealed stream grows while the recording runs, so a stale parse would
+    # keep validating against a sequence the stream has long since passed.
+    metadata.write_text(json.dumps({"highest_sequence": 1, "chunks": CHUNK_NAMES}))
+    os.utime(metadata, (0, 0))
+    with pytest.raises(ValueError, match="does not reach step"):
+        store.head("session")
