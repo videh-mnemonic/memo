@@ -100,15 +100,39 @@ class GitSnapshotStore:
                     )
                     + b"\0"
                 )
-            output = self._run_bytes(
-                "--git-dir",
-                str(self.path),
-                "mktree",
-                "-z",
-                "--batch",
-                input_data=b"".join(payloads),
-            )
-            object_ids = output.decode().splitlines()
+            try:
+                output = self._run_bytes(
+                    "--git-dir",
+                    str(self.path),
+                    "mktree",
+                    "-z",
+                    "--batch",
+                    input_data=b"".join(payloads),
+                )
+                object_ids = output.decode().splitlines()
+            except GitSnapshotError:
+                # Retry a rejected batch one tree at a time. This preserves the
+                # literal, NUL-delimited names and confines the slower path to
+                # snapshots for which the fast batch operation failed. Invalid
+                # individual input still fails closed on the second attempt.
+                object_ids = []
+                for payload in payloads:
+                    entries = payload[:-1]
+                    if entries:
+                        object_id = (
+                            self._run_bytes(
+                                "--git-dir",
+                                str(self.path),
+                                "mktree",
+                                "-z",
+                                input_data=entries,
+                            )
+                            .decode()
+                            .strip()
+                        )
+                    else:
+                        object_id = self._run("--git-dir", str(self.path), "mktree").stdout.strip()
+                    object_ids.append(object_id)
             if len(object_ids) != len(at_depth):
                 raise GitSnapshotError("git snapshot operation returned an incomplete tree list")
             tree_ids.update(zip(at_depth, object_ids, strict=True))
@@ -397,15 +421,22 @@ class GitSnapshotStore:
     ) -> str:
         """Fetch one snapshot ref without changing the published snapshot ref."""
         self.initialize()
+        required = list(dict.fromkeys(required_commits))
+        available: set[str] = set()
         if source.is_file():
             fields = self._run("bundle", "list-heads", str(source), self.REF).stdout.split()
             if len(fields) != 2 or fields[1] != self.REF:
                 raise GitSnapshotError("snapshot recovery bundle is missing its published ref")
             source_ref = fields[0]
         else:
-            source_ref = self._run(
+            source_store = GitSnapshotStore(source)
+            source_ref = source_store._run(
                 "--git-dir", str(source), "rev-parse", "--verify", self.REF
             ).stdout.strip()
+            # Resolve the required commits before importing anything. This
+            # keeps all source validation together and avoids re-opening the
+            # disposable recovery repository between fetch phases.
+            available = source_store.contains_many(required)
         safe_namespace = "".join(
             character if character.isalnum() or character in {"-", "_"} else "-"
             for character in namespace
@@ -428,9 +459,7 @@ class GitSnapshotStore:
             raise GitSnapshotError(
                 f"snapshot recovery tip mismatch: expected {source_ref}, received {actual}"
             )
-        required = list(dict.fromkeys(required_commits))
         if source.is_dir():
-            available = GitSnapshotStore(source).contains_many(required)
             remaining = [
                 commit for commit in required if commit in available and not self.contains(commit)
             ]

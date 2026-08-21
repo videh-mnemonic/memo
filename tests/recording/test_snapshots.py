@@ -300,6 +300,35 @@ def test_git_snapshot_stores_ignored_filtered_and_embedded_repository_files(
     assert actual == expected
 
 
+def test_git_snapshot_retries_mktree_without_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = tmp_path / "tree"
+    nested = tree / "nested"
+    nested.mkdir(parents=True)
+    (tree / "root.txt").write_bytes(b"root bytes")
+    (nested / "child.txt").write_bytes(b"child bytes")
+    original = GitSnapshotStore._run_bytes
+    batch_attempted = False
+
+    def reject_batch(*arguments, **kwargs):
+        nonlocal batch_attempted
+        if "mktree" in arguments and "--batch" in arguments:
+            batch_attempted = True
+            raise GitSnapshotError("injected batched mktree rejection")
+        return original(*arguments, **kwargs)
+
+    monkeypatch.setattr(GitSnapshotStore, "_run_bytes", staticmethod(reject_batch))
+    repository = GitSnapshotStore(tmp_path / "snapshots.git")
+    commit = repository.commit(tree, None, "fallback")
+    restored = tmp_path / "restored"
+    repository.restore(commit, restored)
+
+    assert batch_attempted
+    assert (restored / "root.txt").read_bytes() == b"root bytes"
+    assert (restored / "nested" / "child.txt").read_bytes() == b"child bytes"
+
+
 def test_git_object_recovery_imports_required_unreachable_commit(tmp_path: Path) -> None:
     source = GitSnapshotStore(tmp_path / "source.git")
     first = tmp_path / "first"

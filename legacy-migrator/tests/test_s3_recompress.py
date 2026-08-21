@@ -829,6 +829,28 @@ def test_git_conversion_preserves_files_ignored_by_the_recorded_tree(tmp_path: P
         replacement.prepared.cleanup()
 
 
+def test_git_conversion_preserves_executable_semantics(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    executable = source_root / "snapshots" / "0" / "file.bin"
+    executable.chmod(0o700)
+    _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+    remote = S3Store(config, client)
+    source = source_for_candidate(
+        remote, config, RemoteCandidate("session", "content-addressed", "session")
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+
+    replacement = _prepare_replacement(remote, source, work)
+    try:
+        assert replacement.source.session_id == "session"
+    finally:
+        replacement.prepared.cleanup()
+
+
 def test_upgrade_recovers_manifest_commits_from_verified_older_generation(
     tmp_path: Path,
 ) -> None:

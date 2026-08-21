@@ -399,7 +399,11 @@ def snapshot_fingerprint(tree: Path) -> dict[str, tuple[int, str]]:
             continue
         with path.open("rb") as handle:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
-        result[path.relative_to(tree).as_posix()] = (path.stat().st_mode & 0o111, digest)
+        # Git records one executable bit, not distinct owner/group/other
+        # execute permissions. Canonicalize to that representable semantic so
+        # 0700 and 0755 remain executable while 0600 and 0644 remain ordinary.
+        executable = int(bool(path.stat().st_mode & 0o111))
+        result[path.relative_to(tree).as_posix()] = (executable, digest)
     return result
 
 
