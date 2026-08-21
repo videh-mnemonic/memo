@@ -80,13 +80,17 @@ prevent cleanup.
 
 The preview downloads every indexed session's selected generation into
 temporary storage, verifies its SHA-256 digest and size, converts every
-filesystem step to Git storage, creates a replacement generation, extracts it
-again, and restores every snapshot. Each restored snapshot must match an
-independent pre-conversion fingerprint of every source file's bytes and
-executable mode; non-snapshot session files must also match by path, mode, and
-digest. It does not write to S3. Sessions already in the latest format are
-skipped. Active sessions and sessions with an unselected newer generation are
-also skipped so the migrator cannot race an in-progress upload.
+filesystem step to Git storage, creates a replacement generation, and extracts
+it again. Existing Git histories are retained after validating that every step
+is present, connected, and reachable from the published head. Because Git tree
+IDs are content-addressed, repeated filesystem states are restored and
+fingerprinted once while every step manifest is still checked against its
+state. Each unique replacement state must match an independent pre-conversion
+fingerprint of every source file's bytes and executable mode; non-snapshot
+session files must also match by path, mode, and digest. It does not write to
+S3. Sessions already in the latest format are skipped. Active sessions and
+sessions with an unselected newer generation are also skipped so the migrator
+cannot race an in-progress upload.
 An interactive terminal shows the current session and phase in a progress bar
 with an estimated time remaining. The estimate becomes more stable as sessions
 complete; archive sizes and conversion costs can differ substantially.
