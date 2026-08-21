@@ -15,6 +15,7 @@ import memo_legacy_migrator.session_upgrade as session_upgrade
 import pytest
 from memo_legacy_migrator.s3_recompress import (
     RemoteCandidate,
+    _download,
     _install_replacement,
     _prepare_replacement,
     discover_remote_candidates,
@@ -329,6 +330,21 @@ def test_upgrade_session_recognizes_fully_current_bundle(tmp_path: Path) -> None
         )
 
 
+def test_streamed_current_archive_is_fully_validated_and_skipped(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source = tmp_path / "source" / "session"
+    _numeric_session(source, "session", [STEP_SCHEMA_VERSION], complete_fields=True)
+    _put_content_addressed(client, config, _tar_zst(source), step=0)
+    original = dict(client.objects)
+
+    summary = recompress_s3(config, client, dry_run=True, scratch_dir=tmp_path / "scratch")
+
+    assert summary.migrated == []
+    assert summary.skipped == [("session", "already uses the latest session and archive formats")]
+    assert client.objects == original
+
+
 def test_git_backed_upgrade_preserves_commits_and_restores_each_unique_tree_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -420,6 +436,95 @@ def test_s3_git_upgrade_verifies_each_unique_tree_once_per_archive(
     assert not summary.failed
     assert summary.migrated == ["session"]
     assert len(restored) == 6
+
+
+def test_source_archive_streams_numeric_manifests_without_extracting_them(
+    tmp_path: Path,
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [2, 2])
+    _put_content_addressed(client, config, _tar_zst(source_root), step=1)
+    remote = S3Store(config, client)
+    source = source_for_candidate(
+        remote, config, RemoteCandidate("session", "content-addressed", "session")
+    )
+    extracted = tmp_path / "work" / "session"
+    extracted.mkdir(parents=True)
+
+    _, had_bundle, history = _download(remote, source, extracted)
+
+    assert had_bundle
+    assert history is not None
+    assert history.head == 1
+    assert history.schemas == [2, 2]
+    assert list((extracted / "steps").glob("*.json")) == []
+    assert (extracted / "session.json").is_file()
+    assert (extracted / "HEAD").is_file()
+
+
+def test_streamed_history_resolves_shared_entries_regardless_of_archive_order(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "session"
+    root.mkdir()
+    entries = [SnapshotEntry("ignored", "ignored-policy", 0)]
+    digest = digest_entries(entries)
+    manifest = StepManifest(
+        "session",
+        0,
+        "now",
+        "snapshots/0",
+        [],
+        schema_version=STEP_SCHEMA_VERSION,
+        snapshot_commit="a" * 40,
+        entries_digest=digest,
+    )
+    collector = session_upgrade.NumericHistoryCollector(root, "session")
+
+    collector.add(0, json.dumps(manifest.to_stored_dict()).encode())
+    (root / "entries").mkdir()
+    (root / "entries" / f"{digest}.json").write_bytes(encode_entries(entries))
+    history = collector.finish(0)
+
+    assert history.schemas == [STEP_SCHEMA_VERSION]
+    assert history.steps[0].entries == entries
+
+
+def test_replacement_verification_streams_manifests_without_extracting_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [2, 2])
+    _put_content_addressed(client, config, _tar_zst(source_root), step=1)
+    remote = S3Store(config, client)
+    source = source_for_candidate(
+        remote, config, RemoteCandidate("session", "content-addressed", "session")
+    )
+    verify = s3_recompress._verify_replacement
+    inspected = False
+
+    def inspect(root, result, expected_preserved, session, manifests, progress=None):
+        nonlocal inspected
+        inspected = True
+        assert not (root / "session.json").exists()
+        assert not (root / "HEAD").exists()
+        assert not list((root / "steps").glob("*.json"))
+        assert not list((root / "entries").glob("*.json"))
+        assert (root / "snapshots.bundle").is_file()
+        return verify(root, result, expected_preserved, session, manifests, progress)
+
+    monkeypatch.setattr(s3_recompress, "_verify_replacement", inspect)
+    work = tmp_path / "work"
+    work.mkdir()
+    replacement = _prepare_replacement(remote, source, work)
+    replacement.prepared.cleanup()
+
+    assert inspected
 
 
 def _tar_zst(root: Path) -> bytes:

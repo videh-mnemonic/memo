@@ -14,7 +14,14 @@ from pathlib import Path
 from typing import Any
 
 from memo.recording.git_snapshots import GitSnapshotStore
-from memo.recording.metadata import DirectorySession, SessionOrigin, StepManifest
+from memo.recording.metadata import (
+    ENTRIES_SCHEMA_VERSION,
+    DirectorySession,
+    SessionOrigin,
+    SnapshotEntry,
+    StepManifest,
+    digest_entries,
+)
 from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore, validate_session_id
 from memo.transport import remote_sessions
@@ -29,6 +36,8 @@ from memo.transport.s3 import STREAM_READ_SIZE, S3Store
 from .migrate import _safe_extract_tar
 from .session_upgrade import (
     AlreadyLatest,
+    NumericHistory,
+    NumericHistoryCollector,
     UpgradeResult,
     snapshot_fingerprint,
     upgrade_session,
@@ -37,6 +46,7 @@ from .session_upgrade import (
 SIDECAR_GENERATION = re.compile(r"^(\d{8,})\.tar\.zst$")
 SIDECAR_CHECKSUM = re.compile(r"^(\d{8,})\.sha256$")
 PROGRESS_BYTES = 8 * 1024 * 1024
+STEP_MANIFEST_SIZE_LIMIT = 64 * 1024 * 1024
 ProgressCallback = Callable[[int, int, str], None]
 
 
@@ -445,7 +455,7 @@ def _download(
     source: RemoteSource,
     destination: Path,
     progress: ProgressCallback | None = None,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, NumericHistory | None]:
     expected_size = remote.size(source.object_key)
     if expected_size is None:
         raise ValueError("remote object size is unavailable")
@@ -479,6 +489,25 @@ def _download(
     if download_progress is not None:
         download_progress(downloaded_size, expected_size, "downloaded source archive")
     if source.archive_kind == "tar.zst":
+        collector = NumericHistoryCollector(destination, source.session_id)
+
+        def file_handler(name, member):
+            if name.parts[0] != "steps":
+                return None
+            if len(name.parts) != 2 or name.suffix != ".json" or not name.stem.isdigit():
+                raise ValueError(f"source contains an unexpected step file: {name.as_posix()}")
+            if member.size > STEP_MANIFEST_SIZE_LIMIT:
+                raise ValueError(f"step manifest is too large: {name.as_posix()}")
+            number = int(name.stem)
+
+            def capture(handle) -> None:
+                data = handle.read(STEP_MANIFEST_SIZE_LIMIT + 1)
+                if len(data) != member.size:
+                    raise ValueError(f"step manifest is truncated: {name.as_posix()}")
+                collector.add(number, data)
+
+            return capture
+
         with archive_path.open("rb") as archive:
             extracted_digest = safe_extract_tar_zst_stream(
                 archive,
@@ -486,17 +515,25 @@ def _download(
                 progress=_progress_range(progress, 60, 100),
                 progress_total=expected_size,
                 progress_message="extracting source archive",
+                file_handler=file_handler,
             )
         if extracted_digest != source.digest:
             raise ValueError("scratch archive changed between download and extraction")
     else:
+        collector = None
         _report(progress, 60, "extracting source archive")
         _safe_extract_tar(archive_path, destination)
         if _file_digest(archive_path) != source.digest:
             raise ValueError("scratch archive changed between download and extraction")
         _report(progress, 100, "extracted source archive")
     had_bundle = (destination / "snapshots.bundle").is_file()
-    return downloaded_size, had_bundle
+    history = None
+    if collector is not None and not collector.empty:
+        head_value = (destination / "HEAD").read_text().strip()
+        if not head_value.isdigit():
+            raise ValueError("invalid numeric HEAD step")
+        history = collector.finish(int(head_value))
+    return downloaded_size, had_bundle, history
 
 
 def _store(root: Path) -> SessionStore:
@@ -510,22 +547,132 @@ def _store(root: Path) -> SessionStore:
     )
 
 
+class ReplacementArchiveCollector:
+    """Validate replacement metadata directly from a safe archive stream."""
+
+    def __init__(self) -> None:
+        self.session: DirectorySession | None = None
+        self.head: int | None = None
+        self.manifests: dict[int, StepManifest] = {}
+        self.entries: dict[str, list[SnapshotEntry]] = {}
+
+    @staticmethod
+    def _read(handle, size: int, label: str) -> bytes:
+        if size > STEP_MANIFEST_SIZE_LIMIT:
+            raise ValueError(f"replacement {label} is too large")
+        data = handle.read(STEP_MANIFEST_SIZE_LIMIT + 1)
+        if len(data) != size:
+            raise ValueError(f"replacement {label} is truncated")
+        return data
+
+    def file_handler(self, name, member):
+        path = name.as_posix()
+        if path == "session.json":
+
+            def session(handle) -> None:
+                value = json.loads(self._read(handle, member.size, "session metadata"))
+                if not isinstance(value, dict):
+                    raise ValueError("replacement session metadata must be an object")
+                self.session = DirectorySession.from_dict(value)
+
+            return session
+        if path == "HEAD":
+
+            def head(handle) -> None:
+                value = self._read(handle, member.size, "HEAD").decode().strip()
+                if not value.isdigit():
+                    raise ValueError("replacement has an invalid HEAD")
+                self.head = int(value)
+
+            return head
+        if len(name.parts) == 2 and name.parts[0] == "entries" and name.suffix == ".json":
+            digest = name.stem
+            if not _valid_digest(digest):
+                raise ValueError("replacement has an invalid shared entry filename")
+
+            def entries(handle) -> None:
+                value = json.loads(self._read(handle, member.size, "shared entry list"))
+                if (
+                    not isinstance(value, dict)
+                    or value.get("schema_version") != ENTRIES_SCHEMA_VERSION
+                ):
+                    raise ValueError("replacement has an invalid shared entry list")
+                raw_entries = value.get("entries")
+                if not isinstance(raw_entries, list) or not all(
+                    isinstance(item, dict) for item in raw_entries
+                ):
+                    raise ValueError("replacement has an invalid shared entry list")
+                parsed = [SnapshotEntry.from_dict(item) for item in raw_entries]
+                if digest_entries(parsed) != digest:
+                    raise ValueError("replacement shared entry digest does not match its filename")
+                self.entries[digest] = parsed
+
+            return entries
+        if name.parts[0] == "entries":
+            raise ValueError(f"replacement contains an unexpected entry file: {path}")
+        if len(name.parts) == 2 and name.parts[0] == "steps" and name.suffix == ".json":
+            if not name.stem.isdigit():
+                raise ValueError(f"replacement contains an unexpected step file: {path}")
+            number = int(name.stem)
+
+            def manifest(handle) -> None:
+                if number in self.manifests:
+                    raise ValueError(f"replacement has duplicate numeric step: {number}")
+                value = json.loads(self._read(handle, member.size, "step manifest"))
+                if not isinstance(value, dict):
+                    raise ValueError("replacement step manifest must be an object")
+                parsed = StepManifest.from_dict(value)
+                if parsed.step != number:
+                    raise ValueError("replacement step identity does not match its filename")
+                self.manifests[number] = parsed
+
+            return manifest
+        if name.parts[0] == "steps":
+            raise ValueError(f"replacement contains an unexpected step file: {path}")
+        if name.parts[0] in {"checkpoints", "snapshots", "snapshots.git"}:
+            raise ValueError(f"replacement contains unexpected snapshot data: {path}")
+        return None
+
+    def finish(self) -> tuple[DirectorySession, list[StepManifest]]:
+        if self.session is None or self.head is None:
+            raise ValueError("replacement is missing session metadata or HEAD")
+        numbers = sorted(self.manifests)
+        if numbers != list(range(self.head + 1)):
+            raise ValueError("replacement step history is not contiguous through HEAD")
+        manifests = [self.manifests[number] for number in numbers]
+        for manifest in manifests:
+            if manifest.session_id != self.session.session_id:
+                raise ValueError("replacement step belongs to another session")
+            if manifest.entries:
+                raise ValueError("replacement step contains inline shared entries")
+            digest = manifest.entries_digest
+            if not digest or digest not in self.entries:
+                raise ValueError("replacement step references a missing shared entry list")
+            manifest.entries = self.entries[digest]
+            manifest.validate()
+        if set(self.entries) != {manifest.entries_digest for manifest in manifests}:
+            raise ValueError("replacement contains an unreferenced shared entry list")
+        return self.session, manifests
+
+
 def _verify_replacement(
     root: Path,
     result: UpgradeResult,
     expected_preserved: dict[str, tuple[int, str]],
+    session: DirectorySession,
+    manifests: list[StepManifest],
     progress: ProgressCallback | None = None,
 ) -> None:
     _report(progress, 0, "checking replacement metadata")
-    remote_sessions._restore_snapshot_bundle(root, result.session.session_id)
-    session = DirectorySession.load(root / "session.json")
     if session != result.session:
         raise ValueError("replacement session metadata does not match the upgrade")
-    manifests = _store(root).steps(session.session_id)
-    repository = GitSnapshotStore(root / "snapshots.git")
     commits = [manifest.snapshot_commit or "" for manifest in manifests]
     if any(not commit for commit in commits):
         raise ValueError("replacement contains a step without a snapshot commit")
+    bundle = root / "snapshots.bundle"
+    repository = GitSnapshotStore(root / "snapshots.git")
+    repository.import_bundle(bundle, commits[-1])
+    bundle.unlink()
     trees_by_commit = repository.tree_ids(commits)
     if len(trees_by_commit) != len(set(commits)):
         raise ValueError("replacement contains a missing or invalid snapshot commit")
@@ -538,6 +685,15 @@ def _verify_replacement(
         raise ValueError("replacement filesystem content does not match the source")
     if [manifest.entries for manifest in manifests] != result.entries:
         raise ValueError("replacement snapshot metadata does not match the source")
+    high_water: dict[str, int] = {}
+    run_ids: dict[str, None] = {}
+    for manifest in manifests:
+        for terminal_id, sequence in manifest.stream_high_water.items():
+            high_water[terminal_id] = max(sequence, high_water.get(terminal_id, 0))
+        for run_id in manifest.agent_runs:
+            run_ids.setdefault(run_id, None)
+    SessionStore._validate_streams(root, high_water, chunks=True)
+    SessionStore._validate_agent_runs(root, run_ids)
     if set(trees) != set(result.snapshots_by_tree):
         raise ValueError("replacement unique filesystem states do not match the source")
     representatives: dict[str, StepManifest] = {}
@@ -547,7 +703,7 @@ def _verify_replacement(
     for index, (tree_id, manifest) in enumerate(representatives.items(), start=1):
         with tempfile.TemporaryDirectory(prefix="verify-snapshot-", dir=root.parent) as name:
             restored = Path(name) / "tree"
-            _store(root).restore_manifest(session.session_id, manifest, restored)
+            repository.restore(manifest.snapshot_commit or "", restored)
             if snapshot_fingerprint(restored) != result.snapshots_by_tree[tree_id]:
                 raise ValueError("replacement filesystem bytes do not match the source")
         if progress is not None:
@@ -575,7 +731,7 @@ def _prepare_replacement(
 ) -> Replacement:
     extracted = work / source.session_id
     extracted.mkdir()
-    original_size, had_bundle = _download(
+    original_size, had_bundle, numeric_history = _download(
         remote,
         source,
         extracted,
@@ -593,6 +749,7 @@ def _prepare_replacement(
         expected_step=source.step,
         remote_complete=source.completion_key is not None,
         progress=_progress_range(progress, 50, 75),
+        numeric_history=numeric_history,
     )
     prepared = prepare_generation(
         _store(extracted),
@@ -602,20 +759,25 @@ def _prepare_replacement(
     try:
         verified = work / "verified" / source.session_id
         verified.mkdir(parents=True)
+        replacement_archive = ReplacementArchiveCollector()
         with prepared.path.open("rb") as archive:
             digest = safe_extract_tar_zst_stream(
                 archive,
                 verified,
                 progress=_progress_range(progress, 82, 88),
                 progress_total=prepared.size_bytes,
-                progress_message="extracting prepared replacement",
+                progress_message="scanning prepared replacement",
+                file_handler=replacement_archive.file_handler,
             )
         if digest != prepared.digest:
             raise ValueError("locally prepared replacement checksum mismatch")
+        replacement_session, replacement_manifests = replacement_archive.finish()
         _verify_replacement(
             verified,
             result,
             expected_preserved,
+            replacement_session,
+            replacement_manifests,
             progress=_progress_range(progress, 88, 100),
         )
         _report(progress, 100, "replacement verified locally")

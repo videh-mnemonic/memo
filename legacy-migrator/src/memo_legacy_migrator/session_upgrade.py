@@ -50,6 +50,13 @@ class UpgradeResult:
     snapshots_by_tree: dict[str, dict[str, tuple[int, str]]]
 
 
+@dataclass(frozen=True)
+class NumericHistory:
+    steps: list[SourceStep]
+    schemas: list[int]
+    head: int
+
+
 ProgressCallback = Callable[[int, int, str], None]
 
 
@@ -204,55 +211,162 @@ def _numeric_steps(
         (path for path in (root / "steps").glob("*.json") if path.stem.isdigit()),
         key=lambda path: int(path.stem),
     )
-    numbered = [path for path in numbered if int(path.stem) <= head]
-    if not numbered or int(numbered[-1].stem) != head:
-        raise ValueError("step HEAD is missing")
-    numbers = [int(path.stem) for path in numbered]
-    if numbers != list(range(head + 1)) and len(numbers) != 1:
-        raise ValueError("step history is neither complete nor a single-generation archive")
-    result = []
-    schemas = []
-    previous_raw_entries: object = None
-    previous_entries: list[SnapshotEntry] | None = None
-    shared_entries: dict[str, list[SnapshotEntry]] = {}
-    total = len(numbered)
-    for index, path in enumerate(numbered, start=1):
-        value = _read_object(path, "step manifest")
+    collector = NumericHistoryCollector(root, session_id)
+    for path in numbered:
+        collector.add(int(path.stem), path.read_bytes())
+    history = collector.finish(head, progress=progress)
+    return history.steps, history.schemas, history.head
+
+
+class NumericHistoryCollector:
+    """Parse numeric step manifests without requiring them to remain on disk."""
+
+    def __init__(self, root: Path, session_id: str) -> None:
+        self.root = root
+        self.session_id = session_id
+        self._steps: dict[int, SourceStep] = {}
+        self._schemas: dict[int, int] = {}
+        self._pending: dict[int, StepManifest] = {}
+        self._previous_raw_entries: object = None
+        self._previous_entries: list[SnapshotEntry] | None = None
+        self._shared_entries: dict[str, list[SnapshotEntry]] = {}
+        self._inline_entries: dict[tuple[SnapshotEntry, ...], list[SnapshotEntry]] = {}
+
+    @property
+    def empty(self) -> bool:
+        return not self._steps and not self._pending
+
+    def add(self, number: int, data: bytes) -> int:
+        if number in self._steps or number in self._pending:
+            raise ValueError(f"duplicate numeric step: {number}")
+        value = json.loads(data)
+        if not isinstance(value, dict):
+            raise ValueError("step manifest must be a JSON object")
         raw_entries = value.get("entries", [])
-        if raw_entries and raw_entries == previous_raw_entries and previous_entries is not None:
+        if (
+            raw_entries
+            and raw_entries == self._previous_raw_entries
+            and self._previous_entries is not None
+        ):
             value["entries"] = []
             manifest = StepManifest.from_dict(value)
-            manifest.entries = previous_entries
+            manifest.entries = self._previous_entries
         else:
             manifest = StepManifest.from_dict(value)
             if manifest.entries_digest and not manifest.entries:
-                entries_path = entries_directory(root) / f"{manifest.entries_digest}.json"
+                entries_path = entries_directory(self.root) / f"{manifest.entries_digest}.json"
                 if not entries_path.is_file():
-                    raise ValueError("step references a missing shared entry list")
-                cached = shared_entries.get(manifest.entries_digest)
+                    if manifest.session_id != self.session_id or manifest.step != number:
+                        raise ValueError("step identity does not match its filename")
+                    self._pending[number] = manifest
+                    self._schemas[number] = manifest.schema_version
+                    return manifest.schema_version
+                cached = self._shared_entries.get(manifest.entries_digest)
                 if cached is None:
                     cached = list(read_entries(str(entries_path)))
-                    shared_entries[manifest.entries_digest] = cached
+                    if digest_entries(cached) != manifest.entries_digest:
+                        raise ValueError("shared entry list digest does not match its filename")
+                    self._shared_entries[manifest.entries_digest] = cached
                 manifest.entries = cached
                 manifest.validate()
-            previous_raw_entries = raw_entries
-            previous_entries = manifest.entries
-        if manifest.session_id != session_id or manifest.step != int(path.stem):
+            elif manifest.entries:
+                key = tuple(manifest.entries)
+                manifest.entries = self._inline_entries.setdefault(key, manifest.entries)
+            self._previous_raw_entries = raw_entries
+            self._previous_entries = manifest.entries
+        if manifest.session_id != self.session_id or manifest.step != number:
             raise ValueError("step identity does not match its filename")
-        result.append(
-            SourceStep(
+        self._steps[number] = SourceStep(
+            manifest.created_utc,
+            None if manifest.snapshot_commit else self.root / manifest.snapshot,
+            manifest.snapshot_commit,
+            manifest.entries,
+            dict(manifest.stream_high_water),
+            list(manifest.agent_runs),
+        )
+        self._schemas[number] = manifest.schema_version
+        return manifest.schema_version
+
+    def finish(self, head: int, progress: ProgressCallback | None = None) -> NumericHistory:
+        for number, manifest in self._pending.items():
+            if manifest.session_id != self.session_id or manifest.step != number:
+                raise ValueError("step identity does not match its filename")
+            digest = manifest.entries_digest
+            if digest is None:
+                raise ValueError("pending step has no shared entry digest")
+            entries_path = entries_directory(self.root) / f"{digest}.json"
+            if not entries_path.is_file():
+                raise ValueError("step references a missing shared entry list")
+            cached = self._shared_entries.get(digest)
+            if cached is None:
+                cached = list(read_entries(str(entries_path)))
+                if digest_entries(cached) != digest:
+                    raise ValueError("shared entry list digest does not match its filename")
+                self._shared_entries[digest] = cached
+            manifest.entries = cached
+            manifest.validate()
+            self._steps[number] = SourceStep(
                 manifest.created_utc,
-                None if manifest.snapshot_commit else root / manifest.snapshot,
+                None if manifest.snapshot_commit else self.root / manifest.snapshot,
                 manifest.snapshot_commit,
                 manifest.entries,
                 dict(manifest.stream_high_water),
                 list(manifest.agent_runs),
             )
-        )
-        schemas.append(manifest.schema_version)
-        if index == total or index % 256 == 0:
-            _report(progress, index, total, f"parsed manifest {index}/{total}")
-    return result, schemas, head
+        self._pending.clear()
+        all_numbers = sorted(self._steps)
+        if any(number > head for number in all_numbers):
+            raise ValueError("step history contains data beyond HEAD")
+        numbers = [number for number in all_numbers if number <= head]
+        if not numbers or numbers[-1] != head:
+            raise ValueError("step HEAD is missing")
+        if numbers != list(range(head + 1)) and len(numbers) != 1:
+            raise ValueError("step history is neither complete nor a single-generation archive")
+        result = []
+        schemas = []
+        total = len(numbers)
+        for index, number in enumerate(numbers, start=1):
+            result.append(self._steps[number])
+            schemas.append(self._schemas[number])
+            if index == total or index % 256 == 0:
+                _report(progress, index, total, f"parsed manifest {index}/{total}")
+        return NumericHistory(result, schemas, head)
+
+
+def _validate_current_history(root: Path, source_steps: list[SourceStep]) -> None:
+    repository = GitSnapshotStore(root / "snapshots.git")
+    commits = [step.source_commit or "" for step in source_steps]
+    if any(not commit for commit in commits):
+        raise ValueError("current history contains a step without a snapshot commit")
+    if repository.contains_many(commits) != set(commits):
+        raise ValueError("current history references a missing snapshot commit")
+    final_commit = commits[-1]
+    if not set(commits).issubset(repository.reachable_from(final_commit)):
+        raise ValueError("current history contains commits outside its published history")
+    repository.check_connectivity(final_commit)
+    high_water: dict[str, int] = {}
+    run_ids: dict[str, None] = {}
+    for source in source_steps:
+        for terminal_id, sequence in source.stream_high_water.items():
+            high_water[terminal_id] = max(sequence, high_water.get(terminal_id, 0))
+        for run_id in source.agent_runs:
+            run_ids.setdefault(run_id, None)
+    SessionStore._validate_streams(root, high_water, chunks=True)
+    SessionStore._validate_agent_runs(root, run_ids)
+    repository.pin(final_commit)
+
+
+def _restore_streamed_bundle(root: Path, session_id: str, history: NumericHistory) -> None:
+    bundle = root / "snapshots.bundle"
+    if not bundle.is_file():
+        raise ValueError("snapshot bundle is missing")
+    if (root / "snapshots.git").exists():
+        raise ValueError("archive contains both snapshot bundle and repository")
+    commit = history.steps[-1].source_commit
+    if not commit:
+        raise ValueError("snapshot bundle archive has invalid HEAD manifest")
+    GitSnapshotStore(root / "snapshots.git").import_bundle(bundle, commit)
+    bundle.unlink()
 
 
 def _validate_entry_files(step: SourceStep, tree: Path) -> None:
@@ -568,6 +682,7 @@ def upgrade_session(
     expected_step: int | None = None,
     remote_complete: bool = False,
     progress: ProgressCallback | None = None,
+    numeric_history: NumericHistory | None = None,
 ) -> UpgradeResult:
     """Upgrade an extracted session and return its verified semantic state."""
     session_id = validate_session_id(session_id)
@@ -577,17 +692,28 @@ def upgrade_session(
         raise ValueError(f"unsupported directory session version: {format_version}")
 
     if archive_had_bundle:
-        remote_sessions._restore_snapshot_bundle(root, session_id)
+        if numeric_history is None:
+            remote_sessions._restore_snapshot_bundle(root, session_id)
+        else:
+            _restore_streamed_bundle(root, session_id, numeric_history)
 
     if format_version == 1:
+        if numeric_history is not None:
+            raise ValueError("checkpoint session unexpectedly contains numeric history")
         source_steps, source_head = _checkpoint_steps(root, session_id)
         source_format = "directory-v1-checkpoints"
     else:
-        source_steps, schemas, source_head = _numeric_steps(
-            root,
-            session_id,
-            progress=_progress_range(progress, 0, 20),
-        )
+        if numeric_history is None:
+            source_steps, schemas, source_head = _numeric_steps(
+                root,
+                session_id,
+                progress=_progress_range(progress, 0, 20),
+            )
+        else:
+            source_steps = numeric_history.steps
+            schemas = numeric_history.schemas
+            source_head = numeric_history.head
+            _report(progress, 20, 100, f"validated {len(source_steps)} streamed manifests")
 
     if expected_step is not None and source_head != expected_step:
         raise ValueError(
@@ -612,9 +738,9 @@ def upgrade_session(
             and raw_session.get("state") == "complete"
         ):
             session = DirectorySession.from_dict(raw_session)
-            manifests = _store(root).steps(session_id)
-            if not manifests:
-                raise ValueError("session has no published steps")
+            if session.session_id != session_id:
+                raise ValueError("session metadata does not match its remote identity")
+            _validate_current_history(root, source_steps)
             raise AlreadyLatest("already uses the latest session and archive formats")
 
     session = _session(

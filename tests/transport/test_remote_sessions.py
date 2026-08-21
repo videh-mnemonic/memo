@@ -1068,6 +1068,46 @@ def _directory(name: str) -> tuple[tarfile.TarInfo, None]:
     return info, None
 
 
+def test_safe_stream_extraction_can_intercept_validated_regular_files(tmp_path: Path) -> None:
+    package = _tar_zst([_regular("captured.json", b"captured"), _regular("kept.txt", b"kept")])
+    captured: list[bytes] = []
+
+    def select(name, _member):
+        if name.as_posix() != "captured.json":
+            return None
+
+        def consume(handle) -> None:
+            captured.append(handle.read())
+
+        return consume
+
+    digest = safe_extract_tar_zst_stream(
+        io.BytesIO(package), tmp_path / "extracted", file_handler=select
+    )
+
+    assert digest == hashlib.sha256(package).hexdigest()
+    assert captured == [b"captured"]
+    assert not (tmp_path / "extracted" / "captured.json").exists()
+    assert (tmp_path / "extracted" / "kept.txt").read_bytes() == b"kept"
+
+
+def test_safe_stream_extraction_rejects_path_before_selecting_handler(tmp_path: Path) -> None:
+    selected: list[str] = []
+
+    def select(name, _member):
+        selected.append(name.as_posix())
+        return lambda handle: handle.read()
+
+    with pytest.raises(ValueError, match="unsafe archive path"):
+        safe_extract_tar_zst_stream(
+            io.BytesIO(_tar_zst([_regular("../escape")])),
+            tmp_path / "extracted",
+            file_handler=select,
+        )
+
+    assert selected == []
+
+
 @pytest.mark.parametrize(
     ("members", "message"),
     [

@@ -79,9 +79,13 @@ copies inside it. As with any process, SIGKILL or a machine power loss can
 prevent cleanup.
 
 The preview downloads every indexed session's selected generation into
-temporary storage, verifies its SHA-256 digest and size, converts every
-filesystem step to Git storage, creates a replacement generation, and extracts
-it again. Existing Git histories are retained after validating that every step
+temporary storage and verifies its SHA-256 digest and size. Large numeric step
+histories are validated and parsed directly from the safely checked archive
+stream instead of first materializing every manifest as a scratch file; all
+other session data still passes through the normal safe extraction path. The
+upgrader converts every filesystem step to Git storage, creates a replacement
+generation, then safely scans that archive again without materializing its
+manifests. Existing Git histories are retained after validating that every step
 is present, connected, and reachable from the published head. Because Git tree
 IDs are content-addressed, repeated filesystem states are restored and
 fingerprinted once while every step manifest is still checked against its
