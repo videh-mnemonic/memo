@@ -162,6 +162,7 @@ def safe_extract_tar_zst_stream(
     )
     decompressor = zstandard.ZstdDecompressor()
     shapes: dict[tuple[str, ...], str] = {}
+    paths_with_descendants: set[tuple[str, ...]] = set()
     with decompressor.stream_reader(hashing, closefd=False) as decompressed:
         with tarfile.open(fileobj=decompressed, mode="r|") as archive:
             for member in archive:
@@ -184,9 +185,7 @@ def safe_extract_tar_zst_stream(
                 for index in range(1, len(key)):
                     if shapes.get(key[:index]) == "file":
                         raise ValueError(f"archive path conflict: {member.name}")
-                if member.isfile() and any(
-                    existing[: len(key)] == key for existing in shapes if len(existing) > len(key)
-                ):
+                if member.isfile() and key in paths_with_descendants:
                     raise ValueError(f"archive path conflict: {member.name}")
                 try:
                     destination = root.joinpath(*parts)
@@ -194,6 +193,7 @@ def safe_extract_tar_zst_stream(
                 except ValueError as error:
                     raise ValueError(f"archive path escapes destination: {member.name}") from error
                 shapes[key] = "file" if member.isfile() else "directory"
+                paths_with_descendants.update(key[:index] for index in range(1, len(key)))
                 handler = file_handler(name, member) if file_handler and member.isfile() else None
                 if handler is not None:
                     extracted = archive.extractfile(member)
