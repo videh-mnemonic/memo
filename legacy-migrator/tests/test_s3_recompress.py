@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import memo_legacy_migrator.s3_recompress as s3_recompress
 import memo_legacy_migrator.session_upgrade as session_upgrade
 import pytest
+import zstandard
 from memo_legacy_migrator.s3_recompress import (
     RemoteCandidate,
     _download,
@@ -545,6 +546,15 @@ def _tar_zst(root: Path) -> bytes:
         prepared.cleanup()
 
 
+def _unchecked_tar_zst(root: Path) -> bytes:
+    """Build a historical archive fixture without current-store validation."""
+    tar_data = io.BytesIO()
+    with tarfile.open(fileobj=tar_data, mode="w") as archive:
+        for path in sorted(root.rglob("*")):
+            archive.add(path, arcname=path.relative_to(root), recursive=False)
+    return zstandard.ZstdCompressor().compress(tar_data.getvalue())
+
+
 def _tar_gz(root: Path) -> bytes:
     target = root.parent / "archive.tar.gz"
     with target.open("wb") as raw:
@@ -897,6 +907,55 @@ def test_upgrade_recovers_manifest_commits_from_verified_older_generation(
     assert summary.migrated == ["session"]
     assert client.objects == before
     assert ("get", earlier_key) in client.operations
+
+
+def test_upgrade_recovers_disconnected_commit_retained_by_older_repository(
+    tmp_path: Path,
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [3])
+    repository = GitSnapshotStore(source_root / "snapshots.git")
+    published = json.loads((source_root / "steps" / "0.json").read_text())["snapshot_commit"]
+    snapshot = source_root / "work"
+    snapshot.mkdir()
+    (snapshot / "file.bin").write_bytes(b"disconnected but retained")
+    disconnected = repository.commit(snapshot, None, "disconnected state")
+    repository._run("--git-dir", str(repository.path), "update-ref", repository.REF, published)
+    shutil.rmtree(snapshot)
+
+    earlier_archive = _unchecked_tar_zst(source_root)
+    _put_content_addressed(client, config, earlier_archive, step=0)
+    earlier_digest = hashlib.sha256(earlier_archive).hexdigest()
+    base = remote_sessions._session_base(config, ORIGIN, "session")
+    client.objects.pop(remote_sessions._completion_key(base, 0, earlier_digest))
+
+    loose_commit = repository.path / "objects" / disconnected[:2] / disconnected[2:]
+    assert loose_commit.is_file()
+    loose_commit.unlink()
+    entries: list[SnapshotEntry] = []
+    entries_digest = digest_entries(entries)
+    (source_root / "entries" / f"{entries_digest}.json").write_bytes(encode_entries(entries))
+    manifest = StepManifest(
+        "session",
+        1,
+        "time-1",
+        "snapshots/1",
+        entries,
+        schema_version=STEP_SCHEMA_VERSION,
+        snapshot_commit=disconnected,
+        entries_digest=entries_digest,
+    )
+    _json(source_root / "steps" / "1.json", manifest.to_stored_dict())
+    (source_root / "HEAD").write_text("1\n")
+    selected_archive = _unchecked_tar_zst(source_root)
+    _put_content_addressed(client, config, selected_archive, step=1)
+
+    summary = recompress_s3(config, client, dry_run=True)
+
+    assert not summary.failed, summary.failed
+    assert summary.migrated == ["session"]
 
 
 def test_requested_remote_session_must_exist() -> None:

@@ -612,9 +612,10 @@ def _recover_git_history(
     """Recover referenced objects from checksum-verified earlier generations.
 
     A generation is accepted as an object source only when it belongs to the
-    same indexed session, its archive bytes match its content-addressed digest,
-    and its own manifest names at least one of the exact commits missing from
-    the selected generation. The selected manifests remain authoritative.
+    same indexed session and its archive bytes match its content-addressed
+    digest. Only the exact commit IDs named by the selected generation are
+    imported; older manifests and disconnected objects may provide those
+    bytes, but the selected manifests remain authoritative.
     """
     remaining = set(missing)
     recovered_any = False
@@ -672,11 +673,6 @@ def _recover_git_history(
                 raise ValueError("older generation has mismatched session metadata")
             if history is None or not history.steps:
                 continue
-            mentioned = {
-                step.source_commit for step in history.steps if step.source_commit in remaining
-            }
-            if not mentioned:
-                continue
             published_commit = history.steps[-1].source_commit
             if not published_commit:
                 raise ValueError("older Git generation has no published snapshot commit")
@@ -690,11 +686,11 @@ def _recover_git_history(
             actual_tip = repository.import_objects(
                 object_source,
                 f"{generation.step}-{generation.digest[:16]}",
-                mentioned,
+                remaining,
             )
             if actual_tip != published_commit:
                 raise ValueError("older Git generation tip does not match its manifest")
-            recovered = repository.contains_many(mentioned)
+            recovered = repository.contains_many(remaining)
             remaining -= recovered
             recovered_any = recovered_any or bool(recovered)
         if progress is not None:

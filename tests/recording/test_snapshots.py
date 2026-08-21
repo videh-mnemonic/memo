@@ -329,7 +329,9 @@ def test_git_snapshot_retries_mktree_without_batch(
     assert (restored / "nested" / "child.txt").read_bytes() == b"child bytes"
 
 
-def test_git_object_recovery_imports_required_unreachable_commit(tmp_path: Path) -> None:
+def test_git_object_recovery_imports_required_unreachable_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = GitSnapshotStore(tmp_path / "source.git")
     first = tmp_path / "first"
     first.mkdir()
@@ -340,14 +342,33 @@ def test_git_object_recovery_imports_required_unreachable_commit(tmp_path: Path)
     (second / "file").write_text("published")
     published = source.commit(second, None, "published")
 
+    original = GitSnapshotStore._run
+    fetches = 0
+
+    def count_fetches(*arguments, **kwargs):
+        nonlocal fetches
+        if "fetch" in arguments:
+            fetches += 1
+        return original(*arguments, **kwargs)
+
+    monkeypatch.setattr(GitSnapshotStore, "_run", staticmethod(count_fetches))
     target = GitSnapshotStore(tmp_path / "target.git")
     assert target.import_objects(source.path, "test", [needed]) == published
     assert target.contains(needed)
+    assert fetches == 1
 
 
-def test_git_restore_handles_empty_tree(tmp_path: Path) -> None:
+def test_git_restore_handles_empty_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     tree = tmp_path / "tree"
     tree.mkdir()
+    original = GitSnapshotStore._run
+
+    def reject_inherited_mktree_stdin(*arguments, **kwargs):
+        if "mktree" in arguments:
+            raise AssertionError("mktree must receive explicit stdin")
+        return original(*arguments, **kwargs)
+
+    monkeypatch.setattr(GitSnapshotStore, "_run", staticmethod(reject_inherited_mktree_stdin))
     repository = GitSnapshotStore(tmp_path / "snapshots.git")
     commit = repository.commit(tree, None, "empty")
 

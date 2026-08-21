@@ -70,7 +70,11 @@ class GitSnapshotStore:
                 directories.setdefault(parts[:depth], [])
 
         if not directories:
-            return self._run("--git-dir", str(self.path), "mktree").stdout.strip()
+            return (
+                self._run_bytes("--git-dir", str(self.path), "mktree", input_data=b"")
+                .decode()
+                .strip()
+            )
 
         tree_ids: dict[tuple[bytes, ...], str] = {}
         for depth in range(max(map(len, directories)), -1, -1):
@@ -131,7 +135,11 @@ class GitSnapshotStore:
                             .strip()
                         )
                     else:
-                        object_id = self._run("--git-dir", str(self.path), "mktree").stdout.strip()
+                        object_id = (
+                            self._run_bytes("--git-dir", str(self.path), "mktree", input_data=b"")
+                            .decode()
+                            .strip()
+                        )
                     object_ids.append(object_id)
             if len(object_ids) != len(at_depth):
                 raise GitSnapshotError("git snapshot operation returned an incomplete tree list")
@@ -422,8 +430,11 @@ class GitSnapshotStore:
         """Fetch one snapshot ref without changing the published snapshot ref."""
         self.initialize()
         required = list(dict.fromkeys(required_commits))
-        available: set[str] = set()
-        if source.is_file():
+        source_is_bundle = source.is_file()
+        source_is_repository = source.is_dir()
+        if source_is_bundle == source_is_repository:
+            raise GitSnapshotError("snapshot recovery source is missing or ambiguous")
+        if source_is_bundle:
             fields = self._run("bundle", "list-heads", str(source), self.REF).stdout.split()
             if len(fields) != 2 or fields[1] != self.REF:
                 raise GitSnapshotError("snapshot recovery bundle is missing its published ref")
@@ -433,9 +444,6 @@ class GitSnapshotStore:
             source_ref = source_store._run(
                 "--git-dir", str(source), "rev-parse", "--verify", self.REF
             ).stdout.strip()
-            # Resolve the required commits before importing anything. This
-            # keeps all source validation together and avoids re-opening the
-            # disposable recovery repository between fetch phases.
             available = source_store.contains_many(required)
         safe_namespace = "".join(
             character if character.isalnum() or character in {"-", "_"} else "-"
@@ -443,6 +451,29 @@ class GitSnapshotStore:
         )
         recovery_root = f"refs/memo/recovery/{safe_namespace}"
         recovery_ref = f"{recovery_root}/tip"
+        source_refspec = self.REF
+        if source_is_repository:
+            # Pin every available, explicitly requested commit under one
+            # controlled namespace in the disposable source repository. A
+            # wildcard fetch then transfers the published tip and all required
+            # disconnected objects in one Git process. This avoids repeatedly
+            # reopening a temporary repository while still letting fetch and
+            # later fsck validate the imported object graph.
+            export_root = f"refs/memo/export/{safe_namespace}"
+            commands = [f"create {export_root}/tip {source_ref}\n"]
+            commands.extend(
+                f"create {export_root}/objects/{index:08d} {commit}\n"
+                for index, commit in enumerate(required)
+                if commit in available
+            )
+            source_store._run_bytes(
+                "--git-dir",
+                str(source),
+                "update-ref",
+                "--stdin",
+                input_data="".join(commands).encode(),
+            )
+            source_refspec = f"{export_root}/*"
         self._run(
             "--git-dir",
             str(self.path),
@@ -450,7 +481,9 @@ class GitSnapshotStore:
             "--quiet",
             "--no-tags",
             str(source),
-            f"{self.REF}:{recovery_ref}",
+            f"{source_refspec}:{recovery_root}/*"
+            if source_is_repository
+            else f"{self.REF}:{recovery_ref}",
         )
         actual = self._run(
             "--git-dir", str(self.path), "rev-parse", "--verify", recovery_ref
@@ -459,25 +492,6 @@ class GitSnapshotStore:
             raise GitSnapshotError(
                 f"snapshot recovery tip mismatch: expected {source_ref}, received {actual}"
             )
-        if source.is_dir():
-            remaining = [
-                commit for commit in required if commit in available and not self.contains(commit)
-            ]
-            for offset in range(0, len(remaining), 128):
-                chunk = remaining[offset : offset + 128]
-                refspecs = [
-                    f"{commit}:{recovery_root}/objects/{offset + index:08d}"
-                    for index, commit in enumerate(chunk)
-                ]
-                self._run(
-                    "--git-dir",
-                    str(self.path),
-                    "fetch",
-                    "--quiet",
-                    "--no-tags",
-                    str(source),
-                    *refspecs,
-                )
         return actual
 
     def restore(self, commit: str, destination: Path) -> None:

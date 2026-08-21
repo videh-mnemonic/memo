@@ -120,10 +120,12 @@ cannot race an in-progress upload.
 If a selected historical Git generation references commit objects omitted from
 its bundle, the preview searches older immutable generations of that same
 indexed session. It accepts objects only from an archive whose size and SHA-256
-digest match S3 metadata and whose own manifests name the exact missing commits,
-then rebuilds and independently fingerprints the complete linear history. It
-still fails rather than dropping a step when no verified generation contains
-the referenced data.
+digest match S3 metadata, and imports only the exact commit IDs named by the
+selected manifests. This also permits recovery of a disconnected object that
+an older repository retained after its own manifest moved on. It then rebuilds
+and independently fingerprints the complete linear history. It still fails
+rather than dropping a step when no verified generation contains the referenced
+data.
 An interactive terminal shows separate overall and current-session progress
 bars, each with its own estimated time remaining. The overall estimate becomes
 more stable as sessions complete; archive sizes and conversion costs can differ
