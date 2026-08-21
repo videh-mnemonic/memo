@@ -53,6 +53,20 @@ class PullSummary:
     failed: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ArchivedSession:
+    """Metadata for the generation currently selected by the remote index."""
+
+    session_id: str
+    memo_version_id: str
+    username: str
+    hostname: str
+    step: int
+    object_key: str
+    size_bytes: int
+    complete: bool
+
+
 def _store(config: S3Config, client: Any | None) -> S3Store:
     return client if isinstance(client, S3Store) else S3Store(config, client)
 
@@ -387,6 +401,44 @@ def list_archived_session_ids(
         except ValueError:
             continue
     return sorted(session_ids)
+
+
+def list_archived_sessions(
+    config: S3Config | None = None,
+    client: Any | None = None,
+    *,
+    limit: int | None = None,
+) -> list[ArchivedSession]:
+    """List selected remote generations and their objective S3 object sizes."""
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be positive")
+    config = config or S3Config.discover(required=True)
+    assert config is not None
+    remote = _store(config, client)
+    session_ids = list_archived_session_ids(config, remote)
+    if limit is not None:
+        session_ids = session_ids[:limit]
+
+    def inspect(session_id: str) -> ArchivedSession:
+        origin = _load_index(remote, config, session_id)
+        base = _session_base(config, origin, session_id)
+        step, object_key, _digest, complete = _select_generation(remote, config, base, session_id)
+        size_bytes = remote.size(object_key)
+        if size_bytes is None:
+            raise ValueError(f"remote generation size is unavailable: {session_id}")
+        return ArchivedSession(
+            session_id=session_id,
+            memo_version_id=origin["memo_version_id"],
+            username=origin["username"],
+            hostname=origin["hostname"],
+            step=step,
+            object_key=object_key,
+            size_bytes=size_bytes,
+            complete=complete,
+        )
+
+    with ThreadPoolExecutor(max_workers=MAX_PULL_WORKERS) as executor:
+        return list(executor.map(inspect, session_ids))
 
 
 def _same_origin_remote_session_ids(

@@ -29,6 +29,7 @@ from memo.transport import (
     ensure_local_session,
     inspect_archived_agent_runs,
     list_archived_session_ids,
+    list_archived_sessions,
     prepare_generation,
     pull_session,
     push_session,
@@ -513,6 +514,27 @@ def test_git_session_round_trips_through_remote_transport(tmp_path: Path) -> Non
     assert manifest.entries_digest
     assert manifest.entries == []
     assert (pulled_path / "entries" / f"{manifest.entries_digest}.json").is_file()
+
+
+def test_list_archived_sessions_reports_selected_s3_object_size(tmp_path: Path) -> None:
+    source_paths = _paths(tmp_path / "source-home")
+    source_store, session = _git_session(source_paths, tmp_path / "source")
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+    pushed = push_session(source_store, session, config, client)
+
+    archived = list_archived_sessions(config, client)
+
+    assert len(archived) == 1
+    assert archived[0].session_id == session.session_id
+    assert archived[0].step == 0
+    assert archived[0].complete
+    assert archived[0].object_key == pushed["object"]
+    assert archived[0].size_bytes == len(client.objects[str(pushed["object"])])
+    generation_gets = [
+        key for operation, key in client.operations if operation == "get" and "/generations/" in key
+    ]
+    assert generation_gets == []
 
 
 def test_pull_session_installs_at_exact_external_destination(tmp_path: Path) -> None:

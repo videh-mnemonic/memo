@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,8 +16,8 @@ from ...daemon.server import TERMINAL_STALE_SECONDS
 from ...recording.metadata import DirectorySession
 from ...recording.paths import StoragePaths
 from ...recording.store import SessionStore
+from ...transport import ArchivedSession, list_archived_sessions
 from .common import format_size as _format_size
-from .common import require_local_session
 from .common import session_size as _session_size
 
 NAME = "status"
@@ -32,28 +34,29 @@ def configure(subparsers: Any) -> None:
     command = subparsers.add_parser(NAME, help="list recordings")
     command.add_argument("session_id", nargs="?", help="show one recording")
     command.add_argument(
-        "--include-archive", action="store_true", help="include remote-only archived recordings"
+        "--archive", action="store_true", help="list only recordings indexed in S3"
     )
     command.add_argument(
         "--limit", type=_positive_int, help="maximum number of recordings to display"
     )
     command.add_argument("--active", action="store_true", help="list only active recordings")
+    command.add_argument(
+        "--json", action="store_true", dest="json_output", help="emit machine-readable JSON"
+    )
     command.set_defaults(handler=run)
 
 
 def run(args: Any) -> int:
     if args.session_id is not None:
-        if args.include_archive or args.limit is not None or args.active:
-            raise ValueError(
-                "single-session status cannot use --include-archive, --limit, or --active"
-            )
-        require_local_session(args.session_id)
+        if args.archive or args.limit is not None or args.active:
+            raise ValueError("single-session status cannot use --archive, --limit, or --active")
     print(
         render_status(
-            include_archive=args.include_archive,
+            archive_only=args.archive,
             limit=args.limit,
             session_id=args.session_id,
             active_only=args.active,
+            json_output=args.json_output,
         ),
         end="",
     )
@@ -94,33 +97,97 @@ def _age(value: str, now: datetime, *, ago: bool = False) -> str:
     return f"{result} ago" if ago else result
 
 
-def _local_row(
+def _local_record(
     store: SessionStore,
     session_path: Path,
     session: DirectorySession,
     active: dict[str, tuple[str, int]],
-    now: datetime,
-) -> tuple[str, ...]:
+) -> dict[str, object]:
     head = store.head(session.session_id)
     state, attachments = active.get(session.session_id, (session.state, 0))
     steps = 0 if head is None else head.step + 1
-    archived = (
-        "—"
-        if session.last_pushed_step is None
-        else f"{min(session.last_pushed_step + 1, steps)}/{steps}"
+    archived_steps = (
+        None if session.last_pushed_step is None else min(session.last_pushed_step + 1, steps)
     )
+    return {
+        "session_id": session.session_id,
+        "root": session.root,
+        "state": state,
+        "capture_scope": session.capture_scope,
+        "created_utc": session.created_utc,
+        "updated_utc": session.updated_utc,
+        "last_published_utc": None if head is None else head.created_utc,
+        "active_terminals": attachments,
+        "steps": steps,
+        "size_bytes": _session_size(session_path),
+        "archived_steps": archived_steps,
+    }
+
+
+def _local_row(record: dict[str, object], now: datetime) -> tuple[str, ...]:
+    steps = int(record["steps"])
+    archived_steps = record["archived_steps"]
     return (
-        session.session_id,
-        session.root,
-        state,
-        session.capture_scope,
-        _age(session.created_utc, now),
-        "—" if head is None else _age(head.created_utc, now, ago=True),
-        str(attachments),
+        str(record["session_id"]),
+        str(record["root"]),
+        str(record["state"]),
+        str(record["capture_scope"]),
+        _age(str(record["created_utc"]), now),
+        (
+            "—"
+            if record["last_published_utc"] is None
+            else _age(str(record["last_published_utc"]), now, ago=True)
+        ),
+        str(record["active_terminals"]),
         str(steps),
-        _format_size(_session_size(session_path)),
-        archived,
+        _format_size(int(record["size_bytes"])),
+        "—" if archived_steps is None else f"{archived_steps}/{steps}",
     )
+
+
+def _archive_record(session: ArchivedSession) -> dict[str, object]:
+    return {
+        "session_id": session.session_id,
+        "memo_version_id": session.memo_version_id,
+        "username": session.username,
+        "hostname": session.hostname,
+        "complete": session.complete,
+        "state": "complete" if session.complete else "active",
+        "step": session.step,
+        "steps": session.step + 1,
+        "size_bytes": session.size_bytes,
+        "object": session.object_key,
+    }
+
+
+def _archive_row(record: dict[str, object]) -> tuple[str, ...]:
+    return (
+        str(record["session_id"]),
+        str(record["username"]),
+        str(record["hostname"]),
+        str(record["memo_version_id"]),
+        str(record["state"]),
+        str(record["steps"]),
+        _format_size(int(record["size_bytes"])),
+    )
+
+
+def _render_table(rows: list[tuple[str, ...]]) -> str:
+    widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]))]
+    return (
+        "\n".join(
+            "  ".join(
+                value if index == len(row) - 1 else value.ljust(widths[index])
+                for index, value in enumerate(row)
+            )
+            for row in rows
+        )
+        + "\n"
+    )
+
+
+def _json(value: object) -> str:
+    return json.dumps(value, indent=2, sort_keys=True) + "\n"
 
 
 def _terminal_is_active(attachment: Attachment, cutoff_seen_ns: int) -> bool:
@@ -238,21 +305,78 @@ def _render_session_detail(
     return "\n".join(lines) + "\n"
 
 
+def _session_detail_record(
+    store: SessionStore,
+    session_path: Path,
+    session: DirectorySession,
+    active: dict[str, tuple[str, int]],
+    paths: StoragePaths,
+) -> dict[str, object]:
+    result = _local_record(store, session_path, session, active)
+    if paths.registry.exists():
+        with Registry(paths.registry) as registry:
+            attachments = registry.list_attachments(session.session_id)
+            launches = registry.launches(session.session_id)
+            sandbox_shells = registry.sandbox_shell_launches(session.session_id)
+            windows = registry.windows(session.session_id)
+    else:
+        attachments = []
+        launches = []
+        sandbox_shells = []
+        windows = []
+    cutoff = time.time_ns() - int(TERMINAL_STALE_SECONDS * 1_000_000_000)
+    terminals = []
+    for attachment in attachments:
+        value = asdict(attachment)
+        value["status"] = (
+            "detached"
+            if attachment.detached_utc
+            else "stale"
+            if not _terminal_is_active(attachment, cutoff)
+            else "attached"
+        )
+        terminals.append(value)
+    result.update(
+        {
+            "terminals": terminals,
+            "agent_launches": [asdict(launch) for launch in launches],
+            "capture_windows": [asdict(window) for window in windows],
+            "sandbox_shells": [asdict(launch) for launch in sandbox_shells],
+            "recorded_agent_runs": [
+                AgentRunMetadata.load(path).to_dict()
+                for path in sorted((session_path / "agents" / "runs").glob("*.json"))
+            ],
+        }
+    )
+    return result
+
+
 def render_status(
     paths: StoragePaths | None = None,
     *,
     now: datetime | None = None,
-    include_archive: bool = False,
+    archive_only: bool = False,
     limit: int | None = None,
     session_id: str | None = None,
     active_only: bool = False,
+    json_output: bool = False,
 ) -> str:
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive")
-    if session_id is not None and (include_archive or limit is not None or active_only):
-        raise ValueError("single-session status cannot use --include-archive, --limit, or --active")
-    if active_only and include_archive:
-        raise ValueError("--active cannot be combined with --include-archive")
+    if session_id is not None and (archive_only or limit is not None or active_only):
+        raise ValueError("single-session status cannot use --archive, --limit, or --active")
+    if active_only and archive_only:
+        raise ValueError("--active cannot be combined with --archive")
+    if archive_only:
+        records = [_archive_record(session) for session in list_archived_sessions(limit=limit)]
+        if json_output:
+            return _json(records)
+        if not records:
+            return "No archived sessions.\n"
+        rows = [("SESSION", "USER", "HOST", "VERSION", "STATE", "STEPS", "SIZE")]
+        rows.extend(_archive_row(record) for record in records)
+        return _render_table(rows)
+
     paths = paths or StoragePaths.discover()
     now = now or datetime.now(UTC)
     if now.tzinfo is None:
@@ -290,43 +414,23 @@ def render_status(
     store = SessionStore(paths)
     if session_id is not None:
         session_path, session = store.find(session_id)
+        if json_output:
+            return _json(_session_detail_record(store, session_path, session, active, paths))
         return _render_session_detail(store, session_path, session, active, now, paths)
-    else:
-        all_local_sessions = store.list_sessions()
-        if active_only:
-            active_ids = set(active)
-            all_local_sessions = [
-                item for item in all_local_sessions if item[1].session_id in active_ids
-            ]
-        local_ids = {session.session_id for _, session in all_local_sessions}
-        local_sessions = all_local_sessions[:limit]
-    rows.extend(
-        _local_row(store, session_path, session, active, now)
-        for session_path, session in local_sessions
-    )
-    remaining = None if limit is None else limit - len(local_sessions)
-    if include_archive and (remaining is None or remaining > 0):
-        from ...transport import list_archived_session_ids
-
-        archived_ids = [
-            session_id for session_id in list_archived_session_ids() if session_id not in local_ids
+    all_local_sessions = store.list_sessions()
+    if active_only:
+        active_ids = set(active)
+        all_local_sessions = [
+            item for item in all_local_sessions if item[1].session_id in active_ids
         ]
-        if remaining is not None:
-            archived_ids = archived_ids[:remaining]
-        rows.extend(
-            (session_id, "—", "archived", "—", "—", "—", "—", "—", "—", "yes")
-            for session_id in archived_ids
-        )
+    local_sessions = all_local_sessions[:limit]
+    records = [
+        _local_record(store, session_path, session, active)
+        for session_path, session in local_sessions
+    ]
+    if json_output:
+        return _json(records)
+    rows.extend(_local_row(record, now) for record in records)
     if len(rows) == 1:
         return "No sessions.\n"
-    widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]))]
-    return (
-        "\n".join(
-            "  ".join(
-                value if index == len(row) - 1 else value.ljust(widths[index])
-                for index, value in enumerate(row)
-            )
-            for row in rows
-        )
-        + "\n"
-    )
+    return _render_table(rows)

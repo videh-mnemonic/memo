@@ -216,15 +216,23 @@ filesystem and environment access.
 ### List recordings
 
 ```console
-memo status [SESSION_ID] [--include-archive] [--limit N]
+memo status [--limit N] [--active] [--json]
+memo status SESSION_ID [--json]
+memo status --archive [--limit N] [--json]
 ```
 
-- `SESSION_ID`: show one recording; pulls it from S3 if needed.
-- `--include-archive`: include remote-only recordings in the list.
+- `SESSION_ID`: show one local recording. Status never pulls a recording from S3.
+- `--archive`: list only recordings indexed in S3. Sizes are the selected
+  generation's compressed object sizes reported by S3; recording bodies are not
+  downloaded.
 - `--limit N`: limit the total number of listed recordings.
 - `--active`: list only recordings that are still active.
+- `--json`: emit machine-readable JSON with numeric byte sizes instead of a
+  terminal-formatted table or detail view.
 
-`--include-archive`, `--limit`, and `--active` cannot be used with `SESSION_ID`.
+`--archive`, `--limit`, and `--active` cannot be used with `SESSION_ID`.
+`--archive` cannot be combined with `--active`. The S3 archive index is shared,
+so archive status includes recordings pushed by every configured user and host.
 Single-recording status shows lifecycle, step, terminal, archive, and agent-run
 details.
 
@@ -380,7 +388,7 @@ To import existing native agent sessions cautiously, preview before writing:
 memo import --dry-run
 memo import
 memo tidy
-memo status --include-archive
+memo status --archive
 ```
 
 ## How recording works

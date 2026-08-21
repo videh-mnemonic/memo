@@ -1,3 +1,4 @@
+import json
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,7 @@ from memo.recording.metadata import DirectorySession, SessionOrigin
 from memo.recording.paths import StoragePaths
 from memo.recording.snapshots import StepPublisher
 from memo.recording.store import SessionStore
+from memo.transport import ArchivedSession
 
 
 def _paths(tmp_path: Path) -> StoragePaths:
@@ -167,6 +169,12 @@ def test_status_can_select_one_exact_session(tmp_path: Path, monkeypatch) -> Non
     assert "Lifecycle: complete" in output
     assert "Session: one" not in output
 
+    value = json.loads(render_status(paths, session_id="two", json_output=True))
+    assert value["session_id"] == "two"
+    assert value["state"] == "complete"
+    assert value["terminals"] == []
+    assert value["recorded_agent_runs"] == []
+
 
 def test_status_can_filter_active_recordings(tmp_path: Path, monkeypatch) -> None:
     paths = _paths(tmp_path / "memo-home")
@@ -235,8 +243,11 @@ def test_single_status_rejects_list_only_options(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="--active"):
         render_status(_paths(tmp_path), session_id="session", active_only=True)
 
+    with pytest.raises(ValueError, match="--archive"):
+        render_status(archive_only=True, active_only=True)
 
-def test_status_appends_remote_only_sessions_and_applies_combined_limit(
+
+def test_archive_status_lists_only_remote_sessions_with_object_sizes(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -254,19 +265,42 @@ def test_status_appends_remote_only_sessions_and_applies_combined_limit(
             "complete",
         )
         store.create(session)
-    monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
     monkeypatch.setattr(
-        "memo.transport.list_archived_session_ids",
-        lambda: ["local-a", "remote-a", "remote-b"],
+        "memo.cli.commands.status.list_archived_sessions",
+        lambda *, limit=None: [
+            ArchivedSession(
+                "local-a",
+                "1.0.0",
+                "user",
+                "host",
+                2,
+                "generation-a",
+                1536,
+                True,
+            ),
+            ArchivedSession(
+                "remote-a",
+                "1.0.0",
+                "user",
+                "host",
+                0,
+                "generation-b",
+                2048,
+                False,
+            ),
+        ][:limit],
     )
 
-    lines = render_status(paths, include_archive=True, limit=3).splitlines()
+    lines = render_status(paths, archive_only=True, limit=2).splitlines()
 
-    assert [line.split()[0] for line in lines[1:]] == ["local-a", "local-b", "remote-a"]
-    assert "archived" in lines[-1]
+    assert lines[0].split() == ["SESSION", "USER", "HOST", "VERSION", "STATE", "STEPS", "SIZE"]
+    assert [line.split()[0] for line in lines[1:]] == ["local-a", "remote-a"]
+    assert lines[1].split()[-2:] == ["1.5", "KiB"]
+    assert lines[2].split()[-2:] == ["2", "KiB"]
+    assert "local-b" not in "\n".join(lines)
 
 
-def test_status_limit_can_be_satisfied_without_listing_archive(
+def test_local_status_does_not_list_archive(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -285,8 +319,59 @@ def test_status_limit_can_be_satisfied_without_listing_archive(
     )
     monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 0)
     monkeypatch.setattr(
-        "memo.transport.list_archived_session_ids",
+        "memo.cli.commands.status.list_archived_sessions",
         lambda: (_ for _ in ()).throw(AssertionError("archive should not be listed")),
     )
 
-    assert "local" in render_status(paths, include_archive=True, limit=1)
+    assert "local" in render_status(paths, limit=1)
+
+
+def test_status_json_uses_structured_values(tmp_path: Path, monkeypatch) -> None:
+    paths = _paths(tmp_path / "memo-home")
+    root = tmp_path / "root"
+    root.mkdir()
+    store = SessionStore(paths)
+    session = DirectorySession(
+        "local",
+        str(root.resolve()),
+        "2026-08-15T20:00:00Z",
+        "2026-08-15T20:00:00Z",
+        SessionOrigin("1.0.0", "user", "host"),
+        "complete",
+    )
+    store.create(session)
+    StepPublisher(store).publish(session)
+    monkeypatch.setattr("memo.cli.commands.status._session_size", lambda _path: 1536)
+
+    value = json.loads(render_status(paths, json_output=True))
+
+    assert value[0]["session_id"] == "local"
+    assert value[0]["size_bytes"] == 1536
+    assert value[0]["steps"] == 1
+    assert isinstance(value[0]["active_terminals"], int)
+
+
+def test_archive_status_json_includes_selected_object_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "memo.cli.commands.status.list_archived_sessions",
+        lambda *, limit=None: [
+            ArchivedSession("remote", "1.0.0", "user", "host", 4, "object", 4096, True)
+        ],
+    )
+
+    value = json.loads(render_status(archive_only=True, json_output=True))
+
+    assert value == [
+        {
+            "complete": True,
+            "hostname": "host",
+            "memo_version_id": "1.0.0",
+            "object": "object",
+            "session_id": "remote",
+            "size_bytes": 4096,
+            "state": "complete",
+            "step": 4,
+            "steps": 5,
+            "username": "user",
+        }
+    ]
