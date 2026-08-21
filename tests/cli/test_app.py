@@ -122,9 +122,20 @@ def test_public_push_and_pull_subcommands_route_results(
     assert capsys.readouterr().out == "pushed: session\n"
 
     destination = StoragePaths(tmp_path / "home").archive / "session"
-    monkeypatch.setattr(pull, "pull_session", lambda session_id, force=False: destination)
+    calls = []
+
+    def fake_pull(session_id, force=False, destination=None):
+        calls.append((session_id, force, destination))
+        return destination or StoragePaths(tmp_path / "home").archive / session_id
+
+    monkeypatch.setattr(pull, "pull_session", fake_pull)
     assert main(["pull", "session", "--force"]) == 0
     assert capsys.readouterr().out == f"pulled: session path={destination}\n"
+
+    external = tmp_path / "external-recording"
+    assert main(["pull", "session", "--destination", str(external)]) == 0
+    assert capsys.readouterr().out == f"pulled: session path={external}\n"
+    assert calls == [("session", True, None), ("session", False, external)]
 
 
 def test_pull_all_reports_each_result_and_failure(monkeypatch, capsys) -> None:
@@ -157,6 +168,19 @@ def test_pull_requires_exactly_one_target(capsys) -> None:
     with pytest.raises(SystemExit):
         parser().parse_args(["pull", "session", "--all"])
     assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_pull_destination_rejects_all(monkeypatch, tmp_path, capsys) -> None:
+    from memo.cli.commands import pull
+
+    monkeypatch.setattr(
+        pull,
+        "pull_all_sessions",
+        lambda **_kwargs: pytest.fail("bulk pull should not start"),
+    )
+
+    assert main(["pull", "--all", "--destination", str(tmp_path / "output")]) == 1
+    assert "--destination cannot be used with --all" in capsys.readouterr().err
 
 
 def test_import_dry_run_routes_to_importer(monkeypatch, capsys) -> None:

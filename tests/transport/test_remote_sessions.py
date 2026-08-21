@@ -515,6 +515,49 @@ def test_git_session_round_trips_through_remote_transport(tmp_path: Path) -> Non
     assert (pulled_path / "entries" / f"{manifest.entries_digest}.json").is_file()
 
 
+def test_pull_session_installs_at_exact_external_destination(tmp_path: Path) -> None:
+    source_paths = _paths(tmp_path / "source-home")
+    source_store, session = _git_session(source_paths, tmp_path / "source")
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+    push_session(source_store, session, config, client)
+
+    unused_paths = _paths(tmp_path / "unused-home")
+    destination = tmp_path / "external" / "chosen-name"
+    pulled_path = pull_session(
+        session.session_id,
+        unused_paths,
+        config,
+        client=client,
+        destination=destination,
+    )
+
+    assert pulled_path == destination
+    assert DirectorySession.load(destination / "session.json").session_id == session.session_id
+    assert SessionStore._validate_history(destination, session.session_id)
+    assert (destination / "snapshots.git" / "HEAD").is_file()
+    assert not unused_paths.archive.exists()
+
+
+def test_pull_session_external_destination_preserves_existing_directory(
+    tmp_path: Path,
+) -> None:
+    source_paths = _paths(tmp_path / "source-home")
+    source_store, session = _git_session(source_paths, tmp_path / "source")
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+    push_session(source_store, session, config, client)
+    destination = tmp_path / "external"
+    destination.mkdir()
+    sentinel = destination / "sentinel.txt"
+    sentinel.write_text("preserve")
+
+    with pytest.raises(FileExistsError, match="destination already exists"):
+        pull_session(session.session_id, config=config, client=client, destination=destination)
+
+    assert sentinel.read_text() == "preserve"
+
+
 def test_corrupt_git_snapshot_archive_does_not_replace_existing_session(tmp_path: Path) -> None:
     source_paths = _paths(tmp_path / "source-home")
     source_store, session = _git_session(source_paths, tmp_path / "source")

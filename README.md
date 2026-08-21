@@ -314,6 +314,7 @@ the configured S3-compatible archive.
 
 ```console
 memo pull SESSION_ID [--force]
+memo pull SESSION_ID --destination DIRECTORY [--force]
 memo pull --all [--force]
 ```
 
@@ -322,6 +323,10 @@ continue after individual failures and skip recordings that already exist locall
 
 - `--all`: pull every recording advertised by the remote archive index.
 - `--force`: replace existing local copies instead of skipping them.
+- `--destination DIRECTORY`: install one recording at that exact path instead
+  of the configured Memo archive. This is intended for external programs and
+  offline inspection. Do not use it during normal Memo operation: Memo will not
+  discover or manage a recording stored outside its configured archive.
 
 ### Import, archive, and clean up
 
