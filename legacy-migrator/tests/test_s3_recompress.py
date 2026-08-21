@@ -208,6 +208,43 @@ def _numeric_session(
     return expected
 
 
+def _repeated_git_session(
+    root: Path,
+    session_id: str,
+    *,
+    steps: int,
+    unique_trees: int,
+) -> list[str]:
+    root.mkdir(parents=True)
+    _common_directories(root)
+    _json(root / "session.json", _session_value(session_id, 2))
+    repository = GitSnapshotStore(root / "snapshots.git")
+    parent = None
+    commits = []
+    for step in range(steps):
+        snapshot = root / "work"
+        snapshot.mkdir(exist_ok=True)
+        content = f"state {step % unique_trees}".encode()
+        (snapshot / "file.bin").write_bytes(content)
+        commit = repository.commit(snapshot, parent, f"old step {step}")
+        parent = commit
+        commits.append(commit)
+        entries = [SnapshotEntry("file.bin", "file", 0o644, len(content))]
+        manifest = StepManifest(
+            session_id,
+            step,
+            f"time-{step}",
+            f"snapshots/{step}",
+            entries,
+            schema_version=2,
+            snapshot_commit=commit,
+        )
+        _json(root / "steps" / f"{step}.json", manifest.to_stored_dict())
+    shutil.rmtree(root / "work")
+    (root / "HEAD").write_text(f"{steps - 1}\n")
+    return commits
+
+
 def _assert_latest(root: Path, session_id: str, expected: list[bytes], *, boundary: bool) -> None:
     session = DirectorySession.load(root / "session.json")
     assert session.origin == ORIGIN
@@ -289,6 +326,93 @@ def test_upgrade_session_recognizes_fully_current_bundle(tmp_path: Path) -> None
             transport_is_current=True,
             archive_had_bundle=True,
         )
+
+
+def test_git_backed_upgrade_preserves_commits_and_restores_each_unique_tree_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source" / "session"
+    commits = _repeated_git_session(source, "session", steps=128, unique_trees=3)
+    restored: list[str] = []
+    restore = GitSnapshotStore.restore
+
+    def track_restore(repository, commit, destination):
+        restored.append(commit)
+        return restore(repository, commit, destination)
+
+    monkeypatch.setattr(GitSnapshotStore, "restore", track_restore)
+    progress: list[str] = []
+
+    result = upgrade_session(
+        source,
+        "session",
+        ORIGIN,
+        transport_is_current=False,
+        archive_had_bundle=False,
+        progress=lambda _completed, _total, message: progress.append(message),
+    )
+
+    manifests = SessionStore(
+        StoragePaths(
+            source.parent,
+            archive=source.parent,
+            runtime=tmp_path / "runtime",
+            spool=tmp_path / "spool",
+        )
+    ).steps("session")
+    assert [manifest.snapshot_commit for manifest in manifests] == commits
+    assert len(set(result.tree_ids)) == 3
+    assert len(restored) == 3
+    assert "fingerprinted unique tree 3/3" in progress
+
+
+def test_git_backed_upgrade_rejects_manifest_commit_outside_final_history(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source" / "session"
+    _repeated_git_session(source, "session", steps=2, unique_trees=2)
+    unrelated_tree = tmp_path / "unrelated"
+    unrelated_tree.mkdir()
+    (unrelated_tree / "file.bin").write_bytes(b"unrelated")
+    unrelated = GitSnapshotStore(source / "snapshots.git").commit(unrelated_tree, None, "unrelated")
+    manifest = StepManifest.load(source / "steps" / "1.json")
+    manifest.snapshot_commit = unrelated
+    _json(source / "steps" / "1.json", manifest.to_stored_dict())
+
+    with pytest.raises(ValueError, match="commits absent from its final bundle"):
+        upgrade_session(
+            source,
+            "session",
+            ORIGIN,
+            transport_is_current=False,
+            archive_had_bundle=False,
+        )
+
+
+def test_s3_git_upgrade_verifies_each_unique_tree_once_per_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source = tmp_path / "source" / "session"
+    _repeated_git_session(source, "session", steps=128, unique_trees=3)
+    _put_content_addressed(client, config, _tar_zst(source), step=127)
+    restored: list[str] = []
+    restore = GitSnapshotStore.restore
+
+    def track_restore(repository, commit, destination):
+        restored.append(commit)
+        return restore(repository, commit, destination)
+
+    monkeypatch.setattr(GitSnapshotStore, "restore", track_restore)
+
+    summary = recompress_s3(config, client, dry_run=True, scratch_dir=tmp_path / "scratch")
+
+    assert not summary.failed
+    assert summary.migrated == ["session"]
+    assert len(restored) == 6
 
 
 def _tar_zst(root: Path) -> bytes:

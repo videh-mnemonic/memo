@@ -120,6 +120,53 @@ class GitSnapshotStore:
                 present.add(commit)
         return present
 
+    def tree_ids(self, commits: Iterable[str]) -> dict[str, str]:
+        """Resolve many commit tree IDs in one Git process."""
+        wanted = list(dict.fromkeys(commits))
+        if not wanted or not self.path.is_dir():
+            return {}
+        result = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(self.path),
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype)",
+            ],
+            input="".join(f"{commit}^{{tree}}\n" for commit in wanted),
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode != 0:
+            return {}
+        trees: dict[str, str] = {}
+        for commit, line in zip(wanted, result.stdout.splitlines(), strict=False):
+            fields = line.split()
+            if len(fields) == 2 and fields[1] == "tree":
+                trees[commit] = fields[0]
+        return trees
+
+    def reachable_from(self, commit: str) -> set[str]:
+        """Return every commit carried by a bundle rooted at ``commit``."""
+        if not self.contains(commit):
+            return set()
+        result = self._run("--git-dir", str(self.path), "rev-list", commit)
+        return set(result.stdout.splitlines())
+
+    def check_connectivity(self, commit: str) -> None:
+        """Require the selected history to have all referenced Git objects."""
+        if not self.contains(commit):
+            raise GitSnapshotError(f"snapshot commit is missing: {commit}")
+        self._run(
+            "--git-dir",
+            str(self.path),
+            "fsck",
+            "--connectivity-only",
+            "--no-dangling",
+            commit,
+        )
+
     def pin(self, commit: str) -> None:
         """Keep the current snapshot reachable from the repository's branch ref."""
         if not self.contains(commit):

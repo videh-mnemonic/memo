@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from memo.recording.metadata import (
     digest_entries,
     encode_entries,
     entries_directory,
+    read_entries,
     snapshot_exceptions,
 )
 from memo.recording.paths import StoragePaths
@@ -45,7 +47,28 @@ class UpgradeResult:
     session: DirectorySession
     tree_ids: list[str]
     entries: list[list[SnapshotEntry]]
-    snapshots: list[dict[str, tuple[int, str]]]
+    snapshots_by_tree: dict[str, dict[str, tuple[int, str]]]
+
+
+ProgressCallback = Callable[[int, int, str], None]
+
+
+def _progress_range(
+    progress: ProgressCallback | None, start: int, end: int
+) -> ProgressCallback | None:
+    if progress is None:
+        return None
+
+    def report(completed: int, total: int, message: str) -> None:
+        fraction = max(0.0, min(completed / max(total, 1), 1.0))
+        progress(round(start + ((end - start) * fraction)), 100, message)
+
+    return report
+
+
+def _report(progress: ProgressCallback | None, completed: int, total: int, message: str) -> None:
+    if progress is not None:
+        progress(completed, total, message)
 
 
 class AlreadyLatest(ValueError):
@@ -168,7 +191,11 @@ def _checkpoint_steps(root: Path, session_id: str) -> tuple[list[SourceStep], in
     return result, head_generation
 
 
-def _numeric_steps(root: Path, session_id: str) -> tuple[list[SourceStep], list[int], int]:
+def _numeric_steps(
+    root: Path,
+    session_id: str,
+    progress: ProgressCallback | None = None,
+) -> tuple[list[SourceStep], list[int], int]:
     head_value = (root / "HEAD").read_text().strip()
     if not head_value.isdigit():
         raise ValueError("invalid numeric HEAD step")
@@ -185,8 +212,31 @@ def _numeric_steps(root: Path, session_id: str) -> tuple[list[SourceStep], list[
         raise ValueError("step history is neither complete nor a single-generation archive")
     result = []
     schemas = []
-    for path in numbered:
-        manifest = StepManifest.load(path)
+    previous_raw_entries: object = None
+    previous_entries: list[SnapshotEntry] | None = None
+    shared_entries: dict[str, list[SnapshotEntry]] = {}
+    total = len(numbered)
+    for index, path in enumerate(numbered, start=1):
+        value = _read_object(path, "step manifest")
+        raw_entries = value.get("entries", [])
+        if raw_entries and raw_entries == previous_raw_entries and previous_entries is not None:
+            value["entries"] = []
+            manifest = StepManifest.from_dict(value)
+            manifest.entries = previous_entries
+        else:
+            manifest = StepManifest.from_dict(value)
+            if manifest.entries_digest and not manifest.entries:
+                entries_path = entries_directory(root) / f"{manifest.entries_digest}.json"
+                if not entries_path.is_file():
+                    raise ValueError("step references a missing shared entry list")
+                cached = shared_entries.get(manifest.entries_digest)
+                if cached is None:
+                    cached = list(read_entries(str(entries_path)))
+                    shared_entries[manifest.entries_digest] = cached
+                manifest.entries = cached
+                manifest.validate()
+            previous_raw_entries = raw_entries
+            previous_entries = manifest.entries
         if manifest.session_id != session_id or manifest.step != int(path.stem):
             raise ValueError("step identity does not match its filename")
         result.append(
@@ -200,6 +250,8 @@ def _numeric_steps(root: Path, session_id: str) -> tuple[list[SourceStep], list[
             )
         )
         schemas.append(manifest.schema_version)
+        if index == total or index % 256 == 0:
+            _report(progress, index, total, f"parsed manifest {index}/{total}")
     return result, schemas, head
 
 
@@ -209,6 +261,18 @@ def _validate_entry_files(step: SourceStep, tree: Path) -> None:
         if candidate.is_absolute() or ".." in candidate.parts:
             raise ValueError(f"unsafe snapshot entry: {entry.path}")
         if (entry.kind == "file" or entry.retained) and not (tree / candidate).is_file():
+            raise ValueError(f"snapshot entry is missing: {entry.path}")
+
+
+def _validate_entry_fingerprint(
+    step: SourceStep,
+    fingerprint: dict[str, tuple[int, str]],
+) -> None:
+    for entry in step.entries:
+        candidate = Path(entry.path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError(f"unsafe snapshot entry: {entry.path}")
+        if (entry.kind == "file" or entry.retained) and candidate.as_posix() not in fingerprint:
             raise ValueError(f"snapshot entry is missing: {entry.path}")
 
 
@@ -232,12 +296,164 @@ def _write_entries(root: Path, entries: list[SnapshotEntry]) -> str:
     return digest
 
 
-def _rebuild_history(
-    root: Path, session_id: str, source_steps: list[SourceStep], *, add_boundary: bool
+def _manifest(
+    session_id: str,
+    step_number: int,
+    source: SourceStep,
+    commit: str,
+    entries: list[SnapshotEntry],
+    entries_digest: str | None = None,
+) -> StepManifest:
+    return StepManifest(
+        session_id,
+        step_number,
+        source.created_utc,
+        f"snapshots/{step_number}",
+        entries,
+        source.stream_high_water,
+        schema_version=STEP_SCHEMA_VERSION,
+        agent_runs=source.agent_runs,
+        snapshot_commit=commit,
+        entries_digest=entries_digest or digest_entries(entries),
+    )
+
+
+def _install_history(
+    root: Path,
+    converted: list[StepManifest],
+    compact_entries: list[list[SnapshotEntry]],
+    progress: ProgressCallback | None = None,
+) -> None:
+    shutil.rmtree(root / "steps", ignore_errors=True)
+    shutil.rmtree(root / "entries", ignore_errors=True)
+    (root / "steps").mkdir()
+    total = len(converted)
+    entry_digests: dict[int, str] = {}
+    for index, (manifest, entries) in enumerate(
+        zip(converted, compact_entries, strict=True), start=1
+    ):
+        cache_key = id(entries)
+        digest = entry_digests.get(cache_key)
+        if digest is None:
+            digest = _write_entries(root, entries)
+            entry_digests[cache_key] = digest
+        manifest.entries_digest = digest
+        atomic_write(
+            root / "steps" / f"{manifest.step}.json",
+            _json_bytes(manifest.to_stored_dict()),
+        )
+        if index == total or index % 256 == 0:
+            _report(progress, index, total, f"wrote compact manifest {index}/{total}")
+    atomic_write(root / "HEAD", f"{converted[-1].step}\n".encode())
+
+
+def _append_boundary(
+    converted: list[StepManifest],
+    trees: list[str],
+    compact_entries: list[list[SnapshotEntry]],
+) -> None:
+    head = converted[-1]
+    converted.append(replace(head, step=head.step + 1, snapshot=f"snapshots/{head.step + 1}"))
+    trees.append(trees[-1])
+    compact_entries.append(compact_entries[-1])
+
+
+def _preserve_git_history(
+    root: Path,
+    session_id: str,
+    source_steps: list[SourceStep],
+    *,
+    add_boundary: bool,
+    progress: ProgressCallback | None = None,
 ) -> tuple[
     list[str],
     list[list[SnapshotEntry]],
-    list[dict[str, tuple[int, str]]],
+    dict[str, dict[str, tuple[int, str]]],
+]:
+    """Upgrade manifests while retaining an already content-addressed Git history."""
+    repository = GitSnapshotStore(root / "snapshots.git")
+    commits = [source.source_commit or "" for source in source_steps]
+    if not commits or any(not commit for commit in commits):
+        raise ValueError("Git-backed history contains a step without a snapshot commit")
+    _report(progress, 0, 100, "validating existing Git history")
+    present = repository.contains_many(commits)
+    missing = [commit for commit in dict.fromkeys(commits) if commit not in present]
+    if missing:
+        raise ValueError(f"source Git history is missing {len(missing)} snapshot commit(s)")
+    trees_by_commit = repository.tree_ids(commits)
+    if len(trees_by_commit) != len(set(commits)):
+        raise ValueError("source Git history contains a commit without a valid tree")
+    final_commit = commits[-1]
+    reachable = repository.reachable_from(final_commit)
+    if not set(commits).issubset(reachable):
+        raise ValueError("source Git history contains commits absent from its final bundle")
+    repository.check_connectivity(final_commit)
+
+    trees = [trees_by_commit[commit] for commit in commits]
+    representatives: dict[str, tuple[str, SourceStep]] = {}
+    for tree_id, commit, source in zip(trees, commits, source_steps, strict=True):
+        representatives.setdefault(tree_id, (commit, source))
+    snapshots_by_tree: dict[str, dict[str, tuple[int, str]]] = {}
+    total_trees = len(representatives)
+    tree_progress = _progress_range(progress, 5, 70)
+    for index, (tree_id, (commit, source)) in enumerate(representatives.items(), start=1):
+        with tempfile.TemporaryDirectory(prefix="upgrade-tree-", dir=root.parent) as name:
+            tree = Path(name)
+            repository.restore(commit, tree)
+            fingerprint = snapshot_fingerprint(tree)
+        _validate_entry_fingerprint(source, fingerprint)
+        snapshots_by_tree[tree_id] = fingerprint
+        _report(
+            tree_progress, index, total_trees, f"fingerprinted unique tree {index}/{total_trees}"
+        )
+
+    converted: list[StepManifest] = []
+    compact_entries: list[list[SnapshotEntry]] = []
+    exceptions_by_entries: dict[int, list[SnapshotEntry]] = {}
+    exception_digests: dict[int, str] = {}
+    for step_number, (source, commit, tree_id) in enumerate(
+        zip(source_steps, commits, trees, strict=True)
+    ):
+        _validate_entry_fingerprint(source, snapshots_by_tree[tree_id])
+        cache_key = id(source.entries)
+        exceptions = exceptions_by_entries.get(cache_key)
+        if exceptions is None:
+            exceptions = snapshot_exceptions(source.entries)
+            exceptions_by_entries[cache_key] = exceptions
+            exception_digests[cache_key] = digest_entries(exceptions)
+        converted.append(
+            _manifest(
+                session_id,
+                step_number,
+                source,
+                commit,
+                exceptions,
+                exception_digests[cache_key],
+            )
+        )
+        compact_entries.append(exceptions)
+    if add_boundary:
+        _append_boundary(converted, trees, compact_entries)
+    _install_history(
+        root,
+        converted,
+        compact_entries,
+        progress=_progress_range(progress, 70, 100),
+    )
+    return trees, compact_entries, snapshots_by_tree
+
+
+def _rebuild_history(
+    root: Path,
+    session_id: str,
+    source_steps: list[SourceStep],
+    *,
+    add_boundary: bool,
+    progress: ProgressCallback | None = None,
+) -> tuple[
+    list[str],
+    list[list[SnapshotEntry]],
+    dict[str, dict[str, tuple[int, str]]],
 ]:
     old_repository = GitSnapshotStore(root / "snapshots.git")
     new_path = root / "snapshots.latest.git"
@@ -246,10 +462,15 @@ def _rebuild_history(
     repository = GitSnapshotStore(new_path)
     trees: list[str] = []
     compact_entries: list[list[SnapshotEntry]] = []
-    snapshots: list[dict[str, tuple[int, str]]] = []
+    snapshots_by_tree: dict[str, dict[str, tuple[int, str]]] = {}
     converted: list[StepManifest] = []
     parent: str | None = None
+    previous_tree: str | None = None
+    tree_cache: dict[tuple[tuple[str, tuple[int, str]], ...], str] = {}
+    exceptions_by_entries: dict[int, tuple[list[SnapshotEntry], str]] = {}
     try:
+        total_steps = len(source_steps)
+        conversion_progress = _progress_range(progress, 0, 75)
         for step_number, source in enumerate(source_steps):
             temporary: Path | None = None
             if source.source_commit:
@@ -263,54 +484,61 @@ def _rebuild_history(
             try:
                 _validate_entry_files(source, tree)
                 fingerprint = snapshot_fingerprint(tree)
-                tree_id = repository.write_tree(tree)
+                fingerprint_key = tuple(sorted(fingerprint.items()))
+                tree_id = tree_cache.get(fingerprint_key)
+                if tree_id is None:
+                    tree_id = repository.write_tree(tree)
+                    tree_cache[fingerprint_key] = tree_id
+                    snapshots_by_tree[tree_id] = fingerprint
             finally:
                 if temporary is not None:
                     shutil.rmtree(temporary, ignore_errors=True)
-            commit = repository.commit_tree(
-                tree_id, parent, f"Memo filesystem snapshot {step_number}"
+            if parent is not None and tree_id == previous_tree:
+                commit = parent
+            else:
+                commit = repository.commit_tree(
+                    tree_id, parent, f"Memo filesystem snapshot {step_number}"
+                )
+            cache_key = id(source.entries)
+            cached_exceptions = exceptions_by_entries.get(cache_key)
+            if cached_exceptions is None:
+                exceptions = snapshot_exceptions(source.entries)
+                cached_exceptions = (exceptions, digest_entries(exceptions))
+                exceptions_by_entries[cache_key] = cached_exceptions
+            exceptions, exceptions_digest = cached_exceptions
+            converted.append(
+                _manifest(
+                    session_id,
+                    step_number,
+                    source,
+                    commit,
+                    exceptions,
+                    exceptions_digest,
+                )
             )
-            exceptions = snapshot_exceptions(source.entries)
-            manifest = StepManifest(
-                session_id,
-                step_number,
-                source.created_utc,
-                f"snapshots/{step_number}",
-                exceptions,
-                source.stream_high_water,
-                schema_version=STEP_SCHEMA_VERSION,
-                agent_runs=source.agent_runs,
-                snapshot_commit=commit,
-                entries_digest=digest_entries(exceptions),
-            )
-            converted.append(manifest)
             trees.append(tree_id)
             compact_entries.append(exceptions)
-            snapshots.append(fingerprint)
             parent = commit
+            previous_tree = tree_id
+            if (step_number + 1) == total_steps or (step_number + 1) % 64 == 0:
+                _report(
+                    conversion_progress,
+                    step_number + 1,
+                    total_steps,
+                    f"converted snapshot {step_number + 1}/{total_steps}",
+                )
         if add_boundary:
-            head = converted[-1]
-            converted.append(
-                replace(head, step=head.step + 1, snapshot=f"snapshots/{head.step + 1}")
-            )
-            trees.append(trees[-1])
-            compact_entries.append(compact_entries[-1])
-            snapshots.append(snapshots[-1])
-
-        shutil.rmtree(root / "steps", ignore_errors=True)
-        shutil.rmtree(root / "entries", ignore_errors=True)
-        (root / "steps").mkdir()
-        for manifest, entries in zip(converted, compact_entries, strict=True):
-            manifest.entries_digest = _write_entries(root, entries)
-            atomic_write(
-                root / "steps" / f"{manifest.step}.json",
-                _json_bytes(manifest.to_stored_dict()),
-            )
-        atomic_write(root / "HEAD", f"{converted[-1].step}\n".encode())
+            _append_boundary(converted, trees, compact_entries)
+        _install_history(
+            root,
+            converted,
+            compact_entries,
+            progress=_progress_range(progress, 75, 100),
+        )
         if (root / "snapshots.git").exists():
             shutil.rmtree(root / "snapshots.git")
         os.replace(new_path, root / "snapshots.git")
-        return trees, compact_entries, snapshots
+        return trees, compact_entries, snapshots_by_tree
     except BaseException:
         shutil.rmtree(new_path, ignore_errors=True)
         raise
@@ -336,6 +564,7 @@ def upgrade_session(
     archive_had_bundle: bool,
     expected_step: int | None = None,
     remote_complete: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> UpgradeResult:
     """Upgrade an extracted session and return its verified semantic state."""
     session_id = validate_session_id(session_id)
@@ -351,7 +580,11 @@ def upgrade_session(
         source_steps, source_head = _checkpoint_steps(root, session_id)
         source_format = "directory-v1-checkpoints"
     else:
-        source_steps, schemas, source_head = _numeric_steps(root, session_id)
+        source_steps, schemas, source_head = _numeric_steps(
+            root,
+            session_id,
+            progress=_progress_range(progress, 0, 20),
+        )
 
     if expected_step is not None and source_head != expected_step:
         raise ValueError(
@@ -388,13 +621,24 @@ def upgrade_session(
         remote_complete=remote_complete,
     )
     atomic_write(root / "session.json", _json_bytes(session.to_dict()))
-    trees, entries, snapshots = _rebuild_history(
-        root,
-        session_id,
-        source_steps,
-        add_boundary=transport_is_current,
-    )
+    history_progress = _progress_range(progress, 20, 100)
+    if source_steps and all(source.source_commit for source in source_steps):
+        trees, entries, snapshots_by_tree = _preserve_git_history(
+            root,
+            session_id,
+            source_steps,
+            add_boundary=transport_is_current,
+            progress=history_progress,
+        )
+    else:
+        trees, entries, snapshots_by_tree = _rebuild_history(
+            root,
+            session_id,
+            source_steps,
+            add_boundary=transport_is_current,
+            progress=history_progress,
+        )
     manifests = _store(root).steps(session_id)
     if [manifest.entries for manifest in manifests] != entries:
         raise ValueError("upgraded entry metadata did not validate")
-    return UpgradeResult(source_format, session, trees, entries, snapshots)
+    return UpgradeResult(source_format, session, trees, entries, snapshots_by_tree)

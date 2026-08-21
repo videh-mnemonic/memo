@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from memo.recording.git_snapshots import GitSnapshotStore
-from memo.recording.metadata import DirectorySession, SessionOrigin
+from memo.recording.metadata import DirectorySession, SessionOrigin, StepManifest
 from memo.recording.paths import StoragePaths
 from memo.recording.store import SessionStore, validate_session_id
 from memo.transport import remote_sessions
@@ -420,7 +420,14 @@ def _stream_digest(
 
 def _preserved_files(root: Path) -> dict[str, tuple[int, str]]:
     result: dict[str, tuple[int, str]] = {}
-    transformed_roots = {"checkpoints", "entries", "snapshots", "snapshots.git", "steps"}
+    transformed_roots = {
+        "checkpoints",
+        "entries",
+        "snapshots",
+        "snapshots.bundle",
+        "snapshots.git",
+        "steps",
+    }
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         if (
@@ -516,22 +523,35 @@ def _verify_replacement(
         raise ValueError("replacement session metadata does not match the upgrade")
     manifests = _store(root).steps(session.session_id)
     repository = GitSnapshotStore(root / "snapshots.git")
-    trees = [repository.tree_id(manifest.snapshot_commit or "") for manifest in manifests]
+    commits = [manifest.snapshot_commit or "" for manifest in manifests]
+    if any(not commit for commit in commits):
+        raise ValueError("replacement contains a step without a snapshot commit")
+    trees_by_commit = repository.tree_ids(commits)
+    if len(trees_by_commit) != len(set(commits)):
+        raise ValueError("replacement contains a missing or invalid snapshot commit")
+    final_commit = commits[-1]
+    if not set(commits).issubset(repository.reachable_from(final_commit)):
+        raise ValueError("replacement contains commits outside its published history")
+    repository.check_connectivity(final_commit)
+    trees = [trees_by_commit[commit] for commit in commits]
     if trees != result.tree_ids:
         raise ValueError("replacement filesystem content does not match the source")
     if [manifest.entries for manifest in manifests] != result.entries:
         raise ValueError("replacement snapshot metadata does not match the source")
-    total_snapshots = max(len(manifests), 1)
-    for index, (manifest, expected_snapshot) in enumerate(
-        zip(manifests, result.snapshots, strict=True), start=1
-    ):
+    if set(trees) != set(result.snapshots_by_tree):
+        raise ValueError("replacement unique filesystem states do not match the source")
+    representatives: dict[str, StepManifest] = {}
+    for tree_id, manifest in zip(trees, manifests, strict=True):
+        representatives.setdefault(tree_id, manifest)
+    total_snapshots = max(len(representatives), 1)
+    for index, (tree_id, manifest) in enumerate(representatives.items(), start=1):
         with tempfile.TemporaryDirectory(prefix="verify-snapshot-", dir=root.parent) as name:
             restored = Path(name) / "tree"
             _store(root).restore_manifest(session.session_id, manifest, restored)
-            if snapshot_fingerprint(restored) != expected_snapshot:
+            if snapshot_fingerprint(restored) != result.snapshots_by_tree[tree_id]:
                 raise ValueError("replacement filesystem bytes do not match the source")
         if progress is not None:
-            progress(index, total_snapshots, f"verified snapshot {index}/{total_snapshots}")
+            progress(index, total_snapshots, f"verified unique tree {index}/{total_snapshots}")
     actual_preserved = _preserved_files(root)
     if actual_preserved != expected_preserved:
         missing = sorted(expected_preserved.keys() - actual_preserved.keys())
@@ -561,9 +581,9 @@ def _prepare_replacement(
         extracted,
         progress=_progress_range(progress, 0, 45),
     )
-    _report(progress, 48, "fingerprinting source data")
+    _report(progress, 48, "fingerprinting preserved session data")
     expected_preserved = _preserved_files(extracted)
-    _report(progress, 52, "upgrading session in scratch")
+    _report(progress, 50, "upgrading session in scratch")
     result = upgrade_session(
         extracted,
         source.session_id,
@@ -572,11 +592,12 @@ def _prepare_replacement(
         archive_had_bundle=had_bundle,
         expected_step=source.step,
         remote_complete=source.completion_key is not None,
+        progress=_progress_range(progress, 50, 75),
     )
     prepared = prepare_generation(
         _store(extracted),
         result.session,
-        progress=_progress_range(progress, 60, 70),
+        progress=_progress_range(progress, 75, 82),
     )
     try:
         verified = work / "verified" / source.session_id
@@ -585,7 +606,7 @@ def _prepare_replacement(
             digest = safe_extract_tar_zst_stream(
                 archive,
                 verified,
-                progress=_progress_range(progress, 70, 80),
+                progress=_progress_range(progress, 82, 88),
                 progress_total=prepared.size_bytes,
                 progress_message="extracting prepared replacement",
             )
@@ -595,7 +616,7 @@ def _prepare_replacement(
             verified,
             result,
             expected_preserved,
-            progress=_progress_range(progress, 80, 100),
+            progress=_progress_range(progress, 88, 100),
         )
         _report(progress, 100, "replacement verified locally")
         return Replacement(source, result.session, prepared, original_size, result.source_format)
