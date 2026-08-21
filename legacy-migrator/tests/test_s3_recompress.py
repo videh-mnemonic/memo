@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import memo_legacy_migrator.s3_recompress as s3_recompress
+import memo_legacy_migrator.session_upgrade as session_upgrade
 import pytest
 from memo_legacy_migrator.s3_recompress import (
     RemoteCandidate,
@@ -336,12 +337,18 @@ def test_git_backed_upgrade_preserves_commits_and_restores_each_unique_tree_once
     commits = _repeated_git_session(source, "session", steps=128, unique_trees=3)
     restored: list[str] = []
     restore = GitSnapshotStore.restore
+    atomic_write = session_upgrade.atomic_write
 
     def track_restore(repository, commit, destination):
         restored.append(commit)
         return restore(repository, commit, destination)
 
+    def reject_durable_scratch_manifest(path, data):
+        assert path.parent.name != "steps"
+        return atomic_write(path, data)
+
     monkeypatch.setattr(GitSnapshotStore, "restore", track_restore)
+    monkeypatch.setattr(session_upgrade, "atomic_write", reject_durable_scratch_manifest)
     progress: list[str] = []
 
     result = upgrade_session(
@@ -825,6 +832,7 @@ def test_progress_covers_discovery_download_and_completion(tmp_path: Path) -> No
     _numeric_session(source_root, "session", [1])
     _put_content_addressed(client, config, _tar_zst(source_root), step=0)
     updates: list[tuple[int, int, str]] = []
+    item_updates: list[tuple[int, int, str]] = []
 
     summary = recompress_s3(
         config,
@@ -832,13 +840,18 @@ def test_progress_covers_discovery_download_and_completion(tmp_path: Path) -> No
         dry_run=True,
         scratch_dir=tmp_path / "scratch",
         progress=lambda completed, total, message: updates.append((completed, total, message)),
+        item_progress=lambda completed, total, message: item_updates.append(
+            (completed, total, message)
+        ),
     )
 
     assert summary.migrated == ["session"]
     assert updates[0] == (0, 1, "discovering indexed S3 sessions")
-    assert any("downloading source archive" in message for _, _, message in updates)
+    assert any("downloading source archive" in message for _, _, message in item_updates)
+    assert all("downloading source archive" not in message for _, _, message in updates)
     assert updates[-1][0] == updates[-1][1]
-    assert "finished" in updates[-1][2]
+    assert item_updates[-1][0] == item_updates[-1][1]
+    assert "finished" in item_updates[-1][2]
 
 
 def test_interruption_removes_in_progress_scratch_data(tmp_path: Path) -> None:

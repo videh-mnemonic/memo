@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from types import FrameType
 
-from memo.cli.progress import ProgressBar
+from memo.cli.progress import ProgressPair
 
 from .migrate import migrate_legacy
 from .s3_recompress import upgrade_s3
@@ -61,11 +61,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.upgrade_s3:
             previous_handler = _stop_on_terminate()
-            with ProgressBar(show_eta=True) as bar:
+            with ProgressPair(show_eta=True) as bars:
                 summary = upgrade_s3(
                     dry_run=args.dry_run,
                     scratch_dir=args.scratch_dir,
-                    progress=bar.update if bar.enabled else None,
+                    progress=bars.update_overall if bars.enabled else None,
+                    item_progress=bars.update_current if bars.enabled else None,
                 )
         else:
             summary = migrate_legacy(legacy_dir=args.legacy_dir, dry_run=args.dry_run)

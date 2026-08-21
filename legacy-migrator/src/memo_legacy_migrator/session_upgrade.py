@@ -338,9 +338,12 @@ def _install_history(
             digest = _write_entries(root, entries)
             entry_digests[cache_key] = digest
         manifest.entries_digest = digest
-        atomic_write(
-            root / "steps" / f"{manifest.step}.json",
-            _json_bytes(manifest.to_stored_dict()),
+        # This entire extracted session is disposable scratch state. Per-file
+        # fsyncs make large histories pathologically slow and add no safety: an
+        # interrupted conversion discards the scratch directory, while a
+        # completed archive is extracted and independently verified below.
+        (root / "steps" / f"{manifest.step}.json").write_bytes(
+            _json_bytes(manifest.to_stored_dict())
         )
         if index == total or index % 256 == 0:
             _report(progress, index, total, f"wrote compact manifest {index}/{total}")

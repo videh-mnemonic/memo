@@ -756,6 +756,7 @@ def recompress_s3(
     dry_run: bool = False,
     scratch_dir: Path | None = None,
     progress: ProgressCallback | None = None,
+    item_progress: ProgressCallback | None = None,
 ) -> S3RecompressionSummary:
     """Detect and upgrade every indexed historical S3 session format."""
     config = config or S3Config.discover(required=True)
@@ -775,15 +776,17 @@ def recompress_s3(
         prepared: PreparedGeneration | None = None
 
         def session_progress(completed: int, total: int, message: str) -> None:
-            if progress is None:
-                return
             fraction = max(0.0, min(completed / max(total, 1), 1.0))
             overall = ((position - 1) * 1000) + round(fraction * 1000)
-            progress(
-                overall,
-                progress_total,
-                f"({position}/{len(candidates)}) {candidate.session_id} {message}",
-            )
+            identity = f"({position}/{len(candidates)}) {candidate.session_id}"
+            if item_progress is not None:
+                item_progress(completed, total, f"{candidate.session_id} {message}")
+            if progress is not None:
+                progress(
+                    overall,
+                    progress_total,
+                    identity if item_progress is not None else f"{identity} {message}",
+                )
 
         session_progress(0, 1, "checking eligibility")
         try:
@@ -792,7 +795,7 @@ def recompress_s3(
                 prefix=f"memo-s3-upgrade-{candidate.session_id}-",
                 dir=scratch,
             ) as work_name:
-                if progress is None:
+                if progress is None and item_progress is None:
                     replacement = _prepare_replacement(remote, source, Path(work_name))
                 else:
                     prepare_progress = (
@@ -809,7 +812,7 @@ def recompress_s3(
                 summary.original_bytes += replacement.original_size
                 summary.replacement_bytes += replacement.prepared.size_bytes
                 if not dry_run:
-                    if progress is None:
+                    if progress is None and item_progress is None:
                         _install_replacement(remote, config, replacement)
                     else:
                         _install_replacement(

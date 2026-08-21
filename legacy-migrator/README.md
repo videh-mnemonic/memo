@@ -91,9 +91,10 @@ session files must also match by path, mode, and digest. It does not write to
 S3. Sessions already in the latest format are skipped. Active sessions and
 sessions with an unselected newer generation are also skipped so the migrator
 cannot race an in-progress upload.
-An interactive terminal shows the current session and phase in a progress bar
-with an estimated time remaining. The estimate becomes more stable as sessions
-complete; archive sizes and conversion costs can differ substantially.
+An interactive terminal shows separate overall and current-session progress
+bars, each with its own estimated time remaining. The overall estimate becomes
+more stable as sessions complete; archive sizes and conversion costs can differ
+substantially.
 
 After reviewing the preview, apply the migration explicitly:
 
