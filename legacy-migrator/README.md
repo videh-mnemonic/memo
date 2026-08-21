@@ -85,6 +85,15 @@ S3 upgrades process four independent sessions concurrently by default. Use
 memo-migrate-legacy --upgrade-s3 --dry-run --workers 4
 ```
 
+Use a repeatable `--session` filter to audit or retry particular S3 sessions
+without downloading every indexed archive again:
+
+```console
+memo-migrate-legacy --upgrade-s3 --dry-run \
+  --session 030a33a509794930ba13868586c1b627 \
+  --session 1aa41616320f452c819a37307cdf1e34
+```
+
 Every worker uses a separate scratch directory and performs the complete
 download, checksum, format, conversion, equivalence, and replacement-validation
 sequence. More workers increase CPU, memory, network, and scratch-disk demand;
@@ -108,6 +117,13 @@ session files must also match by path, mode, and digest. It does not write to
 S3. Sessions already in the latest format are skipped. Active sessions and
 sessions with an unselected newer generation are also skipped so the migrator
 cannot race an in-progress upload.
+If a selected historical Git generation references commit objects omitted from
+its bundle, the preview searches older immutable generations of that same
+indexed session. It accepts objects only from an archive whose size and SHA-256
+digest match S3 metadata and whose own manifests name the exact missing commits,
+then rebuilds and independently fingerprints the complete linear history. It
+still fails rather than dropping a step when no verified generation contains
+the referenced data.
 An interactive terminal shows separate overall and current-session progress
 bars, each with its own estimated time remaining. The overall estimate becomes
 more stable as sessions complete; archive sizes and conversion costs can differ

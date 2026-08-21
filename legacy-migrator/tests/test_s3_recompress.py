@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import shutil
+import subprocess
 import tarfile
 import threading
 from dataclasses import asdict
@@ -801,7 +802,7 @@ def test_install_rolls_back_when_replacement_cannot_be_selected(
     assert all(replacement.prepared.digest not in key for key in client.objects if key != original)
 
 
-def test_independent_snapshot_check_rejects_git_omissions(tmp_path: Path) -> None:
+def test_git_conversion_preserves_files_ignored_by_the_recorded_tree(tmp_path: Path) -> None:
     config = S3Config("bucket", "prefix")
     client = FakeS3()
     source_root = tmp_path / "source" / "session"
@@ -809,6 +810,10 @@ def test_independent_snapshot_check_rejects_git_omissions(tmp_path: Path) -> Non
     snapshot = source_root / "snapshots" / "0"
     (snapshot / ".gitignore").write_text("hidden.bin\n")
     (snapshot / "hidden.bin").write_bytes(b"must not disappear")
+    nested = snapshot / "ninfer"
+    nested.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(nested)], check=True)
+    (nested / "untracked.bin").write_bytes(b"embedded repository bytes")
     _put_content_addressed(client, config, _tar_zst(source_root), step=0)
     remote = S3Store(config, client)
     source = source_for_candidate(
@@ -817,8 +822,64 @@ def test_independent_snapshot_check_rejects_git_omissions(tmp_path: Path) -> Non
     work = tmp_path / "work"
     work.mkdir()
 
-    with pytest.raises(ValueError, match="filesystem bytes do not match"):
-        _prepare_replacement(remote, source, work)
+    replacement = _prepare_replacement(remote, source, work)
+    try:
+        assert replacement.source.session_id == "session"
+    finally:
+        replacement.prepared.cleanup()
+
+
+def test_upgrade_recovers_manifest_commits_from_verified_older_generation(
+    tmp_path: Path,
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [3, 3])
+    earlier_archive = _tar_zst(source_root)
+    earlier_key = _put_content_addressed(client, config, earlier_archive, step=1)
+    earlier_digest = hashlib.sha256(earlier_archive).hexdigest()
+    base = remote_sessions._session_base(config, ORIGIN, "session")
+    client.objects.pop(remote_sessions._completion_key(base, 1, earlier_digest))
+
+    repository = GitSnapshotStore(source_root / "snapshots.git")
+    snapshot = source_root / "work"
+    snapshot.mkdir()
+    content = b"forked final state"
+    (snapshot / "file.bin").write_bytes(content)
+    final_commit = repository.commit(snapshot, None, "forked final step")
+    shutil.rmtree(snapshot)
+    entries: list[SnapshotEntry] = []
+    entries_digest = digest_entries(entries)
+    (source_root / "entries").mkdir(exist_ok=True)
+    (source_root / "entries" / f"{entries_digest}.json").write_bytes(encode_entries(entries))
+    manifest = StepManifest(
+        "session",
+        2,
+        "time-2",
+        "snapshots/2",
+        [],
+        schema_version=STEP_SCHEMA_VERSION,
+        snapshot_commit=final_commit,
+        entries_digest=entries_digest,
+    )
+    _json(source_root / "steps" / "2.json", manifest.to_stored_dict())
+    (source_root / "HEAD").write_text("2\n")
+    final_archive = _tar_zst(source_root)
+    _put_content_addressed(client, config, final_archive, step=2)
+    before = dict(client.objects)
+
+    summary = recompress_s3(config, client, dry_run=True)
+
+    assert not summary.failed, summary.failed
+    assert summary.migrated == ["session"]
+    assert client.objects == before
+    assert ("get", earlier_key) in client.operations
+
+
+def test_requested_remote_session_must_exist() -> None:
+    with pytest.raises(ValueError, match="indexed S3 session not found: absent"):
+        recompress_s3(S3Config("bucket", "prefix"), FakeS3(), dry_run=True, session_ids=["absent"])
 
 
 def test_remote_step_must_match_downloaded_archive_head(tmp_path: Path) -> None:

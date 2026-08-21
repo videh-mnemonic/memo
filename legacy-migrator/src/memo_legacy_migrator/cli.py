@@ -55,6 +55,13 @@ def parser() -> argparse.ArgumentParser:
         metavar="N",
         help="process N S3 sessions concurrently (1-8; default: 4)",
     )
+    result.add_argument(
+        "--session",
+        dest="session_ids",
+        action="append",
+        metavar="SESSION_ID",
+        help="upgrade only SESSION_ID; may be repeated and requires --upgrade-s3",
+    )
     return result
 
 
@@ -73,6 +80,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.workers is not None and not args.upgrade_s3:
         print("memo-migrate-legacy: --workers requires --upgrade-s3", file=sys.stderr)
         return 2
+    if args.session_ids is not None and not args.upgrade_s3:
+        print("memo-migrate-legacy: --session requires --upgrade-s3", file=sys.stderr)
+        return 2
     previous_handler: signal.Handlers | None = None
     try:
         if args.upgrade_s3:
@@ -82,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
                     dry_run=args.dry_run,
                     scratch_dir=args.scratch_dir,
                     workers=args.workers or 4,
+                    session_ids=args.session_ids,
                     progress=bars.update_overall if bars.enabled else None,
                     item_progress=bars.update_current if bars.enabled else None,
                 )

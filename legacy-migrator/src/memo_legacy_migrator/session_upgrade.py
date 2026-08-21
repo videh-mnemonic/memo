@@ -58,6 +58,7 @@ class NumericHistory:
 
 
 ProgressCallback = Callable[[int, int, str], None]
+GitRecoveryCallback = Callable[[Path, list[SourceStep], set[str], ProgressCallback | None], bool]
 
 
 def _progress_range(
@@ -683,6 +684,7 @@ def upgrade_session(
     remote_complete: bool = False,
     progress: ProgressCallback | None = None,
     numeric_history: NumericHistory | None = None,
+    recover_git_history: GitRecoveryCallback | None = None,
 ) -> UpgradeResult:
     """Upgrade an extracted session and return its verified semantic state."""
     session_id = validate_session_id(session_id)
@@ -720,6 +722,34 @@ def upgrade_session(
             f"archive HEAD {source_head} does not match selected remote step {expected_step}"
         )
 
+    recovered_git_history = False
+    history_requires_rebuild = False
+    source_commits = [step.source_commit for step in source_steps if step.source_commit]
+    if source_commits:
+        repository = GitSnapshotStore(root / "snapshots.git")
+        present = repository.contains_many(source_commits)
+        missing = set(source_commits) - present
+        if missing and recover_git_history is not None:
+            recovered_git_history = recover_git_history(
+                root,
+                source_steps,
+                missing,
+                _progress_range(progress, 20, 35),
+            )
+            present = repository.contains_many(source_commits)
+            missing = set(source_commits) - present
+        if missing:
+            raise ValueError(f"source Git history is missing {len(missing)} snapshot commit(s)")
+        final_commit = source_steps[-1].source_commit
+        outside_published_history = final_commit is None or not set(source_commits).issubset(
+            repository.reachable_from(final_commit)
+        )
+        # Only a commit recovered from a checksum-verified older generation has
+        # independent provenance that permits linearizing a formerly forked
+        # history. An unrelated object merely found in the selected repository
+        # remains an error in _preserve_git_history below.
+        history_requires_rebuild = recovered_git_history and outside_published_history
+
     if format_version == 2:
         schema_label = "-".join(str(value) for value in sorted(set(schemas)))
         representation = (
@@ -736,6 +766,8 @@ def upgrade_session(
             and schemas
             and all(schema == STEP_SCHEMA_VERSION for schema in schemas)
             and raw_session.get("state") == "complete"
+            and not recovered_git_history
+            and not history_requires_rebuild
         ):
             session = DirectorySession.from_dict(raw_session)
             if session.session_id != session_id:
@@ -751,7 +783,11 @@ def upgrade_session(
     )
     atomic_write(root / "session.json", _json_bytes(session.to_dict()))
     history_progress = _progress_range(progress, 20, 100)
-    if source_steps and all(source.source_commit for source in source_steps):
+    if (
+        source_steps
+        and all(source.source_commit for source in source_steps)
+        and not history_requires_rebuild
+    ):
         trees, entries, snapshots_by_tree = _preserve_git_history(
             root,
             session_id,
