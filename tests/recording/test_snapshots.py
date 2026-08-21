@@ -275,3 +275,22 @@ def test_snapshot_bundle_is_deterministic_and_uses_requested_commit(tmp_path: Pa
     destination = tmp_path / "restored-tree"
     restored.restore(first, destination)
     assert (destination / "file.txt").read_text() == "first"
+
+
+def test_git_history_queries_are_batched_and_validate_connectivity(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    repository = GitSnapshotStore(tmp_path / "snapshots.git")
+    (tree / "file.txt").write_text("first")
+    first = repository.commit(tree, None, "first")
+    first_tree = repository.tree_id(first)
+    (tree / "file.txt").write_text("second")
+    second = repository.commit(tree, first, "second")
+    second_tree = repository.tree_id(second)
+
+    assert repository.tree_ids([first, second, first, "f" * 40]) == {
+        first: first_tree,
+        second: second_tree,
+    }
+    assert repository.reachable_from(second) == {first, second}
+    repository.check_connectivity(second)

@@ -53,6 +53,20 @@ class PullSummary:
     failed: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ArchivedSession:
+    """Metadata for the generation currently selected by the remote index."""
+
+    session_id: str
+    memo_version_id: str
+    username: str
+    hostname: str
+    step: int
+    object_key: str
+    size_bytes: int
+    complete: bool
+
+
 def _store(config: S3Config, client: Any | None) -> S3Store:
     return client if isinstance(client, S3Store) else S3Store(config, client)
 
@@ -389,6 +403,44 @@ def list_archived_session_ids(
     return sorted(session_ids)
 
 
+def list_archived_sessions(
+    config: S3Config | None = None,
+    client: Any | None = None,
+    *,
+    limit: int | None = None,
+) -> list[ArchivedSession]:
+    """List selected remote generations and their objective S3 object sizes."""
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be positive")
+    config = config or S3Config.discover(required=True)
+    assert config is not None
+    remote = _store(config, client)
+    session_ids = list_archived_session_ids(config, remote)
+    if limit is not None:
+        session_ids = session_ids[:limit]
+
+    def inspect(session_id: str) -> ArchivedSession:
+        origin = _load_index(remote, config, session_id)
+        base = _session_base(config, origin, session_id)
+        step, object_key, _digest, complete = _select_generation(remote, config, base, session_id)
+        size_bytes = remote.size(object_key)
+        if size_bytes is None:
+            raise ValueError(f"remote generation size is unavailable: {session_id}")
+        return ArchivedSession(
+            session_id=session_id,
+            memo_version_id=origin["memo_version_id"],
+            username=origin["username"],
+            hostname=origin["hostname"],
+            step=step,
+            object_key=object_key,
+            size_bytes=size_bytes,
+            complete=complete,
+        )
+
+    with ThreadPoolExecutor(max_workers=MAX_PULL_WORKERS) as executor:
+        return list(executor.map(inspect, session_ids))
+
+
 def _same_origin_remote_session_ids(
     origin: SessionOrigin, config: S3Config, store: S3Store
 ) -> list[str]:
@@ -525,12 +577,17 @@ def pull_session(
     force: bool = False,
     client: Any | None = None,
     progress: ProgressCallback | None = None,
+    destination: Path | None = None,
 ) -> Path:
-    """Download, verify, and atomically install a remote session."""
+    """Download, verify, and atomically install a remote session.
+
+    ``destination`` bypasses the configured Memo archive and names the exact
+    installation directory. It is intended for external consumers, not for a
+    session that Memo should discover and manage normally.
+    """
     session_id = validate_session_id(session_id)
     if progress is not None:
         progress(0, 100, f"resolving remote session {session_id}")
-    paths = paths or StoragePaths.discover()
     config = config or S3Config.discover(required=True)
     assert config is not None
     remote = _store(config, client)
@@ -538,17 +595,28 @@ def pull_session(
     base = _session_base(config, origin, session_id)
     step, object_key, digest, complete = _select_generation(remote, config, base, session_id)
     if progress is not None:
-        progress(10, 100, f"checking local archive for {session_id}")
-    store = SessionStore(paths)
-    destination = store.session_path(session_id)
-    if destination.exists() and not force:
-        local = store.head(session_id)
-        if local and local.step >= step:
-            raise FileExistsError(f"local step {local.step} is not older than remote step {step}")
-        raise FileExistsError(f"local session exists: {session_id}; use --force to replace it")
-    destination.parent.mkdir(parents=True, exist_ok=True)
+        location = "local archive" if destination is None else "destination"
+        progress(10, 100, f"checking {location} for {session_id}")
+    if destination is None:
+        paths = paths or StoragePaths.discover()
+        store = SessionStore(paths)
+        install_destination = store.session_path(session_id)
+        if install_destination.exists() and not force:
+            local = store.head(session_id)
+            if local and local.step >= step:
+                raise FileExistsError(
+                    f"local step {local.step} is not older than remote step {step}"
+                )
+            raise FileExistsError(f"local session exists: {session_id}; use --force to replace it")
+    else:
+        install_destination = Path(destination).expanduser()
+        if install_destination.exists() and not force:
+            raise FileExistsError(
+                f"destination already exists: {install_destination}; use --force to replace it"
+            )
+    install_destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
-        prefix=f".{session_id}.pull-", dir=destination.parent
+        prefix=f".{session_id}.pull-", dir=install_destination.parent
     ) as temporary_name:
         temporary = Path(temporary_name)
         object_size = remote.size(object_key) if progress is not None else None
@@ -601,10 +669,10 @@ def pull_session(
         )
         if progress is not None:
             progress(96, 100, f"installing {session_id}")
-        atomic_install_directory(temporary, destination, force=force)
+        atomic_install_directory(temporary, install_destination, force=force)
     if progress is not None:
         progress(100, 100, f"pulled {session_id}")
-    return destination
+    return install_destination
 
 
 def verify_archived_session(

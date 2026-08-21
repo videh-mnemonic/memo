@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 
-from memo.cli.progress import ProgressBar
+from memo.cli.progress import ProgressBar, ProgressPair
 
 
 class TtyBuffer(io.StringIO):
@@ -28,3 +28,35 @@ def test_progress_bar_is_silent_for_non_tty_stream() -> None:
         progress.update(1, 1, "complete")
 
     assert stream.getvalue() == ""
+
+
+def test_progress_bar_can_render_eta() -> None:
+    stream = TtyBuffer()
+    values = iter([10.0, 20.0, 30.0])
+
+    with ProgressBar(
+        stream=stream,
+        width=10,
+        show_eta=True,
+        clock=lambda: next(values),
+    ) as progress:
+        progress.update(0, 100, "starting")
+        progress.update(25, 100, "working")
+        progress.update(100, 100, "done")
+
+    output = stream.getvalue()
+    assert "ETA -- starting" in output
+    assert "ETA 30s working" in output
+    assert "ETA 0s done" in output
+
+
+def test_progress_pair_renders_overall_and_current_item() -> None:
+    stream = TtyBuffer()
+
+    with ProgressPair(stream=stream, width=10) as progress:
+        progress.update_overall(2, 4, "(2/4) session")
+        progress.update_current(3, 10, "session writing manifests")
+
+    output = stream.getvalue()
+    assert "Overall [#####-----]  50% (2/4) session" in output
+    assert "Current [###-------]  30% session writing manifests" in output

@@ -40,6 +40,18 @@ def test_daemon_commands_do_not_require_s3(monkeypatch, tmp_path, capsys) -> Non
     assert capsys.readouterr().out == "daemon: stopped\n"
 
 
+def test_local_status_does_not_require_s3_but_archive_status_does(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    monkeypatch.delenv("MEMO_S3_BUCKET", raising=False)
+    monkeypatch.setenv("MEMO_HOME", str(tmp_path / "home"))
+
+    assert main(["status", "--json"]) == 0
+    assert capsys.readouterr().out == "[]\n"
+    assert main(["status", "--archive"]) == 1
+    assert "S3 transport requires MEMO_S3_BUCKET" in capsys.readouterr().err
+
+
 def test_default_and_path_invocations_launch_generic_relay(monkeypatch, tmp_path: Path) -> None:
     calls: list[Path] = []
     monkeypatch.setattr("memo.cli.app.run_relay", lambda path: calls.append(path) or 7)
@@ -122,9 +134,20 @@ def test_public_push_and_pull_subcommands_route_results(
     assert capsys.readouterr().out == "pushed: session\n"
 
     destination = StoragePaths(tmp_path / "home").archive / "session"
-    monkeypatch.setattr(pull, "pull_session", lambda session_id, force=False: destination)
+    calls = []
+
+    def fake_pull(session_id, force=False, destination=None):
+        calls.append((session_id, force, destination))
+        return destination or StoragePaths(tmp_path / "home").archive / session_id
+
+    monkeypatch.setattr(pull, "pull_session", fake_pull)
     assert main(["pull", "session", "--force"]) == 0
     assert capsys.readouterr().out == f"pulled: session path={destination}\n"
+
+    external = tmp_path / "external-recording"
+    assert main(["pull", "session", "--destination", str(external)]) == 0
+    assert capsys.readouterr().out == f"pulled: session path={external}\n"
+    assert calls == [("session", True, None), ("session", False, external)]
 
 
 def test_pull_all_reports_each_result_and_failure(monkeypatch, capsys) -> None:
@@ -157,6 +180,19 @@ def test_pull_requires_exactly_one_target(capsys) -> None:
     with pytest.raises(SystemExit):
         parser().parse_args(["pull", "session", "--all"])
     assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_pull_destination_rejects_all(monkeypatch, tmp_path, capsys) -> None:
+    from memo.cli.commands import pull
+
+    monkeypatch.setattr(
+        pull,
+        "pull_all_sessions",
+        lambda **_kwargs: pytest.fail("bulk pull should not start"),
+    )
+
+    assert main(["pull", "--all", "--destination", str(tmp_path / "output")]) == 1
+    assert "--destination cannot be used with --all" in capsys.readouterr().err
 
 
 def test_import_dry_run_routes_to_importer(monkeypatch, capsys) -> None:
@@ -208,9 +244,8 @@ def test_tidy_imports_pushes_then_removes_archived(monkeypatch, capsys) -> None:
     assert "failed: failed: offline" in captured.err
 
 
-def test_read_commands_ensure_session_is_local(monkeypatch, tmp_path: Path, capsys) -> None:
+def test_export_commands_pull_but_status_remains_local(monkeypatch, tmp_path: Path, capsys) -> None:
     calls: list[str] = []
-    monkeypatch.setattr("memo.cli.commands.status.require_local_session", calls.append)
     monkeypatch.setattr("memo.cli.commands.traces.require_local_session", calls.append)
     monkeypatch.setattr("memo.cli.commands.replay.require_local_session", calls.append)
     monkeypatch.setattr(
@@ -227,7 +262,7 @@ def test_read_commands_ensure_session_is_local(monkeypatch, tmp_path: Path, caps
     assert main(["status", "one"]) == 0
     assert main(["traces", "two"]) == 0
     assert main(["replay", "three", "-1", str(tmp_path / "out")]) == 0
-    assert calls == ["one", "two", "three"]
+    assert calls == ["two", "three"]
     capsys.readouterr()
 
 
@@ -238,22 +273,19 @@ def test_status_options_route_to_renderer(monkeypatch, capsys) -> None:
         lambda **kwargs: captured.update(kwargs) or "status\n",
     )
 
-    assert main(["status", "--include-archive", "--limit", "7"]) == 0
+    assert main(["status", "--archive", "--limit", "7", "--json"]) == 0
     assert captured == {
-        "include_archive": True,
+        "archive_only": True,
         "limit": 7,
         "session_id": None,
         "active_only": False,
+        "json_output": True,
     }
     assert capsys.readouterr().out == "status\n"
 
 
-def test_single_status_rejects_list_options_before_pull(monkeypatch, capsys) -> None:
-    calls: list[str] = []
-    monkeypatch.setattr("memo.cli.commands.status.require_local_session", calls.append)
-
+def test_single_status_rejects_list_options(capsys) -> None:
     assert main(["status", "session", "--limit", "1"]) == 1
-    assert calls == []
     assert "single-session status" in capsys.readouterr().err
 
 

@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     handler = getattr(args, "handler", None)
     if handler is None:
         command_parser.error("a command is required")
-    if args.command == daemon.NAME:
+    if args.command == daemon.NAME or (args.command == status.NAME and not args.archive):
         return _run_without_s3(lambda: handler(args))
     return _run_with_s3(lambda: handler(args))
 

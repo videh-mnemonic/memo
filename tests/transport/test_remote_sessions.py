@@ -29,6 +29,7 @@ from memo.transport import (
     ensure_local_session,
     inspect_archived_agent_runs,
     list_archived_session_ids,
+    list_archived_sessions,
     prepare_generation,
     pull_session,
     push_session,
@@ -513,6 +514,70 @@ def test_git_session_round_trips_through_remote_transport(tmp_path: Path) -> Non
     assert manifest.entries_digest
     assert manifest.entries == []
     assert (pulled_path / "entries" / f"{manifest.entries_digest}.json").is_file()
+
+
+def test_list_archived_sessions_reports_selected_s3_object_size(tmp_path: Path) -> None:
+    source_paths = _paths(tmp_path / "source-home")
+    source_store, session = _git_session(source_paths, tmp_path / "source")
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+    pushed = push_session(source_store, session, config, client)
+
+    archived = list_archived_sessions(config, client)
+
+    assert len(archived) == 1
+    assert archived[0].session_id == session.session_id
+    assert archived[0].step == 0
+    assert archived[0].complete
+    assert archived[0].object_key == pushed["object"]
+    assert archived[0].size_bytes == len(client.objects[str(pushed["object"])])
+    generation_gets = [
+        key for operation, key in client.operations if operation == "get" and "/generations/" in key
+    ]
+    assert generation_gets == []
+
+
+def test_pull_session_installs_at_exact_external_destination(tmp_path: Path) -> None:
+    source_paths = _paths(tmp_path / "source-home")
+    source_store, session = _git_session(source_paths, tmp_path / "source")
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+    push_session(source_store, session, config, client)
+
+    unused_paths = _paths(tmp_path / "unused-home")
+    destination = tmp_path / "external" / "chosen-name"
+    pulled_path = pull_session(
+        session.session_id,
+        unused_paths,
+        config,
+        client=client,
+        destination=destination,
+    )
+
+    assert pulled_path == destination
+    assert DirectorySession.load(destination / "session.json").session_id == session.session_id
+    assert SessionStore._validate_history(destination, session.session_id)
+    assert (destination / "snapshots.git" / "HEAD").is_file()
+    assert not unused_paths.archive.exists()
+
+
+def test_pull_session_external_destination_preserves_existing_directory(
+    tmp_path: Path,
+) -> None:
+    source_paths = _paths(tmp_path / "source-home")
+    source_store, session = _git_session(source_paths, tmp_path / "source")
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+    push_session(source_store, session, config, client)
+    destination = tmp_path / "external"
+    destination.mkdir()
+    sentinel = destination / "sentinel.txt"
+    sentinel.write_text("preserve")
+
+    with pytest.raises(FileExistsError, match="destination already exists"):
+        pull_session(session.session_id, config=config, client=client, destination=destination)
+
+    assert sentinel.read_text() == "preserve"
 
 
 def test_corrupt_git_snapshot_archive_does_not_replace_existing_session(tmp_path: Path) -> None:
@@ -1066,6 +1131,46 @@ def _directory(name: str) -> tuple[tarfile.TarInfo, None]:
     info = tarfile.TarInfo(name)
     info.type = tarfile.DIRTYPE
     return info, None
+
+
+def test_safe_stream_extraction_can_intercept_validated_regular_files(tmp_path: Path) -> None:
+    package = _tar_zst([_regular("captured.json", b"captured"), _regular("kept.txt", b"kept")])
+    captured: list[bytes] = []
+
+    def select(name, _member):
+        if name.as_posix() != "captured.json":
+            return None
+
+        def consume(handle) -> None:
+            captured.append(handle.read())
+
+        return consume
+
+    digest = safe_extract_tar_zst_stream(
+        io.BytesIO(package), tmp_path / "extracted", file_handler=select
+    )
+
+    assert digest == hashlib.sha256(package).hexdigest()
+    assert captured == [b"captured"]
+    assert not (tmp_path / "extracted" / "captured.json").exists()
+    assert (tmp_path / "extracted" / "kept.txt").read_bytes() == b"kept"
+
+
+def test_safe_stream_extraction_rejects_path_before_selecting_handler(tmp_path: Path) -> None:
+    selected: list[str] = []
+
+    def select(name, _member):
+        selected.append(name.as_posix())
+        return lambda handle: handle.read()
+
+    with pytest.raises(ValueError, match="unsafe archive path"):
+        safe_extract_tar_zst_stream(
+            io.BytesIO(_tar_zst([_regular("../escape")])),
+            tmp_path / "extracted",
+            file_handler=select,
+        )
+
+    assert selected == []
 
 
 @pytest.mark.parametrize(

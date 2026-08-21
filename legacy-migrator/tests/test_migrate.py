@@ -33,8 +33,7 @@ def test_migrate_legacy_scratch_recording(tmp_path: Path) -> None:
     (legacy / "traces").mkdir()
     _git(["bundle", "create", str(legacy / "git" / "initial.bundle"), "HEAD"], source_repo)
     (legacy / "traces" / "leg-001.jsonl").write_text(
-        json.dumps({"session_id": "legacy-session", "type": "user", "content": "old prompt"})
-        + "\n"
+        json.dumps({"session_id": "legacy-session", "type": "user", "content": "old prompt"}) + "\n"
     )
     (legacy / "meta.json").write_text(
         json.dumps(
@@ -100,11 +99,73 @@ def test_cli_dry_run_reports_without_writing(monkeypatch, capsys) -> None:
     assert main(["--legacy-dir", str(requested_directory), "--dry-run"]) == 0
     assert received == {"legacy_dir": requested_directory, "dry_run": True}
     assert capsys.readouterr().out == (
-        "would migrate: 1\n"
+        "would migrate: 1\nskipped: 0\nfailed: 0\nwould migrate: legacy-session\n"
+    )
+
+
+def test_cli_s3_upgrade_options_are_forwarded(monkeypatch, capsys, tmp_path: Path) -> None:
+    received: dict[str, object] = {}
+
+    def fake_upgrade_s3(
+        *, dry_run: bool, scratch_dir: Path, workers: int, progress, item_progress
+    ) -> SimpleNamespace:
+        received.update(
+            dry_run=dry_run,
+            scratch_dir=scratch_dir,
+            workers=workers,
+            progress=progress,
+            item_progress=item_progress,
+        )
+        return SimpleNamespace(
+            sources=1,
+            migrated=["remote-session"],
+            skipped=[],
+            failed=[],
+            original_bytes=100,
+            replacement_bytes=25,
+        )
+
+    monkeypatch.setattr(
+        "memo_legacy_migrator.cli.upgrade_s3",
+        fake_upgrade_s3,
+    )
+
+    scratch = tmp_path / "scratch"
+    assert (
+        main(
+            [
+                "--upgrade-s3",
+                "--dry-run",
+                "--scratch-dir",
+                str(scratch),
+                "--workers",
+                "3",
+            ]
+        )
+        == 0
+    )
+    assert received == {
+        "dry_run": True,
+        "scratch_dir": scratch,
+        "workers": 3,
+        "progress": None,
+        "item_progress": None,
+    }
+    assert capsys.readouterr().out == (
+        "would upgrade: 1\n"
         "skipped: 0\n"
         "failed: 0\n"
-        "would migrate: legacy-session\n"
+        "would upgrade: remote-session\n"
+        "bytes: 100 -> 25 (75 saved)\n"
     )
+
+
+def test_cli_rejects_scratch_for_local_migration(capsys, tmp_path: Path) -> None:
+    assert main(["--scratch-dir", str(tmp_path)]) == 2
+    assert "--scratch-dir requires --upgrade-s3" in capsys.readouterr().err
+
+    assert main(["--workers", "2"]) == 2
+    assert "--workers requires --upgrade-s3" in capsys.readouterr().err
 
 
 def test_legacy_sources_can_use_explicit_directory(tmp_path: Path) -> None:

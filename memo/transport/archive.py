@@ -24,6 +24,8 @@ from ..recording.store import SessionStore
 
 STREAM_READ_SIZE = 64 * 1024
 DEFAULT_LARGE_ARCHIVE_BYTES = 1 * 1024 * 1024 * 1024
+ArchiveFileHandler = Callable[[BinaryIO], None]
+ArchiveFileHandlerFactory = Callable[[PurePosixPath, tarfile.TarInfo], ArchiveFileHandler | None]
 
 
 class LargeGenerationError(ValueError):
@@ -143,8 +145,14 @@ def safe_extract_tar_zst_stream(
     progress: Callable[[int, int, str], None] | None = None,
     progress_total: int | None = None,
     progress_message: str = "downloading archive",
+    file_handler: ArchiveFileHandlerFactory | None = None,
 ) -> str:
-    """Safely extract a tar.zst stream and return its SHA-256 digest."""
+    """Safely extract a tar.zst stream and return its SHA-256 digest.
+
+    ``file_handler`` may consume selected regular files instead of writing
+    them. Every member still passes the same path, type, duplicate, and shape
+    checks before the handler is selected.
+    """
     root = target.resolve()
     hashing = HashingReader(
         source,
@@ -154,6 +162,7 @@ def safe_extract_tar_zst_stream(
     )
     decompressor = zstandard.ZstdDecompressor()
     shapes: dict[tuple[str, ...], str] = {}
+    paths_with_descendants: set[tuple[str, ...]] = set()
     with decompressor.stream_reader(hashing, closefd=False) as decompressed:
         with tarfile.open(fileobj=decompressed, mode="r|") as archive:
             for member in archive:
@@ -176,9 +185,7 @@ def safe_extract_tar_zst_stream(
                 for index in range(1, len(key)):
                     if shapes.get(key[:index]) == "file":
                         raise ValueError(f"archive path conflict: {member.name}")
-                if member.isfile() and any(
-                    existing[: len(key)] == key for existing in shapes if len(existing) > len(key)
-                ):
+                if member.isfile() and key in paths_with_descendants:
                     raise ValueError(f"archive path conflict: {member.name}")
                 try:
                     destination = root.joinpath(*parts)
@@ -186,6 +193,16 @@ def safe_extract_tar_zst_stream(
                 except ValueError as error:
                     raise ValueError(f"archive path escapes destination: {member.name}") from error
                 shapes[key] = "file" if member.isfile() else "directory"
+                paths_with_descendants.update(key[:index] for index in range(1, len(key)))
+                handler = file_handler(name, member) if file_handler and member.isfile() else None
+                if handler is not None:
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        raise ValueError(f"archive file cannot be read: {member.name}")
+                    handler(extracted)
+                    while extracted.read(STREAM_READ_SIZE):
+                        pass
+                    continue
                 archive.extract(member, target, filter="data")
     while hashing.read(STREAM_READ_SIZE):
         pass
