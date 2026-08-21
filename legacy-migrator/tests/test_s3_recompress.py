@@ -6,6 +6,7 @@ import io
 import json
 import shutil
 import tarfile
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -957,6 +958,45 @@ def test_progress_covers_discovery_download_and_completion(tmp_path: Path) -> No
     assert updates[-1][0] == updates[-1][1]
     assert item_updates[-1][0] == item_updates[-1][1]
     assert "finished" in item_updates[-1][2]
+
+
+def test_s3_upgrade_processes_sessions_with_bounded_concurrency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidates = [RemoteCandidate(f"session-{index}", "test", "") for index in range(4)]
+    barrier = threading.Barrier(4)
+    lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    monkeypatch.setattr(
+        s3_recompress,
+        "discover_remote_candidates",
+        lambda _remote, _config: candidates,
+    )
+
+    def overlap(_remote, _config, _candidate):
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        barrier.wait(timeout=5)
+        with lock:
+            active -= 1
+        raise s3_recompress.NotEligible("test candidate")
+
+    monkeypatch.setattr(s3_recompress, "source_for_candidate", overlap)
+
+    summary = recompress_s3(
+        S3Config("bucket", "prefix"),
+        SimpleNamespace(),
+        dry_run=True,
+        scratch_dir=tmp_path / "scratch",
+        workers=4,
+    )
+
+    assert maximum_active == 4
+    assert summary.skipped == [(candidate.session_id, "test candidate") for candidate in candidates]
 
 
 def test_interruption_removes_in_progress_scratch_data(tmp_path: Path) -> None:

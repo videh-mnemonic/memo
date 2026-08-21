@@ -78,6 +78,19 @@ directory may remain, but completed runs leave no session archives or extracted
 copies inside it. As with any process, SIGKILL or a machine power loss can
 prevent cleanup.
 
+S3 upgrades process four independent sessions concurrently by default. Use
+`--workers N` to select between one and eight workers:
+
+```console
+memo-migrate-legacy --upgrade-s3 --dry-run --workers 4
+```
+
+Every worker uses a separate scratch directory and performs the complete
+download, checksum, format, conversion, equivalence, and replacement-validation
+sequence. More workers increase CPU, memory, network, and scratch-disk demand;
+use `--workers 1` on a constrained machine. Ctrl-C and SIGTERM ask all workers
+to unwind and remove their temporary data before the command exits.
+
 The preview downloads every indexed session's selected generation into
 temporary storage and verifies its SHA-256 digest and size. Large numeric step
 histories are validated and parsed directly from the safely checked archive

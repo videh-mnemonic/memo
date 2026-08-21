@@ -8,9 +8,11 @@ import os
 import re
 import tempfile
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event, Lock
 from typing import Any
 
 from memo.recording.git_snapshots import GitSnapshotStore
@@ -93,6 +95,20 @@ class Replacement:
     prepared: PreparedGeneration
     original_size: int
     source_format: str
+
+
+@dataclass(frozen=True)
+class CandidateOutcome:
+    session_id: str
+    status: str
+    detail: str = ""
+    source_format: str | None = None
+    original_bytes: int = 0
+    replacement_bytes: int = 0
+
+
+class MigrationCancelled(BaseException):
+    """Stop a worker promptly while allowing its scratch contexts to unwind."""
 
 
 class NotEligible(ValueError):
@@ -919,8 +935,11 @@ def recompress_s3(
     scratch_dir: Path | None = None,
     progress: ProgressCallback | None = None,
     item_progress: ProgressCallback | None = None,
+    workers: int = 4,
 ) -> S3RecompressionSummary:
     """Detect and upgrade every indexed historical S3 session format."""
+    if not 1 <= workers <= 8:
+        raise ValueError("workers must be between 1 and 8")
     config = config or S3Config.discover(required=True)
     assert config is not None
     remote = client if isinstance(client, S3Store) else S3Store(config, client)
@@ -934,21 +953,39 @@ def recompress_s3(
         return summary
     scratch = _scratch_directory(scratch_dir)
     progress_total = len(candidates) * 1000
-    for position, candidate in enumerate(candidates, start=1):
+    progress_by_position = [0] * len(candidates)
+    progress_lock = Lock()
+    cancelled = Event()
+
+    def process(position: int, candidate: RemoteCandidate) -> CandidateOutcome:
         prepared: PreparedGeneration | None = None
+        last_report: tuple[int, str] | None = None
 
         def session_progress(completed: int, total: int, message: str) -> None:
+            nonlocal last_report
+            if cancelled.is_set():
+                raise MigrationCancelled
             fraction = max(0.0, min(completed / max(total, 1), 1.0))
-            overall = ((position - 1) * 1000) + round(fraction * 1000)
-            identity = f"({position}/{len(candidates)}) {candidate.session_id}"
-            if item_progress is not None:
-                item_progress(completed, total, f"{candidate.session_id} {message}")
-            if progress is not None:
-                progress(
-                    overall,
-                    progress_total,
-                    identity if item_progress is not None else f"{identity} {message}",
+            progress_units = round(fraction * 1000)
+            report = (progress_units, message)
+            if report == last_report:
+                return
+            last_report = report
+            with progress_lock:
+                progress_by_position[position - 1] = progress_units
+                overall = sum(progress_by_position)
+                remaining = sum(value < 1000 for value in progress_by_position)
+                identity = (
+                    f"({position}/{len(candidates)}, {remaining} remaining) {candidate.session_id}"
                 )
+                if item_progress is not None:
+                    item_progress(completed, total, f"{candidate.session_id} {message}")
+                if progress is not None:
+                    progress(
+                        overall,
+                        progress_total,
+                        identity if item_progress is not None else f"{identity} {message}",
+                    )
 
         session_progress(0, 1, "checking eligibility")
         try:
@@ -970,9 +1007,6 @@ def recompress_s3(
                         progress=prepare_progress,
                     )
                 prepared = replacement.prepared
-                summary.formats[candidate.session_id] = replacement.source_format
-                summary.original_bytes += replacement.original_size
-                summary.replacement_bytes += replacement.prepared.size_bytes
                 if not dry_run:
                     if progress is None and item_progress is None:
                         _install_replacement(remote, config, replacement)
@@ -983,15 +1017,50 @@ def recompress_s3(
                             replacement,
                             progress=_progress_range(session_progress, 70, 100),
                         )
-                summary.migrated.append(candidate.session_id)
+                return CandidateOutcome(
+                    candidate.session_id,
+                    "migrated",
+                    source_format=replacement.source_format,
+                    original_bytes=replacement.original_size,
+                    replacement_bytes=replacement.prepared.size_bytes,
+                )
         except (AlreadyLatest, NotEligible) as error:
-            summary.skipped.append((candidate.session_id, str(error)))
+            return CandidateOutcome(candidate.session_id, "skipped", str(error))
         except Exception as error:
-            summary.failed.append((candidate.session_id, str(error)))
+            return CandidateOutcome(candidate.session_id, "failed", str(error))
         finally:
             if prepared is not None:
                 prepared.cleanup()
-            session_progress(1, 1, "finished")
+            if not cancelled.is_set():
+                session_progress(1, 1, "finished")
+
+    executor = ThreadPoolExecutor(max_workers=min(workers, len(candidates)))
+    futures: list[Future[CandidateOutcome]] = [
+        executor.submit(process, position, candidate)
+        for position, candidate in enumerate(candidates, start=1)
+    ]
+    try:
+        outcomes = [future.result() for future in futures]
+    except BaseException:
+        cancelled.set()
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+
+    for outcome in outcomes:
+        if outcome.status == "migrated":
+            summary.migrated.append(outcome.session_id)
+            assert outcome.source_format is not None
+            summary.formats[outcome.session_id] = outcome.source_format
+            summary.original_bytes += outcome.original_bytes
+            summary.replacement_bytes += outcome.replacement_bytes
+        elif outcome.status == "skipped":
+            summary.skipped.append((outcome.session_id, outcome.detail))
+        else:
+            summary.failed.append((outcome.session_id, outcome.detail))
     return summary
 
 
