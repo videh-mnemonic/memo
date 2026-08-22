@@ -393,6 +393,79 @@ def test_git_backed_upgrade_preserves_commits_and_restores_each_unique_tree_once
     assert "fingerprinted unique tree 3/3" in progress
 
 
+def test_best_effort_prefers_preceding_state_for_missing_commit(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "session"
+    commits = _repeated_git_session(source, "session", steps=3, unique_trees=3)
+    missing = commits[1]
+    loose_commit = source / "snapshots.git" / "objects" / missing[:2] / missing[2:]
+    assert loose_commit.is_file()
+    loose_commit.unlink()
+
+    result = upgrade_session(
+        source,
+        "session",
+        ORIGIN,
+        transport_is_current=False,
+        archive_had_bundle=False,
+        best_effort=True,
+    )
+
+    assert len(result.best_effort_substitutions) == 1
+    substitution = result.best_effort_substitutions[0]
+    assert substitution.step == 1
+    assert substitution.missing_commit == missing
+    assert substitution.substitute_step == 0
+    assert substitution.substitute_commit == commits[0]
+    assert substitution.direction == "preceding"
+    _assert_latest(
+        source,
+        "session",
+        [b"state 0", b"state 0", b"state 2"],
+        boundary=False,
+    )
+
+
+def test_best_effort_uses_following_state_when_no_preceding_state_exists(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source" / "session"
+    commits = _repeated_git_session(source, "session", steps=2, unique_trees=2)
+    missing = commits[0]
+    (source / "snapshots.git" / "objects" / missing[:2] / missing[2:]).unlink()
+
+    result = upgrade_session(
+        source,
+        "session",
+        ORIGIN,
+        transport_is_current=False,
+        archive_had_bundle=False,
+        best_effort=True,
+    )
+
+    substitution = result.best_effort_substitutions[0]
+    assert substitution.step == 0
+    assert substitution.substitute_step == 1
+    assert substitution.direction == "following"
+    _assert_latest(source, "session", [b"state 1", b"state 1"], boundary=False)
+
+
+def test_best_effort_fails_when_no_filesystem_state_survives(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "session"
+    commits = _repeated_git_session(source, "session", steps=2, unique_trees=2)
+    for commit in commits:
+        (source / "snapshots.git" / "objects" / commit[:2] / commit[2:]).unlink()
+
+    with pytest.raises(ValueError, match="no verified filesystem state"):
+        upgrade_session(
+            source,
+            "session",
+            ORIGIN,
+            transport_is_current=False,
+            archive_had_bundle=False,
+            best_effort=True,
+        )
+
+
 def test_git_backed_upgrade_rejects_manifest_commit_outside_final_history(
     tmp_path: Path,
 ) -> None:
@@ -717,6 +790,68 @@ def test_remote_upgrade_handles_every_transport_and_removes_source_last(
     assert remote_sessions._select_generation(
         S3Store(config, client), config, selected_base, "session"
     )[3]
+
+
+def test_best_effort_embeds_report_and_retains_original_s3_archive(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    commits = _repeated_git_session(source_root, "session", steps=3, unique_trees=3)
+    missing = commits[1]
+    loose_commit = source_root / "snapshots.git" / "objects" / missing[:2] / missing[2:]
+    assert loose_commit.is_file()
+    loose_commit.unlink()
+    original = _put_content_addressed(
+        client,
+        config,
+        _unchecked_tar_zst(source_root),
+        step=2,
+    )
+    original_objects = dict(client.objects)
+
+    strict = recompress_s3(config, client, dry_run=True)
+    assert strict.migrated == []
+    assert "missing 1 snapshot commit" in strict.failed[0][1]
+
+    preview = recompress_s3(config, client, dry_run=True, best_effort=True)
+    assert not preview.failed, preview.failed
+    assert preview.migrated == ["session"]
+    assert preview.best_effort == {"session": 1}
+    assert preview.retained_original_bytes == len(original_objects[original])
+    assert client.objects == original_objects
+
+    client.operations.clear()
+    summary = recompress_s3(config, client, best_effort=True)
+
+    assert not summary.failed, summary.failed
+    assert summary.best_effort == {"session": 1}
+    assert original in client.objects
+    assert ("remove", original) not in client.operations
+    replacements = [
+        key
+        for key in client.objects
+        if "/generations/" in key and key.endswith(".tar.zst") and key != original
+    ]
+    assert len(replacements) == 1
+    extracted = tmp_path / "replacement"
+    extracted.mkdir()
+    safe_extract_tar_zst_stream(io.BytesIO(client.objects[replacements[0]]), extracted)
+    report = json.loads((extracted / s3_recompress.BEST_EFFORT_REPORT).read_text())
+    assert report["source_archive"] == {
+        "object_key": original,
+        "retained_in_s3": True,
+        "sha256": hashlib.sha256(original_objects[original]).hexdigest(),
+        "size_bytes": len(original_objects[original]),
+    }
+    assert report["substitutions"] == [
+        {
+            "direction": "preceding",
+            "missing_commit": missing,
+            "step": 1,
+            "substitute_commit": commits[0],
+            "substitute_step": 0,
+        }
+    ]
 
 
 def test_install_preserves_original_when_staging_is_corrupt(tmp_path: Path) -> None:

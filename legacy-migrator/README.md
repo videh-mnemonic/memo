@@ -126,6 +126,28 @@ an older repository retained after its own manifest moved on. It then rebuilds
 and independently fingerprints the complete linear history. It still fails
 rather than dropping a step when no verified generation contains the referenced
 data.
+
+If those exact objects no longer exist, an explicit best-effort preview can
+substitute the nearest verified filesystem state, preferring the preceding
+state when two are equally close:
+
+```console
+memo-migrate-legacy --upgrade-s3 --dry-run --best-effort \
+  --session SESSION_ID
+```
+
+This deliberately relaxes filesystem-history equivalence; it never relaxes
+archive checksums, session identity, safe extraction, metadata validation, or
+upload verification. Step count, timestamps, streams, and agent data are
+preserved. Each substituted step uses the donor state's snapshot metadata, and
+`legacy-best-effort-migration.json` is embedded in the replacement with the
+missing commit, donor step, donor commit, direction, and original S3 object.
+When applied without `--dry-run`, Memo retains the original archive (and its
+checksum sidecar, if present) instead of deleting it. The CLI prints a prominent
+`BEST EFFORT` warning and reports the additional storage rather than claiming
+the retained bytes as savings. If no verified filesystem state exists, or any
+other safety check fails, the session still fails.
+
 An interactive terminal shows separate overall and current-session progress
 bars, each with its own estimated time remaining. The overall estimate becomes
 more stable as sessions complete; archive sizes and conversion costs can differ

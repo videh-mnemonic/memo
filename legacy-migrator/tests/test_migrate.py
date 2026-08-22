@@ -112,6 +112,7 @@ def test_cli_s3_upgrade_options_are_forwarded(monkeypatch, capsys, tmp_path: Pat
         scratch_dir: Path,
         workers: int,
         session_ids: list[str] | None,
+        best_effort: bool,
         progress,
         item_progress,
     ) -> SimpleNamespace:
@@ -120,6 +121,7 @@ def test_cli_s3_upgrade_options_are_forwarded(monkeypatch, capsys, tmp_path: Pat
             scratch_dir=scratch_dir,
             workers=workers,
             session_ids=session_ids,
+            best_effort=best_effort,
             progress=progress,
             item_progress=item_progress,
         )
@@ -130,6 +132,8 @@ def test_cli_s3_upgrade_options_are_forwarded(monkeypatch, capsys, tmp_path: Pat
             failed=[],
             original_bytes=100,
             replacement_bytes=25,
+            best_effort={"remote-session": 2},
+            retained_original_bytes=100,
         )
 
     monkeypatch.setattr(
@@ -149,6 +153,7 @@ def test_cli_s3_upgrade_options_are_forwarded(monkeypatch, capsys, tmp_path: Pat
                 "3",
                 "--session",
                 "remote-session",
+                "--best-effort",
             ]
         )
         == 0
@@ -158,15 +163,21 @@ def test_cli_s3_upgrade_options_are_forwarded(monkeypatch, capsys, tmp_path: Pat
         "scratch_dir": scratch,
         "workers": 3,
         "session_ids": ["remote-session"],
+        "best_effort": True,
         "progress": None,
         "item_progress": None,
     }
-    assert capsys.readouterr().out == (
+    captured = capsys.readouterr()
+    assert captured.out == (
         "would upgrade: 1\n"
         "skipped: 0\n"
         "failed: 0\n"
         "would upgrade: remote-session\n"
-        "bytes: 100 -> 25 (75 saved)\n"
+        "bytes: 100 -> 125 (25 added; best-effort originals retained)\n"
+    )
+    assert captured.err == (
+        "BEST EFFORT: remote-session: substituted 2 filesystem step(s); "
+        "would retain original S3 archive\n"
     )
 
 
@@ -179,6 +190,9 @@ def test_cli_rejects_scratch_for_local_migration(capsys, tmp_path: Path) -> None
 
     assert main(["--session", "one"]) == 2
     assert "--session requires --upgrade-s3" in capsys.readouterr().err
+
+    assert main(["--best-effort"]) == 2
+    assert "--best-effort requires --upgrade-s3" in capsys.readouterr().err
 
 
 def test_legacy_sources_can_use_explicit_directory(tmp_path: Path) -> None:

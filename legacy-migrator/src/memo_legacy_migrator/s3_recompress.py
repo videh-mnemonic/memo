@@ -15,6 +15,7 @@ from pathlib import Path
 from threading import Event, Lock
 from typing import Any
 
+from memo.recording.filesystem import atomic_write
 from memo.recording.git_snapshots import GitSnapshotStore
 from memo.recording.metadata import (
     ENTRIES_SCHEMA_VERSION,
@@ -38,6 +39,7 @@ from memo.transport.s3 import STREAM_READ_SIZE, S3Store
 from .migrate import _safe_extract_tar
 from .session_upgrade import (
     AlreadyLatest,
+    BestEffortSubstitution,
     NumericHistory,
     NumericHistoryCollector,
     SourceStep,
@@ -50,6 +52,7 @@ SIDECAR_GENERATION = re.compile(r"^(\d{8,})\.tar\.zst$")
 SIDECAR_CHECKSUM = re.compile(r"^(\d{8,})\.sha256$")
 PROGRESS_BYTES = 8 * 1024 * 1024
 STEP_MANIFEST_SIZE_LIMIT = 64 * 1024 * 1024
+BEST_EFFORT_REPORT = "legacy-best-effort-migration.json"
 ProgressCallback = Callable[[int, int, str], None]
 
 
@@ -62,6 +65,8 @@ class S3RecompressionSummary:
     original_bytes: int = 0
     replacement_bytes: int = 0
     formats: dict[str, str] = field(default_factory=dict)
+    best_effort: dict[str, int] = field(default_factory=dict)
+    retained_original_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,7 @@ class Replacement:
     prepared: PreparedGeneration
     original_size: int
     source_format: str
+    best_effort_substitutions: tuple[BestEffortSubstitution, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +121,7 @@ class CandidateOutcome:
     source_format: str | None = None
     original_bytes: int = 0
     replacement_bytes: int = 0
+    best_effort_substitutions: int = 0
 
 
 class MigrationCancelled(BaseException):
@@ -907,6 +914,7 @@ def _prepare_replacement(
     source: RemoteSource,
     work: Path,
     progress: ProgressCallback | None = None,
+    best_effort: bool = False,
 ) -> Replacement:
     extracted = work / source.session_id
     extracted.mkdir()
@@ -949,7 +957,40 @@ def _prepare_replacement(
         progress=_progress_range(progress, 50, 75),
         numeric_history=numeric_history,
         recover_git_history=recover_git_history,
+        best_effort=best_effort,
     )
+    if result.best_effort_substitutions:
+        report_path = extracted / BEST_EFFORT_REPORT
+        if report_path.exists():
+            raise ValueError(f"source session already contains reserved file: {BEST_EFFORT_REPORT}")
+        report = {
+            "schema_version": 1,
+            "mode": "best-effort",
+            "session_id": source.session_id,
+            "source_archive": {
+                "object_key": source.object_key,
+                "sha256": source.digest,
+                "size_bytes": original_size,
+                "retained_in_s3": True,
+            },
+            "substitution_policy": "nearest verified state; prefer preceding on ties",
+            "substitutions": [
+                {
+                    "step": substitution.step,
+                    "missing_commit": substitution.missing_commit,
+                    "substitute_step": substitution.substitute_step,
+                    "substitute_commit": substitution.substitute_commit,
+                    "direction": substitution.direction,
+                }
+                for substitution in result.best_effort_substitutions
+            ],
+        }
+        atomic_write(report_path, _canonical_json(report) + b"\n")
+        report_path.chmod(0o644)
+        expected_preserved[BEST_EFFORT_REPORT] = (
+            report_path.stat().st_mode & 0o777,
+            _file_digest(report_path),
+        )
     prepared = prepare_generation(
         _store(extracted),
         result.session,
@@ -980,7 +1021,14 @@ def _prepare_replacement(
             progress=_progress_range(progress, 88, 100),
         )
         _report(progress, 100, "replacement verified locally")
-        return Replacement(source, result.session, prepared, original_size, result.source_format)
+        return Replacement(
+            source,
+            result.session,
+            prepared,
+            original_size,
+            result.source_format,
+            result.best_effort_substitutions,
+        )
     except BaseException:
         prepared.cleanup()
         raise
@@ -1099,11 +1147,18 @@ def _install_replacement(
                 remote.remove(generation)
             raise
 
+        retain_source = bool(replacement.best_effort_substitutions)
         for key in source.cleanup_keys:
-            if key != source.object_key:
+            if key != source.object_key and not (
+                retain_source and key == f"{source.object_key}.sha256"
+            ):
                 remote.remove(key)
-        # The source archive is always the final destructive operation.
-        remote.remove(source.object_key)
+        # An equivalent migration removes the source archive last. A
+        # best-effort replacement is intentionally not equivalent, so its
+        # original bytes (and sidecar checksum, when present) remain available
+        # for forensic recovery.
+        if not retain_source:
+            remote.remove(source.object_key)
         _report(progress, 100, "replacement installed")
     finally:
         with suppress(Exception):
@@ -1120,6 +1175,7 @@ def recompress_s3(
     item_progress: ProgressCallback | None = None,
     workers: int = 4,
     session_ids: list[str] | None = None,
+    best_effort: bool = False,
 ) -> S3RecompressionSummary:
     """Detect and upgrade every indexed historical S3 session format."""
     if not 1 <= workers <= 8:
@@ -1186,7 +1242,12 @@ def recompress_s3(
                 dir=scratch,
             ) as work_name:
                 if progress is None and item_progress is None:
-                    replacement = _prepare_replacement(remote, source, Path(work_name))
+                    replacement = _prepare_replacement(
+                        remote,
+                        source,
+                        Path(work_name),
+                        best_effort=best_effort,
+                    )
                 else:
                     prepare_progress = (
                         session_progress if dry_run else _progress_range(session_progress, 0, 70)
@@ -1196,6 +1257,7 @@ def recompress_s3(
                         source,
                         Path(work_name),
                         progress=prepare_progress,
+                        best_effort=best_effort,
                     )
                 prepared = replacement.prepared
                 if not dry_run:
@@ -1214,6 +1276,7 @@ def recompress_s3(
                     source_format=replacement.source_format,
                     original_bytes=replacement.original_size,
                     replacement_bytes=replacement.prepared.size_bytes,
+                    best_effort_substitutions=len(replacement.best_effort_substitutions),
                 )
         except (AlreadyLatest, NotEligible) as error:
             return CandidateOutcome(candidate.session_id, "skipped", str(error))
@@ -1248,6 +1311,9 @@ def recompress_s3(
             summary.formats[outcome.session_id] = outcome.source_format
             summary.original_bytes += outcome.original_bytes
             summary.replacement_bytes += outcome.replacement_bytes
+            if outcome.best_effort_substitutions:
+                summary.best_effort[outcome.session_id] = outcome.best_effort_substitutions
+                summary.retained_original_bytes += outcome.original_bytes
         elif outcome.status == "skipped":
             summary.skipped.append((outcome.session_id, outcome.detail))
         else:
