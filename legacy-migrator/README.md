@@ -85,6 +85,15 @@ S3 upgrades process four independent sessions concurrently by default. Use
 memo-migrate-legacy --upgrade-s3 --dry-run --workers 4
 ```
 
+Use a repeatable `--session` filter to audit or retry particular S3 sessions
+without downloading every indexed archive again:
+
+```console
+memo-migrate-legacy --upgrade-s3 --dry-run \
+  --session 030a33a509794930ba13868586c1b627 \
+  --session 1aa41616320f452c819a37307cdf1e34
+```
+
 Every worker uses a separate scratch directory and performs the complete
 download, checksum, format, conversion, equivalence, and replacement-validation
 sequence. More workers increase CPU, memory, network, and scratch-disk demand;
@@ -108,6 +117,37 @@ session files must also match by path, mode, and digest. It does not write to
 S3. Sessions already in the latest format are skipped. Active sessions and
 sessions with an unselected newer generation are also skipped so the migrator
 cannot race an in-progress upload.
+If a selected historical Git generation references commit objects omitted from
+its bundle, the preview searches older immutable generations of that same
+indexed session. It accepts objects only from an archive whose size and SHA-256
+digest match S3 metadata, and imports only the exact commit IDs named by the
+selected manifests. This also permits recovery of a disconnected object that
+an older repository retained after its own manifest moved on. It then rebuilds
+and independently fingerprints the complete linear history. It still fails
+rather than dropping a step when no verified generation contains the referenced
+data.
+
+If those exact objects no longer exist, an explicit best-effort preview can
+substitute the nearest verified filesystem state, preferring the preceding
+state when two are equally close:
+
+```console
+memo-migrate-legacy --upgrade-s3 --dry-run --best-effort \
+  --session SESSION_ID
+```
+
+This deliberately relaxes filesystem-history equivalence; it never relaxes
+archive checksums, session identity, safe extraction, metadata validation, or
+upload verification. Step count, timestamps, streams, and agent data are
+preserved. Each substituted step uses the donor state's snapshot metadata, and
+`legacy-best-effort-migration.json` is embedded in the replacement with the
+missing commit, donor step, donor commit, direction, and original S3 object.
+When applied without `--dry-run`, Memo retains the original archive (and its
+checksum sidecar, if present) instead of deleting it. The CLI prints a prominent
+`BEST EFFORT` warning and reports the additional storage rather than claiming
+the retained bytes as savings. If no verified filesystem state exists, or any
+other safety check fails, the session still fails.
+
 An interactive terminal shows separate overall and current-session progress
 bars, each with its own estimated time remaining. The overall estimate becomes
 more stable as sessions complete; archive sizes and conversion costs can differ

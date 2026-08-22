@@ -15,6 +15,7 @@ from pathlib import Path
 from threading import Event, Lock
 from typing import Any
 
+from memo.recording.filesystem import atomic_write
 from memo.recording.git_snapshots import GitSnapshotStore
 from memo.recording.metadata import (
     ENTRIES_SCHEMA_VERSION,
@@ -38,8 +39,10 @@ from memo.transport.s3 import STREAM_READ_SIZE, S3Store
 from .migrate import _safe_extract_tar
 from .session_upgrade import (
     AlreadyLatest,
+    BestEffortSubstitution,
     NumericHistory,
     NumericHistoryCollector,
+    SourceStep,
     UpgradeResult,
     snapshot_fingerprint,
     upgrade_session,
@@ -49,6 +52,7 @@ SIDECAR_GENERATION = re.compile(r"^(\d{8,})\.tar\.zst$")
 SIDECAR_CHECKSUM = re.compile(r"^(\d{8,})\.sha256$")
 PROGRESS_BYTES = 8 * 1024 * 1024
 STEP_MANIFEST_SIZE_LIMIT = 64 * 1024 * 1024
+BEST_EFFORT_REPORT = "legacy-best-effort-migration.json"
 ProgressCallback = Callable[[int, int, str], None]
 
 
@@ -61,6 +65,8 @@ class S3RecompressionSummary:
     original_bytes: int = 0
     replacement_bytes: int = 0
     formats: dict[str, str] = field(default_factory=dict)
+    best_effort: dict[str, int] = field(default_factory=dict)
+    retained_original_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,14 @@ class RemoteCandidate:
     session_id: str
     layout: str
     locator: str
+
+
+@dataclass(frozen=True)
+class RecoveryGeneration:
+    step: int
+    object_key: str
+    digest: str
+    archive_kind: str = "tar.zst"
 
 
 @dataclass(frozen=True)
@@ -82,6 +96,7 @@ class RemoteSource:
     completion_key: str | None
     completion_data: bytes | None
     cleanup_keys: tuple[str, ...]
+    recovery_generations: tuple[RecoveryGeneration, ...] = ()
 
     @property
     def session_id(self) -> str:
@@ -95,6 +110,7 @@ class Replacement:
     prepared: PreparedGeneration
     original_size: int
     source_format: str
+    best_effort_substitutions: tuple[BestEffortSubstitution, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,6 +121,7 @@ class CandidateOutcome:
     source_format: str | None = None
     original_bytes: int = 0
     replacement_bytes: int = 0
+    best_effort_substitutions: int = 0
 
 
 class MigrationCancelled(BaseException):
@@ -271,6 +288,13 @@ def _current_source(remote: S3Store, config: S3Config, candidate: RemoteCandidat
         completion_key,
         completion_data,
         (completion_key, object_key),
+        tuple(
+            RecoveryGeneration(generation_step, key, generation_digest)
+            for generation_step, (key, generation_digest) in sorted(
+                generations.items(), reverse=True
+            )
+            if generation_step < step
+        ),
     )
 
 
@@ -318,6 +342,17 @@ def _sidecar_source(remote: S3Store, config: S3Config, candidate: RemoteCandidat
     checksum_data = remote.read_bytes(pair[1]).decode().split()
     if not checksum_data or checksum_data[0] != digest:
         raise ValueError("legacy checksum and completion record disagree")
+    recovery_generations = []
+    for earlier_step, (earlier_package, earlier_checksum) in sorted(pairs.items(), reverse=True):
+        if earlier_step >= step:
+            continue
+        try:
+            fields = remote.read_bytes(earlier_checksum).decode().split()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not fields or not _valid_digest(fields[0]):
+            continue
+        recovery_generations.append(RecoveryGeneration(earlier_step, earlier_package, fields[0]))
     return RemoteSource(
         candidate,
         origin,
@@ -329,6 +364,7 @@ def _sidecar_source(remote: S3Store, config: S3Config, candidate: RemoteCandidat
         completion_key,
         completion_data,
         (completion_key, candidate.locator, pair[1], pair[0]),
+        tuple(recovery_generations),
     )
 
 
@@ -466,6 +502,25 @@ def _preserved_files(root: Path) -> dict[str, tuple[int, str]]:
     return result
 
 
+def _fingerprint_difference(
+    expected: dict[str, tuple[int, str]],
+    actual: dict[str, tuple[int, str]],
+) -> str:
+    def limited(values: list[str]) -> list[str]:
+        return values[:20] + ([f"... and {len(values) - 20} more"] if len(values) > 20 else [])
+
+    shared = expected.keys() & actual.keys()
+    missing = sorted(expected.keys() - actual.keys())
+    added = sorted(actual.keys() - expected.keys())
+    content_changed = sorted(path for path in shared if expected[path][1] != actual[path][1])
+    executable_changed = sorted(path for path in shared if expected[path][0] != actual[path][0])
+    return (
+        f"missing={limited(missing)}, added={limited(added)}, "
+        f"content_changed={limited(content_changed)}, "
+        f"executable_changed={limited(executable_changed)}"
+    )
+
+
 def _download(
     remote: S3Store,
     source: RemoteSource,
@@ -550,6 +605,116 @@ def _download(
             raise ValueError("invalid numeric HEAD step")
         history = collector.finish(int(head_value))
     return downloaded_size, had_bundle, history
+
+
+def _recover_git_history(
+    remote: S3Store,
+    source: RemoteSource,
+    work: Path,
+    root: Path,
+    _source_steps: list[SourceStep],
+    missing: set[str],
+    progress: ProgressCallback | None = None,
+) -> bool:
+    """Recover referenced objects from checksum-verified earlier generations.
+
+    A generation is accepted as an object source only when it belongs to the
+    same indexed session and its archive bytes match its content-addressed
+    digest. Only the exact commit IDs named by the selected generation are
+    imported; older manifests and disconnected objects may provide those
+    bytes, but the selected manifests remain authoritative.
+    """
+    remaining = set(missing)
+    recovered_any = False
+    repository = GitSnapshotStore(root / "snapshots.git")
+    generations = source.recovery_generations
+    for index, generation in enumerate(generations, start=1):
+        if not remaining:
+            break
+        if progress is not None:
+            progress(index - 1, max(len(generations), 1), "checking older Git generation")
+        with tempfile.TemporaryDirectory(
+            prefix=f"memo-git-recovery-{generation.step}-", dir=work
+        ) as recovery_name:
+            recovery_root = Path(recovery_name) / source.session_id
+            recovery_root.mkdir()
+            recovery_source = RemoteSource(
+                source.candidate,
+                source.origin,
+                generation.step,
+                generation.object_key,
+                generation.digest,
+                generation.archive_kind,
+                source.base,
+                None,
+                None,
+                (),
+            )
+            recovery_download_progress = None
+            if progress is not None:
+
+                def recovery_download_progress(
+                    completed: int,
+                    total: int,
+                    message: str,
+                ) -> None:
+                    fraction = max(0.0, min(completed / max(total, 1), 1.0))
+                    progress(
+                        round(((index - 1) + fraction) * 1000),
+                        max(len(generations), 1) * 1000,
+                        message,
+                    )
+
+            _, had_bundle, history = _download(
+                remote,
+                recovery_source,
+                recovery_root,
+                progress=recovery_download_progress,
+            )
+            metadata = json.loads((recovery_root / "session.json").read_bytes())
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("format") != "memo-directory-session"
+                or metadata.get("session_id") != source.session_id
+            ):
+                raise ValueError("older generation has mismatched session metadata")
+            if history is None or not history.steps:
+                continue
+            published_commit = history.steps[-1].source_commit
+            object_source = (
+                recovery_root / "snapshots.bundle"
+                if had_bundle
+                else recovery_root / "snapshots.git"
+            )
+            if not object_source.exists():
+                continue
+            if object_source.is_dir():
+                source_repository = GitSnapshotStore(object_source)
+                actual_source_tip = source_repository.published_commit()
+                # Some historical archives contain an empty snapshots.git
+                # directory. It is not evidence for any missing object and
+                # must not prevent searching still-older generations.
+                if actual_source_tip is None:
+                    continue
+                if published_commit and actual_source_tip != published_commit:
+                    continue
+                if not source_repository.contains_many(remaining):
+                    continue
+            actual_tip = repository.import_objects(
+                object_source,
+                f"{generation.step}-{generation.digest[:16]}",
+                remaining,
+            )
+            if published_commit and actual_tip != published_commit:
+                raise ValueError("older Git generation tip does not match its manifest")
+            recovered = repository.contains_many(remaining)
+            remaining -= recovered
+            recovered_any = recovered_any or bool(recovered)
+        if progress is not None:
+            progress(
+                index, max(len(generations), 1), f"recovered Git objects; {len(remaining)} missing"
+            )
+    return recovered_any
 
 
 def _store(root: Path) -> SessionStore:
@@ -720,8 +885,13 @@ def _verify_replacement(
         with tempfile.TemporaryDirectory(prefix="verify-snapshot-", dir=root.parent) as name:
             restored = Path(name) / "tree"
             repository.restore(manifest.snapshot_commit or "", restored)
-            if snapshot_fingerprint(restored) != result.snapshots_by_tree[tree_id]:
-                raise ValueError("replacement filesystem bytes do not match the source")
+            expected_fingerprint = result.snapshots_by_tree[tree_id]
+            actual_fingerprint = snapshot_fingerprint(restored)
+            if actual_fingerprint != expected_fingerprint:
+                raise ValueError(
+                    "replacement filesystem bytes do not match the source "
+                    f"({_fingerprint_difference(expected_fingerprint, actual_fingerprint)})"
+                )
         if progress is not None:
             progress(index, total_snapshots, f"verified unique tree {index}/{total_snapshots}")
     actual_preserved = _preserved_files(root)
@@ -744,6 +914,7 @@ def _prepare_replacement(
     source: RemoteSource,
     work: Path,
     progress: ProgressCallback | None = None,
+    best_effort: bool = False,
 ) -> Replacement:
     extracted = work / source.session_id
     extracted.mkdir()
@@ -756,6 +927,25 @@ def _prepare_replacement(
     _report(progress, 48, "fingerprinting preserved session data")
     expected_preserved = _preserved_files(extracted)
     _report(progress, 50, "upgrading session in scratch")
+    recover_git_history = None
+    if source.recovery_generations:
+
+        def recover_git_history(
+            root: Path,
+            steps: list[SourceStep],
+            missing: set[str],
+            recovery_progress: ProgressCallback | None,
+        ) -> bool:
+            return _recover_git_history(
+                remote,
+                source,
+                work,
+                root,
+                steps,
+                missing,
+                recovery_progress,
+            )
+
     result = upgrade_session(
         extracted,
         source.session_id,
@@ -766,7 +956,41 @@ def _prepare_replacement(
         remote_complete=source.completion_key is not None,
         progress=_progress_range(progress, 50, 75),
         numeric_history=numeric_history,
+        recover_git_history=recover_git_history,
+        best_effort=best_effort,
     )
+    if result.best_effort_substitutions:
+        report_path = extracted / BEST_EFFORT_REPORT
+        if report_path.exists():
+            raise ValueError(f"source session already contains reserved file: {BEST_EFFORT_REPORT}")
+        report = {
+            "schema_version": 1,
+            "mode": "best-effort",
+            "session_id": source.session_id,
+            "source_archive": {
+                "object_key": source.object_key,
+                "sha256": source.digest,
+                "size_bytes": original_size,
+                "retained_in_s3": True,
+            },
+            "substitution_policy": "nearest verified state; prefer preceding on ties",
+            "substitutions": [
+                {
+                    "step": substitution.step,
+                    "missing_commit": substitution.missing_commit,
+                    "substitute_step": substitution.substitute_step,
+                    "substitute_commit": substitution.substitute_commit,
+                    "direction": substitution.direction,
+                }
+                for substitution in result.best_effort_substitutions
+            ],
+        }
+        atomic_write(report_path, _canonical_json(report) + b"\n")
+        report_path.chmod(0o644)
+        expected_preserved[BEST_EFFORT_REPORT] = (
+            report_path.stat().st_mode & 0o777,
+            _file_digest(report_path),
+        )
     prepared = prepare_generation(
         _store(extracted),
         result.session,
@@ -797,7 +1021,14 @@ def _prepare_replacement(
             progress=_progress_range(progress, 88, 100),
         )
         _report(progress, 100, "replacement verified locally")
-        return Replacement(source, result.session, prepared, original_size, result.source_format)
+        return Replacement(
+            source,
+            result.session,
+            prepared,
+            original_size,
+            result.source_format,
+            result.best_effort_substitutions,
+        )
     except BaseException:
         prepared.cleanup()
         raise
@@ -916,11 +1147,18 @@ def _install_replacement(
                 remote.remove(generation)
             raise
 
+        retain_source = bool(replacement.best_effort_substitutions)
         for key in source.cleanup_keys:
-            if key != source.object_key:
+            if key != source.object_key and not (
+                retain_source and key == f"{source.object_key}.sha256"
+            ):
                 remote.remove(key)
-        # The source archive is always the final destructive operation.
-        remote.remove(source.object_key)
+        # An equivalent migration removes the source archive last. A
+        # best-effort replacement is intentionally not equivalent, so its
+        # original bytes (and sidecar checksum, when present) remain available
+        # for forensic recovery.
+        if not retain_source:
+            remote.remove(source.object_key)
         _report(progress, 100, "replacement installed")
     finally:
         with suppress(Exception):
@@ -936,6 +1174,8 @@ def recompress_s3(
     progress: ProgressCallback | None = None,
     item_progress: ProgressCallback | None = None,
     workers: int = 4,
+    session_ids: list[str] | None = None,
+    best_effort: bool = False,
 ) -> S3RecompressionSummary:
     """Detect and upgrade every indexed historical S3 session format."""
     if not 1 <= workers <= 8:
@@ -946,6 +1186,13 @@ def recompress_s3(
     if progress is not None:
         progress(0, 1, "discovering indexed S3 sessions")
     candidates = discover_remote_candidates(remote, config)
+    if session_ids is not None:
+        requested = {validate_session_id(session_id) for session_id in session_ids}
+        available = {candidate.session_id for candidate in candidates}
+        missing_sessions = sorted(requested - available)
+        if missing_sessions:
+            raise ValueError(f"indexed S3 session not found: {', '.join(missing_sessions)}")
+        candidates = [candidate for candidate in candidates if candidate.session_id in requested]
     summary = S3RecompressionSummary(sources=len(candidates))
     if not candidates:
         if progress is not None:
@@ -995,7 +1242,12 @@ def recompress_s3(
                 dir=scratch,
             ) as work_name:
                 if progress is None and item_progress is None:
-                    replacement = _prepare_replacement(remote, source, Path(work_name))
+                    replacement = _prepare_replacement(
+                        remote,
+                        source,
+                        Path(work_name),
+                        best_effort=best_effort,
+                    )
                 else:
                     prepare_progress = (
                         session_progress if dry_run else _progress_range(session_progress, 0, 70)
@@ -1005,6 +1257,7 @@ def recompress_s3(
                         source,
                         Path(work_name),
                         progress=prepare_progress,
+                        best_effort=best_effort,
                     )
                 prepared = replacement.prepared
                 if not dry_run:
@@ -1023,6 +1276,7 @@ def recompress_s3(
                     source_format=replacement.source_format,
                     original_bytes=replacement.original_size,
                     replacement_bytes=replacement.prepared.size_bytes,
+                    best_effort_substitutions=len(replacement.best_effort_substitutions),
                 )
         except (AlreadyLatest, NotEligible) as error:
             return CandidateOutcome(candidate.session_id, "skipped", str(error))
@@ -1057,6 +1311,9 @@ def recompress_s3(
             summary.formats[outcome.session_id] = outcome.source_format
             summary.original_bytes += outcome.original_bytes
             summary.replacement_bytes += outcome.replacement_bytes
+            if outcome.best_effort_substitutions:
+                summary.best_effort[outcome.session_id] = outcome.best_effort_substitutions
+                summary.retained_original_bytes += outcome.original_bytes
         elif outcome.status == "skipped":
             summary.skipped.append((outcome.session_id, outcome.detail))
         else:

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
-import tarfile
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
@@ -25,35 +25,171 @@ class GitSnapshotStore:
         if (self.path / "HEAD").is_file() and (self.path / "objects").is_dir():
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._run("init", "--bare", "--quiet", str(self.path), cwd=self.path.parent)
+        self._run(
+            "init",
+            "--bare",
+            "--quiet",
+            "--object-format=sha1",
+            str(self.path),
+            cwd=self.path.parent,
+        )
 
     def commit(self, tree: Path, parent: str | None, message: str) -> str:
         tree_id = self.write_tree(tree)
         return self.commit_tree(tree_id, parent, message)
 
     def write_tree(self, tree: Path) -> str:
-        """Store a filesystem tree and return its content-addressed tree ID."""
+        """Store every regular file literally and return its content-addressed tree ID.
+
+        Ordinary ``git add`` is intentionally not used here. It consults ignore
+        rules and clean filters, and treats embedded repositories as gitlinks;
+        all three behaviours can silently make a recorded snapshot differ from
+        the filesystem bytes Memo was asked to preserve.
+        """
         self.initialize()
-        index_fd, index_name = tempfile.mkstemp(prefix="git-index-", dir=tree.parent)
-        os.close(index_fd)
-        os.unlink(index_name)
-        try:
-            environment = {**os.environ, "GIT_INDEX_FILE": index_name}
-            self._run(
-                "--git-dir",
-                str(self.path),
-                "--work-tree",
-                str(tree),
-                "add",
-                "--all",
-                ".",
-                env=environment,
+        root = tree.resolve()
+        files: list[tuple[tuple[bytes, ...], Path, int]] = []
+        for path in sorted(tree.rglob("*"), key=lambda item: os.fsencode(item.as_posix())):
+            metadata = path.lstat()
+            if stat.S_ISDIR(metadata.st_mode):
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise GitSnapshotError(f"unsupported snapshot entry: {path.relative_to(tree)}")
+            resolved = path.resolve()
+            resolved.relative_to(root)
+            relative = path.relative_to(tree)
+            parts = tuple(os.fsencode(part) for part in relative.parts)
+            mode = 0o100755 if metadata.st_mode & 0o111 else 0o100644
+            files.append((parts, path, mode))
+
+        object_ids = self._hash_files_literally(tree, [path for _, path, _ in files])
+        directories: dict[tuple[bytes, ...], list[tuple[int, bytes, str, bytes]]] = {}
+        for (parts, _path, mode), object_id in zip(files, object_ids, strict=True):
+            directories.setdefault(parts[:-1], []).append((mode, b"blob", object_id, parts[-1]))
+            for depth in range(len(parts)):
+                directories.setdefault(parts[:depth], [])
+
+        if not directories:
+            return (
+                self._run_bytes("--git-dir", str(self.path), "mktree", input_data=b"")
+                .decode()
+                .strip()
             )
-            return self._run(
-                "--git-dir", str(self.path), "write-tree", env=environment
-            ).stdout.strip()
-        finally:
-            Path(index_name).unlink(missing_ok=True)
+
+        tree_ids: dict[tuple[bytes, ...], str] = {}
+        for depth in range(max(map(len, directories)), -1, -1):
+            at_depth = sorted(directory for directory in directories if len(directory) == depth)
+            payloads = []
+            for directory in at_depth:
+                entries = list(directories[directory])
+                children = {
+                    child[: len(directory) + 1]
+                    for child in directories
+                    if len(child) > len(directory) and child[: len(directory)] == directory
+                }
+                for child in children:
+                    child_id = tree_ids.get(child)
+                    if child_id is not None:
+                        entries.append((0o40000, b"tree", child_id, child[-1]))
+                payloads.append(
+                    b"".join(
+                        f"{mode:o} ".encode()
+                        + kind
+                        + b" "
+                        + object_id.encode()
+                        + b"\t"
+                        + name
+                        + b"\0"
+                        for mode, kind, object_id, name in entries
+                    )
+                    + b"\0"
+                )
+            try:
+                output = self._run_bytes(
+                    "--git-dir",
+                    str(self.path),
+                    "mktree",
+                    "-z",
+                    "--batch",
+                    input_data=b"".join(payloads),
+                )
+                object_ids = output.decode().splitlines()
+            except GitSnapshotError:
+                # Retry a rejected batch one tree at a time. This preserves the
+                # literal, NUL-delimited names and confines the slower path to
+                # snapshots for which the fast batch operation failed. Invalid
+                # individual input still fails closed on the second attempt.
+                object_ids = []
+                for payload in payloads:
+                    entries = payload[:-1]
+                    if entries:
+                        object_id = (
+                            self._run_bytes(
+                                "--git-dir",
+                                str(self.path),
+                                "mktree",
+                                "-z",
+                                input_data=entries,
+                            )
+                            .decode()
+                            .strip()
+                        )
+                    else:
+                        object_id = (
+                            self._run_bytes("--git-dir", str(self.path), "mktree", input_data=b"")
+                            .decode()
+                            .strip()
+                        )
+                    object_ids.append(object_id)
+            if len(object_ids) != len(at_depth):
+                raise GitSnapshotError("git snapshot operation returned an incomplete tree list")
+            tree_ids.update(zip(at_depth, object_ids, strict=True))
+        return tree_ids[()]
+
+    def _hash_files_literally(self, root: Path, files: list[Path]) -> list[str]:
+        """Hash paths without attributes, newline conversion, or clean filters."""
+        if not files:
+            return []
+        ordinary: list[tuple[int, bytes]] = []
+        result: list[str | None] = [None] * len(files)
+        for index, path in enumerate(files):
+            relative = os.fsencode(path.relative_to(root))
+            if b"\n" in relative or b"\r" in relative:
+                output = self._run_bytes(
+                    "--git-dir",
+                    str(self.path),
+                    "hash-object",
+                    "-w",
+                    "--no-filters",
+                    "--",
+                    relative,
+                    cwd=root,
+                )
+                result[index] = output.decode().strip()
+            else:
+                ordinary.append((index, relative))
+        if ordinary:
+            output = (
+                self._run_bytes(
+                    "--git-dir",
+                    str(self.path),
+                    "hash-object",
+                    "-w",
+                    "--no-filters",
+                    "--stdin-paths",
+                    cwd=root,
+                    input_data=b"".join(path + b"\n" for _, path in ordinary),
+                )
+                .decode()
+                .splitlines()
+            )
+            if len(output) != len(ordinary):
+                raise GitSnapshotError("git snapshot operation returned an incomplete object list")
+            for (index, _), object_id in zip(ordinary, output, strict=True):
+                result[index] = object_id
+        if any(object_id is None for object_id in result):
+            raise GitSnapshotError("git snapshot operation did not store every file")
+        return [object_id for object_id in result if object_id is not None]
 
     def commit_tree(self, tree_id: str, parent: str | None, message: str) -> str:
         """Commit a previously written tree and advance the snapshot ref."""
@@ -91,6 +227,18 @@ class GitSnapshotStore:
             text=True,
         )
         return result.returncode == 0
+
+    def published_commit(self) -> str | None:
+        """Return the snapshot branch tip, or None for an incomplete repository."""
+        if not self.path.is_dir():
+            return None
+        result = subprocess.run(
+            ["git", "--git-dir", str(self.path), "rev-parse", "--verify", self.REF],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
 
     def contains_many(self, commits: Iterable[str]) -> set[str]:
         """Return which of ``commits`` this repository holds, in one Git invocation.
@@ -285,34 +433,146 @@ class GitSnapshotStore:
             shutil.rmtree(self.path, ignore_errors=True)
             raise
 
+    def import_objects(
+        self,
+        source: Path,
+        namespace: str,
+        required_commits: Iterable[str] = (),
+    ) -> str:
+        """Fetch one snapshot ref without changing the published snapshot ref."""
+        self.initialize()
+        required = list(dict.fromkeys(required_commits))
+        source_is_bundle = source.is_file()
+        source_is_repository = source.is_dir()
+        if source_is_bundle == source_is_repository:
+            raise GitSnapshotError("snapshot recovery source is missing or ambiguous")
+        if source_is_bundle:
+            fields = self._run("bundle", "list-heads", str(source), self.REF).stdout.split()
+            if len(fields) != 2 or fields[1] != self.REF:
+                raise GitSnapshotError("snapshot recovery bundle is missing its published ref")
+            source_ref = fields[0]
+        else:
+            source_store = GitSnapshotStore(source)
+            source_ref = source_store._run(
+                "--git-dir", str(source), "rev-parse", "--verify", self.REF
+            ).stdout.strip()
+            available = source_store.contains_many(required)
+        safe_namespace = "".join(
+            character if character.isalnum() or character in {"-", "_"} else "-"
+            for character in namespace
+        )
+        recovery_root = f"refs/memo/recovery/{safe_namespace}"
+        recovery_ref = f"{recovery_root}/tip"
+        source_refspec = self.REF
+        if source_is_repository:
+            # Pin every available, explicitly requested commit under one
+            # controlled namespace in the disposable source repository. A
+            # wildcard fetch then transfers the published tip and all required
+            # disconnected objects in one Git process. This avoids repeatedly
+            # reopening a temporary repository while still letting fetch and
+            # later fsck validate the imported object graph.
+            export_root = f"refs/memo/export/{safe_namespace}"
+            commands = [f"create {export_root}/tip {source_ref}\n"]
+            commands.extend(
+                f"create {export_root}/objects/{index:08d} {commit}\n"
+                for index, commit in enumerate(required)
+                if commit in available
+            )
+            source_store._run_bytes(
+                "--git-dir",
+                str(source),
+                "update-ref",
+                "--stdin",
+                input_data="".join(commands).encode(),
+            )
+            source_refspec = f"{export_root}/*"
+        self._run(
+            "--git-dir",
+            str(self.path),
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            str(source),
+            f"{source_refspec}:{recovery_root}/*"
+            if source_is_repository
+            else f"{self.REF}:{recovery_ref}",
+        )
+        actual = self._run(
+            "--git-dir", str(self.path), "rev-parse", "--verify", recovery_ref
+        ).stdout.strip()
+        if actual != source_ref:
+            raise GitSnapshotError(
+                f"snapshot recovery tip mismatch: expected {source_ref}, received {actual}"
+            )
+        return actual
+
     def restore(self, commit: str, destination: Path) -> None:
         if not self.contains(commit):
             raise GitSnapshotError(f"snapshot commit is missing: {commit}")
         destination.mkdir(parents=True, exist_ok=True)
-        entries = self._run(
-            "--git-dir", str(self.path), "ls-tree", "-r", "--name-only", commit
-        ).stdout
-        if not entries:
+        raw_entries = self._run_bytes(
+            "--git-dir", str(self.path), "ls-tree", "-r", "-z", "--full-tree", commit
+        )
+        if not raw_entries:
             return
+        entries: list[tuple[str, int, Path]] = []
+        root = destination.resolve()
+        for raw_entry in raw_entries.rstrip(b"\0").split(b"\0"):
+            metadata, separator, raw_name = raw_entry.partition(b"\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 3:
+                raise GitSnapshotError("snapshot tree contains an invalid entry")
+            raw_mode, kind, raw_object_id = fields
+            if kind != b"blob" or raw_mode not in {b"100644", b"100755"}:
+                raise GitSnapshotError(f"unsupported snapshot entry: {os.fsdecode(raw_name)}")
+            relative = Path(os.fsdecode(raw_name))
+            if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+                raise GitSnapshotError(f"unsafe snapshot entry: {os.fsdecode(raw_name)}")
+            target = destination / relative
+            try:
+                target.resolve().relative_to(root)
+            except ValueError as error:
+                raise GitSnapshotError(f"unsafe snapshot entry: {os.fsdecode(raw_name)}") from error
+            entries.append((raw_object_id.decode(), int(raw_mode, 8), target))
+
         process = subprocess.Popen(
-            ["git", "--git-dir", str(self.path), "archive", "--format=tar", commit],
+            ["git", "--git-dir", str(self.path), "cat-file", "--batch"],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        assert process.stdin is not None
         assert process.stdout is not None
         try:
-            with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
-                for member in archive:
-                    if member.issym() or member.islnk() or member.isdev():
-                        raise GitSnapshotError(f"unsupported snapshot entry: {member.name}")
-                    target = (destination / member.name).resolve()
-                    target.relative_to(destination.resolve())
-                    archive.extract(member, destination)
+            for object_id, mode, target in entries:
+                process.stdin.write(f"{object_id}\n".encode())
+                process.stdin.flush()
+                header = process.stdout.readline().decode(errors="replace").strip().split()
+                if len(header) != 3 or header[0] != object_id or header[1] != "blob":
+                    raise GitSnapshotError(f"snapshot blob is missing or invalid: {object_id}")
+                size = int(header[2])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    raise GitSnapshotError(
+                        f"duplicate snapshot entry: {target.relative_to(destination)}"
+                    )
+                remaining = size
+                with target.open("xb") as handle:
+                    while remaining:
+                        chunk = process.stdout.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise GitSnapshotError(f"snapshot blob is truncated: {object_id}")
+                        handle.write(chunk)
+                        remaining -= len(chunk)
+                if process.stdout.read(1) != b"\n":
+                    raise GitSnapshotError(f"snapshot blob has invalid framing: {object_id}")
+                target.chmod(0o755 if mode == 0o100755 else 0o644)
+            process.stdin.close()
         except GitSnapshotError:
             process.kill()
             process.wait()
             raise
-        except (OSError, tarfile.TarError, ValueError) as error:
+        except (OSError, ValueError) as error:
             process.kill()
             process.wait()
             raise GitSnapshotError(f"could not restore snapshot {commit}") from error
@@ -335,3 +595,23 @@ class GitSnapshotStore:
             detail = getattr(error, "stderr", "") or str(error)
             raise GitSnapshotError(f"git snapshot operation failed: {detail.strip()}") from error
         return result
+
+    @staticmethod
+    def _run_bytes(
+        *arguments: str | bytes,
+        cwd: Path | None = None,
+        input_data: bytes | None = None,
+    ) -> bytes:
+        try:
+            result = subprocess.run(
+                [os.fsencode("git"), *(os.fsencode(value) for value in arguments)],
+                cwd=cwd,
+                input=input_data,
+                capture_output=True,
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            stderr = getattr(error, "stderr", b"")
+            detail = os.fsdecode(stderr).strip() if stderr else str(error)
+            raise GitSnapshotError(f"git snapshot operation failed: {detail}") from error
+        return result.stdout

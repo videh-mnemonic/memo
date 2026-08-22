@@ -42,12 +42,22 @@ class SourceStep:
 
 
 @dataclass(frozen=True)
+class BestEffortSubstitution:
+    step: int
+    missing_commit: str
+    substitute_step: int
+    substitute_commit: str | None
+    direction: str
+
+
+@dataclass(frozen=True)
 class UpgradeResult:
     source_format: str
     session: DirectorySession
     tree_ids: list[str]
     entries: list[list[SnapshotEntry]]
     snapshots_by_tree: dict[str, dict[str, tuple[int, str]]]
+    best_effort_substitutions: tuple[BestEffortSubstitution, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,6 +68,7 @@ class NumericHistory:
 
 
 ProgressCallback = Callable[[int, int, str], None]
+GitRecoveryCallback = Callable[[Path, list[SourceStep], set[str], ProgressCallback | None], bool]
 
 
 def _progress_range(
@@ -76,6 +87,50 @@ def _progress_range(
 def _report(progress: ProgressCallback | None, completed: int, total: int, message: str) -> None:
     if progress is not None:
         progress(completed, total, message)
+
+
+def _substitute_missing_states(
+    source_steps: list[SourceStep], present: set[str]
+) -> tuple[BestEffortSubstitution, ...]:
+    available = [
+        index
+        for index, step in enumerate(source_steps)
+        if (step.source_commit is not None and step.source_commit in present)
+        or (step.source_snapshot is not None and step.source_snapshot.is_dir())
+    ]
+    if not available:
+        raise ValueError("best-effort upgrade found no verified filesystem state to substitute")
+
+    substitutions = []
+    for index, step in enumerate(source_steps):
+        missing_commit = step.source_commit
+        if missing_commit is None or missing_commit in present:
+            continue
+        substitute_index = min(
+            available,
+            key=lambda candidate: (
+                abs(candidate - index),
+                candidate > index,
+                candidate,
+            ),
+        )
+        substitute = source_steps[substitute_index]
+        source_steps[index] = replace(
+            step,
+            source_snapshot=substitute.source_snapshot,
+            source_commit=substitute.source_commit,
+            entries=substitute.entries,
+        )
+        substitutions.append(
+            BestEffortSubstitution(
+                index,
+                missing_commit,
+                substitute_index,
+                substitute.source_commit,
+                "preceding" if substitute_index < index else "following",
+            )
+        )
+    return tuple(substitutions)
 
 
 class AlreadyLatest(ValueError):
@@ -398,7 +453,11 @@ def snapshot_fingerprint(tree: Path) -> dict[str, tuple[int, str]]:
             continue
         with path.open("rb") as handle:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
-        result[path.relative_to(tree).as_posix()] = (path.stat().st_mode & 0o111, digest)
+        # Git records one executable bit, not distinct owner/group/other
+        # execute permissions. Canonicalize to that representable semantic so
+        # 0700 and 0755 remain executable while 0600 and 0644 remain ordinary.
+        executable = int(bool(path.stat().st_mode & 0o111))
+        result[path.relative_to(tree).as_posix()] = (executable, digest)
     return result
 
 
@@ -683,6 +742,8 @@ def upgrade_session(
     remote_complete: bool = False,
     progress: ProgressCallback | None = None,
     numeric_history: NumericHistory | None = None,
+    recover_git_history: GitRecoveryCallback | None = None,
+    best_effort: bool = False,
 ) -> UpgradeResult:
     """Upgrade an extracted session and return its verified semantic state."""
     session_id = validate_session_id(session_id)
@@ -720,6 +781,46 @@ def upgrade_session(
             f"archive HEAD {source_head} does not match selected remote step {expected_step}"
         )
 
+    recovered_git_history = False
+    history_requires_rebuild = False
+    best_effort_substitutions: tuple[BestEffortSubstitution, ...] = ()
+    source_commits = [step.source_commit for step in source_steps if step.source_commit]
+    if source_commits:
+        repository = GitSnapshotStore(root / "snapshots.git")
+        present = repository.contains_many(source_commits)
+        missing = set(source_commits) - present
+        if missing and recover_git_history is not None:
+            recovered_git_history = recover_git_history(
+                root,
+                source_steps,
+                missing,
+                _progress_range(progress, 20, 35),
+            )
+            present = repository.contains_many(source_commits)
+            missing = set(source_commits) - present
+        if missing:
+            if best_effort:
+                best_effort_substitutions = _substitute_missing_states(source_steps, present)
+                history_requires_rebuild = True
+            else:
+                detail = f"source Git history is missing {len(missing)} snapshot commit(s)"
+                if recover_git_history is not None:
+                    detail += " after checking all checksum-verified older generations"
+                raise ValueError(detail)
+        final_commit = source_steps[-1].source_commit
+        outside_published_history = bool(best_effort_substitutions)
+        if not outside_published_history:
+            outside_published_history = final_commit is None or not set(source_commits).issubset(
+                repository.reachable_from(final_commit)
+            )
+        # Only a commit recovered from a checksum-verified older generation has
+        # independent provenance that permits linearizing a formerly forked
+        # history. An unrelated object merely found in the selected repository
+        # remains an error in _preserve_git_history below.
+        history_requires_rebuild = history_requires_rebuild or (
+            recovered_git_history and outside_published_history
+        )
+
     if format_version == 2:
         schema_label = "-".join(str(value) for value in sorted(set(schemas)))
         representation = (
@@ -736,6 +837,8 @@ def upgrade_session(
             and schemas
             and all(schema == STEP_SCHEMA_VERSION for schema in schemas)
             and raw_session.get("state") == "complete"
+            and not recovered_git_history
+            and not history_requires_rebuild
         ):
             session = DirectorySession.from_dict(raw_session)
             if session.session_id != session_id:
@@ -751,7 +854,11 @@ def upgrade_session(
     )
     atomic_write(root / "session.json", _json_bytes(session.to_dict()))
     history_progress = _progress_range(progress, 20, 100)
-    if source_steps and all(source.source_commit for source in source_steps):
+    if (
+        source_steps
+        and all(source.source_commit for source in source_steps)
+        and not history_requires_rebuild
+    ):
         trees, entries, snapshots_by_tree = _preserve_git_history(
             root,
             session_id,
@@ -770,4 +877,11 @@ def upgrade_session(
     manifests = _store(root).steps(session_id)
     if [manifest.entries for manifest in manifests] != entries:
         raise ValueError("upgraded entry metadata did not validate")
-    return UpgradeResult(source_format, session, trees, entries, snapshots_by_tree)
+    return UpgradeResult(
+        source_format,
+        session,
+        trees,
+        entries,
+        snapshots_by_tree,
+        best_effort_substitutions,
+    )

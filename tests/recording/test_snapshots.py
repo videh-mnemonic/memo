@@ -229,20 +229,146 @@ def test_compact_manifest_rejects_redundant_entries_but_reads_schema_two() -> No
         StepManifest(**without_commit, schema_version=2).validate()
 
 
-def test_git_restore_rejects_symlink_entries(tmp_path: Path) -> None:
+def test_git_snapshot_rejects_symlink_entries_before_storing_them(tmp_path: Path) -> None:
     tree = tmp_path / "tree"
     tree.mkdir()
     os.symlink("/etc/passwd", tree / "escape")
     repository = GitSnapshotStore(tmp_path / "snapshots.git")
-    commit = repository.commit(tree, None, "unsafe")
+    with pytest.raises(GitSnapshotError, match="unsupported snapshot entry"):
+        repository.commit(tree, None, "unsafe")
+
+
+def test_git_restore_rejects_imported_symlink_entries(tmp_path: Path) -> None:
+    repository = GitSnapshotStore(tmp_path / "snapshots.git")
+    repository.initialize()
+    blob = (
+        subprocess.run(
+            ["git", "--git-dir", str(repository.path), "hash-object", "-w", "--stdin"],
+            input=b"/etc/passwd",
+            capture_output=True,
+            check=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    tree = subprocess.run(
+        ["git", "--git-dir", str(repository.path), "mktree"],
+        input=f"120000 blob {blob}\tescape\n",
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    commit = repository.commit_tree(tree, None, "unsafe imported tree")
 
     with pytest.raises(GitSnapshotError, match="unsupported snapshot entry"):
         repository.restore(commit, tmp_path / "restored")
 
 
-def test_git_restore_handles_empty_tree(tmp_path: Path) -> None:
+def test_git_snapshot_stores_ignored_filtered_and_embedded_repository_files(
+    tmp_path: Path,
+) -> None:
     tree = tmp_path / "tree"
     tree.mkdir()
+    (tree / ".gitignore").write_text("ignored.txt\n")
+    (tree / "ignored.txt").write_bytes(b"ignored but recorded\r\n")
+    (tree / ".gitattributes").write_text("*.txt text eol=lf\n")
+    nested = tree / "nested"
+    nested.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(nested)], check=True)
+    (nested / "untracked.txt").write_bytes(b"nested bytes\r\n")
+    newline = tree / "line\nbreak.bin"
+    newline.write_bytes(b"unusual name")
+    executable = tree / "executable"
+    executable.write_bytes(b"#!/bin/sh\n")
+    executable.chmod(0o755)
+
+    repository = GitSnapshotStore(tmp_path / "snapshots.git")
+    commit = repository.commit(tree, None, "literal")
+    restored = tmp_path / "restored"
+    repository.restore(commit, restored)
+
+    expected = {
+        path.relative_to(tree).as_posix(): (path.stat().st_mode & 0o111, path.read_bytes())
+        for path in tree.rglob("*")
+        if path.is_file()
+    }
+    actual = {
+        path.relative_to(restored).as_posix(): (path.stat().st_mode & 0o111, path.read_bytes())
+        for path in restored.rglob("*")
+        if path.is_file()
+    }
+    assert actual == expected
+
+
+def test_git_snapshot_retries_mktree_without_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = tmp_path / "tree"
+    nested = tree / "nested"
+    nested.mkdir(parents=True)
+    (tree / "root.txt").write_bytes(b"root bytes")
+    (nested / "child.txt").write_bytes(b"child bytes")
+    original = GitSnapshotStore._run_bytes
+    batch_attempted = False
+
+    def reject_batch(*arguments, **kwargs):
+        nonlocal batch_attempted
+        if "mktree" in arguments and "--batch" in arguments:
+            batch_attempted = True
+            raise GitSnapshotError("injected batched mktree rejection")
+        return original(*arguments, **kwargs)
+
+    monkeypatch.setattr(GitSnapshotStore, "_run_bytes", staticmethod(reject_batch))
+    repository = GitSnapshotStore(tmp_path / "snapshots.git")
+    commit = repository.commit(tree, None, "fallback")
+    restored = tmp_path / "restored"
+    repository.restore(commit, restored)
+
+    assert batch_attempted
+    assert (restored / "root.txt").read_bytes() == b"root bytes"
+    assert (restored / "nested" / "child.txt").read_bytes() == b"child bytes"
+
+
+def test_git_object_recovery_imports_required_unreachable_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = GitSnapshotStore(tmp_path / "source.git")
+    first = tmp_path / "first"
+    first.mkdir()
+    (first / "file").write_text("needed")
+    needed = source.commit(first, None, "needed")
+    second = tmp_path / "second"
+    second.mkdir()
+    (second / "file").write_text("published")
+    published = source.commit(second, None, "published")
+
+    original = GitSnapshotStore._run
+    fetches = 0
+
+    def count_fetches(*arguments, **kwargs):
+        nonlocal fetches
+        if "fetch" in arguments:
+            fetches += 1
+        return original(*arguments, **kwargs)
+
+    monkeypatch.setattr(GitSnapshotStore, "_run", staticmethod(count_fetches))
+    target = GitSnapshotStore(tmp_path / "target.git")
+    assert target.import_objects(source.path, "test", [needed]) == published
+    assert target.contains(needed)
+    assert fetches == 1
+
+
+def test_git_restore_handles_empty_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    original = GitSnapshotStore._run
+
+    def reject_inherited_mktree_stdin(*arguments, **kwargs):
+        if "mktree" in arguments:
+            raise AssertionError("mktree must receive explicit stdin")
+        return original(*arguments, **kwargs)
+
+    monkeypatch.setattr(GitSnapshotStore, "_run", staticmethod(reject_inherited_mktree_stdin))
     repository = GitSnapshotStore(tmp_path / "snapshots.git")
     commit = repository.commit(tree, None, "empty")
 

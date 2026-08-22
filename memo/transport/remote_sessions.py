@@ -7,7 +7,8 @@ import json
 import re
 import tarfile
 import tempfile
-from collections.abc import Callable
+from bisect import bisect_left
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,7 @@ GENERATION_NAME = re.compile(r"^(\d{8,})-([0-9a-f]{64})\.tar\.zst$")
 COMPLETION_NAME = re.compile(r"^(\d{8,})-([0-9a-f]{64})\.json$")
 INDEX_NAME = re.compile(r"^([0-9a-f]{64})\.json$")
 MAX_PULL_WORKERS = 4
+MAX_ARCHIVE_STATUS_WORKERS = 16
 ProgressCallback = Callable[[int, int, str], None]
 
 
@@ -65,6 +67,34 @@ class ArchivedSession:
     object_key: str
     size_bytes: int
     complete: bool
+
+
+class _InventoryStore(S3Store):
+    """Serve listings and sizes from one immutable S3 inventory pass."""
+
+    def __init__(self, remote: S3Store, prefix: str) -> None:
+        self.remote = remote
+        self.objects = {item.key: item.size for item in remote.list_info(prefix)}
+        self.keys = sorted(self.objects)
+
+    def list(self, prefix: str) -> Iterator[str]:
+        start = bisect_left(self.keys, prefix)
+        for index in range(start, len(self.keys)):
+            key = self.keys[index]
+            if not key.startswith(prefix):
+                break
+            yield key
+
+    def read_bytes(self, key: str, limit: int = METADATA_SIZE_LIMIT) -> bytes:
+        if key not in self.objects:
+            raise FileNotFoundError(key)
+        return self.remote.read_bytes(key, limit)
+
+    def size(self, key: str) -> int | None:
+        if key not in self.objects:
+            raise FileNotFoundError(key)
+        size = self.objects[key]
+        return self.remote.size(key) if size is None else size
 
 
 def _store(config: S3Config, client: Any | None) -> S3Store:
@@ -415,15 +445,19 @@ def list_archived_sessions(
     config = config or S3Config.discover(required=True)
     assert config is not None
     remote = _store(config, client)
-    session_ids = list_archived_session_ids(config, remote)
+    inventory_prefix = f"{config.prefix}/" if config.prefix else ""
+    inventory = _InventoryStore(remote, inventory_prefix)
+    session_ids = list_archived_session_ids(config, inventory)
     if limit is not None:
         session_ids = session_ids[:limit]
 
     def inspect(session_id: str) -> ArchivedSession:
-        origin = _load_index(remote, config, session_id)
+        origin = _load_index(inventory, config, session_id)
         base = _session_base(config, origin, session_id)
-        step, object_key, _digest, complete = _select_generation(remote, config, base, session_id)
-        size_bytes = remote.size(object_key)
+        step, object_key, _digest, complete = _select_generation(
+            inventory, config, base, session_id
+        )
+        size_bytes = inventory.size(object_key)
         if size_bytes is None:
             raise ValueError(f"remote generation size is unavailable: {session_id}")
         return ArchivedSession(
@@ -437,7 +471,7 @@ def list_archived_sessions(
             complete=complete,
         )
 
-    with ThreadPoolExecutor(max_workers=MAX_PULL_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_ARCHIVE_STATUS_WORKERS) as executor:
         return list(executor.map(inspect, session_ids))
 
 

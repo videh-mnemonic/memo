@@ -120,7 +120,7 @@ class FakeS3:
     def list_objects(self, bucket: str, prefix: str, recursive: bool = True):
         self.operations.append(("list", prefix))
         return (
-            SimpleNamespace(object_name=key)
+            SimpleNamespace(object_name=key, size=len(self.objects[key]))
             for key in sorted(self.objects)
             if key.startswith(prefix)
         )
@@ -522,6 +522,7 @@ def test_list_archived_sessions_reports_selected_s3_object_size(tmp_path: Path) 
     client = FakeS3()
     config = S3Config("bucket", "prefix")
     pushed = push_session(source_store, session, config, client)
+    client.operations.clear()
 
     archived = list_archived_sessions(config, client)
 
@@ -535,6 +536,57 @@ def test_list_archived_sessions_reports_selected_s3_object_size(tmp_path: Path) 
         key for operation, key in client.operations if operation == "get" and "/generations/" in key
     ]
     assert generation_gets == []
+    assert [operation for operation, _key in client.operations].count("list") == 1
+    assert [operation for operation, _key in client.operations].count("get") == 2
+    assert [operation for operation, _key in client.operations].count("stat") == 0
+
+
+def test_list_archived_sessions_uses_one_inventory_for_many_sessions() -> None:
+    client = FakeS3()
+    config = S3Config("bucket", "prefix")
+    expected_ids = [f"session-{index:03d}" for index in range(32)]
+    for index, session_id in enumerate(expected_ids):
+        session = DirectorySession(
+            session_id,
+            "/recorded/root",
+            "created",
+            "updated",
+            SessionOrigin("1.0.0", "user", "host"),
+            state="complete",
+        )
+        index_key, index_data = remote_sessions._index_record(config, session)
+        base = remote_sessions._session_base(config, session.origin, session_id)
+        archive = f"archive-{index}".encode()
+        digest = hashlib.sha256(archive).hexdigest()
+        generation = remote_sessions._generation_key(base, index, digest)
+        completion = remote_sessions._completion_key(base, index, digest)
+        client.objects[index_key] = index_data
+        client.objects[generation] = archive
+        client.objects[completion] = remote_sessions._canonical_json(
+            {
+                "schema_version": 1,
+                "session_id": session_id,
+                "final_step": index,
+                "generation": generation,
+                "sha256": digest,
+            }
+        )
+
+    archived = list_archived_sessions(config, client)
+
+    assert [session.session_id for session in archived] == expected_ids
+    operations = [operation for operation, _key in client.operations]
+    assert operations.count("list") == 1
+    assert operations.count("get") == 2 * len(expected_ids)
+    assert operations.count("stat") == 0
+
+    client.operations.clear()
+    limited = list_archived_sessions(config, client, limit=3)
+    assert [session.session_id for session in limited] == expected_ids[:3]
+    limited_operations = [operation for operation, _key in client.operations]
+    assert limited_operations.count("list") == 1
+    assert limited_operations.count("get") == 6
+    assert limited_operations.count("stat") == 0
 
 
 def test_pull_session_installs_at_exact_external_destination(tmp_path: Path) -> None:
