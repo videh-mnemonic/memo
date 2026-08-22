@@ -228,6 +228,18 @@ class GitSnapshotStore:
         )
         return result.returncode == 0
 
+    def published_commit(self) -> str | None:
+        """Return the snapshot branch tip, or None for an incomplete repository."""
+        if not self.path.is_dir():
+            return None
+        result = subprocess.run(
+            ["git", "--git-dir", str(self.path), "rev-parse", "--verify", self.REF],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
     def contains_many(self, commits: Iterable[str]) -> set[str]:
         """Return which of ``commits`` this repository holds, in one Git invocation.
 

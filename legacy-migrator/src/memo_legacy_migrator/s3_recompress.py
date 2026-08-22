@@ -674,21 +674,31 @@ def _recover_git_history(
             if history is None or not history.steps:
                 continue
             published_commit = history.steps[-1].source_commit
-            if not published_commit:
-                raise ValueError("older Git generation has no published snapshot commit")
             object_source = (
                 recovery_root / "snapshots.bundle"
                 if had_bundle
                 else recovery_root / "snapshots.git"
             )
             if not object_source.exists():
-                raise ValueError("older Git generation is missing its object store")
+                continue
+            if object_source.is_dir():
+                source_repository = GitSnapshotStore(object_source)
+                actual_source_tip = source_repository.published_commit()
+                # Some historical archives contain an empty snapshots.git
+                # directory. It is not evidence for any missing object and
+                # must not prevent searching still-older generations.
+                if actual_source_tip is None:
+                    continue
+                if published_commit and actual_source_tip != published_commit:
+                    continue
+                if not source_repository.contains_many(remaining):
+                    continue
             actual_tip = repository.import_objects(
                 object_source,
                 f"{generation.step}-{generation.digest[:16]}",
                 remaining,
             )
-            if actual_tip != published_commit:
+            if published_commit and actual_tip != published_commit:
                 raise ValueError("older Git generation tip does not match its manifest")
             recovered = repository.contains_many(remaining)
             remaining -= recovered

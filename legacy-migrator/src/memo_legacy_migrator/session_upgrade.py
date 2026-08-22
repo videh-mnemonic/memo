@@ -743,7 +743,10 @@ def upgrade_session(
             present = repository.contains_many(source_commits)
             missing = set(source_commits) - present
         if missing:
-            raise ValueError(f"source Git history is missing {len(missing)} snapshot commit(s)")
+            detail = f"source Git history is missing {len(missing)} snapshot commit(s)"
+            if recover_git_history is not None:
+                detail += " after checking all checksum-verified older generations"
+            raise ValueError(detail)
         final_commit = source_steps[-1].source_commit
         outside_published_history = final_commit is None or not set(source_commits).issubset(
             repository.reachable_from(final_commit)

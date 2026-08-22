@@ -925,11 +925,31 @@ def test_upgrade_recovers_disconnected_commit_retained_by_older_repository(
     repository._run("--git-dir", str(repository.path), "update-ref", repository.REF, published)
     shutil.rmtree(snapshot)
 
+    # This transitional archive has a valid repository but predates commit
+    # pointers in its manifests. The selected newer manifest is the authority
+    # for which exact disconnected object may be recovered from it.
+    step_path = source_root / "steps" / "0.json"
+    current_step = step_path.read_bytes()
+    legacy_step = json.loads(current_step)
+    legacy_step["schema_version"] = 1
+    legacy_step.pop("snapshot_commit")
+    legacy_step.pop("entries_digest")
+    _json(step_path, legacy_step)
     earlier_archive = _unchecked_tar_zst(source_root)
+    step_path.write_bytes(current_step)
     _put_content_addressed(client, config, earlier_archive, step=0)
     earlier_digest = hashlib.sha256(earlier_archive).hexdigest()
     base = remote_sessions._session_base(config, ORIGIN, "session")
     client.objects.pop(remote_sessions._completion_key(base, 0, earlier_digest))
+
+    unusable_root = tmp_path / "unusable" / "session"
+    shutil.copytree(source_root, unusable_root)
+    shutil.rmtree(unusable_root / "snapshots.git")
+    (unusable_root / "snapshots.git").mkdir()
+    unusable_archive = _unchecked_tar_zst(unusable_root)
+    _put_content_addressed(client, config, unusable_archive, step=1)
+    unusable_digest = hashlib.sha256(unusable_archive).hexdigest()
+    client.objects.pop(remote_sessions._completion_key(base, 1, unusable_digest))
 
     loose_commit = repository.path / "objects" / disconnected[:2] / disconnected[2:]
     assert loose_commit.is_file()
@@ -937,20 +957,21 @@ def test_upgrade_recovers_disconnected_commit_retained_by_older_repository(
     entries: list[SnapshotEntry] = []
     entries_digest = digest_entries(entries)
     (source_root / "entries" / f"{entries_digest}.json").write_bytes(encode_entries(entries))
-    manifest = StepManifest(
-        "session",
-        1,
-        "time-1",
-        "snapshots/1",
-        entries,
-        schema_version=STEP_SCHEMA_VERSION,
-        snapshot_commit=disconnected,
-        entries_digest=entries_digest,
-    )
-    _json(source_root / "steps" / "1.json", manifest.to_stored_dict())
-    (source_root / "HEAD").write_text("1\n")
+    for step in (1, 2):
+        manifest = StepManifest(
+            "session",
+            step,
+            f"time-{step}",
+            f"snapshots/{step}",
+            entries,
+            schema_version=STEP_SCHEMA_VERSION,
+            snapshot_commit=disconnected,
+            entries_digest=entries_digest,
+        )
+        _json(source_root / "steps" / f"{step}.json", manifest.to_stored_dict())
+    (source_root / "HEAD").write_text("2\n")
     selected_archive = _unchecked_tar_zst(source_root)
-    _put_content_addressed(client, config, selected_archive, step=1)
+    _put_content_addressed(client, config, selected_archive, step=2)
 
     summary = recompress_s3(config, client, dry_run=True)
 
