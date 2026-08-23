@@ -55,6 +55,21 @@ def parser() -> argparse.ArgumentParser:
         metavar="N",
         help="process N S3 sessions concurrently (1-8; default: 4)",
     )
+    result.add_argument(
+        "--session",
+        dest="session_ids",
+        action="append",
+        metavar="SESSION_ID",
+        help="upgrade only SESSION_ID; may be repeated and requires --upgrade-s3",
+    )
+    result.add_argument(
+        "--best-effort",
+        action="store_true",
+        help=(
+            "substitute missing filesystem states with the nearest verified state, "
+            "embed a repair report, and retain the original S3 archive"
+        ),
+    )
     return result
 
 
@@ -73,6 +88,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.workers is not None and not args.upgrade_s3:
         print("memo-migrate-legacy: --workers requires --upgrade-s3", file=sys.stderr)
         return 2
+    if args.session_ids is not None and not args.upgrade_s3:
+        print("memo-migrate-legacy: --session requires --upgrade-s3", file=sys.stderr)
+        return 2
+    if args.best_effort and not args.upgrade_s3:
+        print("memo-migrate-legacy: --best-effort requires --upgrade-s3", file=sys.stderr)
+        return 2
     previous_handler: signal.Handlers | None = None
     try:
         if args.upgrade_s3:
@@ -82,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
                     dry_run=args.dry_run,
                     scratch_dir=args.scratch_dir,
                     workers=args.workers or 4,
+                    session_ids=args.session_ids,
+                    best_effort=args.best_effort,
                     progress=bars.update_overall if bars.enabled else None,
                     item_progress=bars.update_current if bars.enabled else None,
                 )
@@ -123,9 +146,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"skipped: {source}: {reason}")
     for source, error in summary.failed:
         print(f"failed: {source}: {error}", file=sys.stderr)
+    for session_id, substitutions in getattr(summary, "best_effort", {}).items():
+        action = "would retain" if args.dry_run else "retained"
+        print(
+            f"BEST EFFORT: {session_id}: substituted {substitutions} filesystem step(s); "
+            f"{action} original S3 archive",
+            file=sys.stderr,
+        )
     if args.upgrade_s3 and summary.migrated:
-        saved = summary.original_bytes - summary.replacement_bytes
-        print(f"bytes: {summary.original_bytes} -> {summary.replacement_bytes} ({saved} saved)")
+        retained = getattr(summary, "retained_original_bytes", 0)
+        effective_after = summary.replacement_bytes + retained
+        difference = summary.original_bytes - effective_after
+        if retained:
+            change = f"{difference} saved" if difference >= 0 else f"{-difference} added"
+            print(
+                f"bytes: {summary.original_bytes} -> {effective_after} "
+                f"({change}; best-effort originals retained)"
+            )
+        else:
+            print(
+                f"bytes: {summary.original_bytes} -> {summary.replacement_bytes} "
+                f"({difference} saved)"
+            )
     return 1 if summary.failed else 0
 
 

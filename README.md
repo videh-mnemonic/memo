@@ -224,7 +224,8 @@ memo status --archive [--limit N] [--json]
 - `SESSION_ID`: show one local recording. Status never pulls a recording from S3.
 - `--archive`: list only recordings indexed in S3. Sizes are the selected
   generation's compressed object sizes reported by S3; recording bodies are not
-  downloaded.
+  downloaded. Memo inventories the configured prefix once and reads the small
+  content-addressed index and completion records concurrently.
 - `--limit N`: limit the total number of listed recordings.
 - `--active`: list only recordings that are still active.
 - `--json`: emit machine-readable JSON with numeric byte sizes instead of a

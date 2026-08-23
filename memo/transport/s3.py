@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
@@ -13,6 +14,12 @@ from .config import S3Config
 MULTIPART_PART_SIZE = 8 * 1024 * 1024
 METADATA_SIZE_LIMIT = 1024 * 1024
 STREAM_READ_SIZE = 64 * 1024
+
+
+@dataclass(frozen=True)
+class S3ObjectInfo:
+    key: str
+    size: int | None
 
 
 def _error_code(error: BaseException) -> str | None:
@@ -182,6 +189,11 @@ class S3Store:
         self.client.remove_object(self.config.bucket, key)
 
     def list(self, prefix: str) -> Iterator[str]:
+        for item in self.list_info(prefix):
+            yield item.key
+
+    def list_info(self, prefix: str) -> Iterator[S3ObjectInfo]:
+        """List object keys and retain sizes already returned by S3."""
         for item in self.client.list_objects(
             self.config.bucket,
             prefix=prefix,
@@ -189,4 +201,8 @@ class S3Store:
         ):
             key = getattr(item, "object_name", None)
             if isinstance(key, str):
-                yield key
+                size = getattr(item, "size", None)
+                yield S3ObjectInfo(
+                    key,
+                    size if isinstance(size, int) and size >= 0 else None,
+                )

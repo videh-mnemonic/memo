@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import shutil
+import subprocess
 import tarfile
 import threading
 from dataclasses import asdict
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 import memo_legacy_migrator.s3_recompress as s3_recompress
 import memo_legacy_migrator.session_upgrade as session_upgrade
 import pytest
+import zstandard
 from memo_legacy_migrator.s3_recompress import (
     RemoteCandidate,
     _download,
@@ -391,6 +393,79 @@ def test_git_backed_upgrade_preserves_commits_and_restores_each_unique_tree_once
     assert "fingerprinted unique tree 3/3" in progress
 
 
+def test_best_effort_prefers_preceding_state_for_missing_commit(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "session"
+    commits = _repeated_git_session(source, "session", steps=3, unique_trees=3)
+    missing = commits[1]
+    loose_commit = source / "snapshots.git" / "objects" / missing[:2] / missing[2:]
+    assert loose_commit.is_file()
+    loose_commit.unlink()
+
+    result = upgrade_session(
+        source,
+        "session",
+        ORIGIN,
+        transport_is_current=False,
+        archive_had_bundle=False,
+        best_effort=True,
+    )
+
+    assert len(result.best_effort_substitutions) == 1
+    substitution = result.best_effort_substitutions[0]
+    assert substitution.step == 1
+    assert substitution.missing_commit == missing
+    assert substitution.substitute_step == 0
+    assert substitution.substitute_commit == commits[0]
+    assert substitution.direction == "preceding"
+    _assert_latest(
+        source,
+        "session",
+        [b"state 0", b"state 0", b"state 2"],
+        boundary=False,
+    )
+
+
+def test_best_effort_uses_following_state_when_no_preceding_state_exists(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source" / "session"
+    commits = _repeated_git_session(source, "session", steps=2, unique_trees=2)
+    missing = commits[0]
+    (source / "snapshots.git" / "objects" / missing[:2] / missing[2:]).unlink()
+
+    result = upgrade_session(
+        source,
+        "session",
+        ORIGIN,
+        transport_is_current=False,
+        archive_had_bundle=False,
+        best_effort=True,
+    )
+
+    substitution = result.best_effort_substitutions[0]
+    assert substitution.step == 0
+    assert substitution.substitute_step == 1
+    assert substitution.direction == "following"
+    _assert_latest(source, "session", [b"state 1", b"state 1"], boundary=False)
+
+
+def test_best_effort_fails_when_no_filesystem_state_survives(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "session"
+    commits = _repeated_git_session(source, "session", steps=2, unique_trees=2)
+    for commit in commits:
+        (source / "snapshots.git" / "objects" / commit[:2] / commit[2:]).unlink()
+
+    with pytest.raises(ValueError, match="no verified filesystem state"):
+        upgrade_session(
+            source,
+            "session",
+            ORIGIN,
+            transport_is_current=False,
+            archive_had_bundle=False,
+            best_effort=True,
+        )
+
+
 def test_git_backed_upgrade_rejects_manifest_commit_outside_final_history(
     tmp_path: Path,
 ) -> None:
@@ -542,6 +617,15 @@ def _tar_zst(root: Path) -> bytes:
         return prepared.path.read_bytes()
     finally:
         prepared.cleanup()
+
+
+def _unchecked_tar_zst(root: Path) -> bytes:
+    """Build a historical archive fixture without current-store validation."""
+    tar_data = io.BytesIO()
+    with tarfile.open(fileobj=tar_data, mode="w") as archive:
+        for path in sorted(root.rglob("*")):
+            archive.add(path, arcname=path.relative_to(root), recursive=False)
+    return zstandard.ZstdCompressor().compress(tar_data.getvalue())
 
 
 def _tar_gz(root: Path) -> bytes:
@@ -708,6 +792,68 @@ def test_remote_upgrade_handles_every_transport_and_removes_source_last(
     )[3]
 
 
+def test_best_effort_embeds_report_and_retains_original_s3_archive(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    commits = _repeated_git_session(source_root, "session", steps=3, unique_trees=3)
+    missing = commits[1]
+    loose_commit = source_root / "snapshots.git" / "objects" / missing[:2] / missing[2:]
+    assert loose_commit.is_file()
+    loose_commit.unlink()
+    original = _put_content_addressed(
+        client,
+        config,
+        _unchecked_tar_zst(source_root),
+        step=2,
+    )
+    original_objects = dict(client.objects)
+
+    strict = recompress_s3(config, client, dry_run=True)
+    assert strict.migrated == []
+    assert "missing 1 snapshot commit" in strict.failed[0][1]
+
+    preview = recompress_s3(config, client, dry_run=True, best_effort=True)
+    assert not preview.failed, preview.failed
+    assert preview.migrated == ["session"]
+    assert preview.best_effort == {"session": 1}
+    assert preview.retained_original_bytes == len(original_objects[original])
+    assert client.objects == original_objects
+
+    client.operations.clear()
+    summary = recompress_s3(config, client, best_effort=True)
+
+    assert not summary.failed, summary.failed
+    assert summary.best_effort == {"session": 1}
+    assert original in client.objects
+    assert ("remove", original) not in client.operations
+    replacements = [
+        key
+        for key in client.objects
+        if "/generations/" in key and key.endswith(".tar.zst") and key != original
+    ]
+    assert len(replacements) == 1
+    extracted = tmp_path / "replacement"
+    extracted.mkdir()
+    safe_extract_tar_zst_stream(io.BytesIO(client.objects[replacements[0]]), extracted)
+    report = json.loads((extracted / s3_recompress.BEST_EFFORT_REPORT).read_text())
+    assert report["source_archive"] == {
+        "object_key": original,
+        "retained_in_s3": True,
+        "sha256": hashlib.sha256(original_objects[original]).hexdigest(),
+        "size_bytes": len(original_objects[original]),
+    }
+    assert report["substitutions"] == [
+        {
+            "direction": "preceding",
+            "missing_commit": missing,
+            "step": 1,
+            "substitute_commit": commits[0],
+            "substitute_step": 0,
+        }
+    ]
+
+
 def test_install_preserves_original_when_staging_is_corrupt(tmp_path: Path) -> None:
     config = S3Config("bucket", "prefix")
     client = FakeS3()
@@ -801,7 +947,7 @@ def test_install_rolls_back_when_replacement_cannot_be_selected(
     assert all(replacement.prepared.digest not in key for key in client.objects if key != original)
 
 
-def test_independent_snapshot_check_rejects_git_omissions(tmp_path: Path) -> None:
+def test_git_conversion_preserves_files_ignored_by_the_recorded_tree(tmp_path: Path) -> None:
     config = S3Config("bucket", "prefix")
     client = FakeS3()
     source_root = tmp_path / "source" / "session"
@@ -809,6 +955,10 @@ def test_independent_snapshot_check_rejects_git_omissions(tmp_path: Path) -> Non
     snapshot = source_root / "snapshots" / "0"
     (snapshot / ".gitignore").write_text("hidden.bin\n")
     (snapshot / "hidden.bin").write_bytes(b"must not disappear")
+    nested = snapshot / "ninfer"
+    nested.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(nested)], check=True)
+    (nested / "untracked.bin").write_bytes(b"embedded repository bytes")
     _put_content_addressed(client, config, _tar_zst(source_root), step=0)
     remote = S3Store(config, client)
     source = source_for_candidate(
@@ -817,8 +967,156 @@ def test_independent_snapshot_check_rejects_git_omissions(tmp_path: Path) -> Non
     work = tmp_path / "work"
     work.mkdir()
 
-    with pytest.raises(ValueError, match="filesystem bytes do not match"):
-        _prepare_replacement(remote, source, work)
+    replacement = _prepare_replacement(remote, source, work)
+    try:
+        assert replacement.source.session_id == "session"
+    finally:
+        replacement.prepared.cleanup()
+
+
+def test_git_conversion_preserves_executable_semantics(tmp_path: Path) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [1])
+    executable = source_root / "snapshots" / "0" / "file.bin"
+    executable.chmod(0o700)
+    _put_content_addressed(client, config, _tar_zst(source_root), step=0)
+    remote = S3Store(config, client)
+    source = source_for_candidate(
+        remote, config, RemoteCandidate("session", "content-addressed", "session")
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+
+    replacement = _prepare_replacement(remote, source, work)
+    try:
+        assert replacement.source.session_id == "session"
+    finally:
+        replacement.prepared.cleanup()
+
+
+def test_upgrade_recovers_manifest_commits_from_verified_older_generation(
+    tmp_path: Path,
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [3, 3])
+    earlier_archive = _tar_zst(source_root)
+    earlier_key = _put_content_addressed(client, config, earlier_archive, step=1)
+    earlier_digest = hashlib.sha256(earlier_archive).hexdigest()
+    base = remote_sessions._session_base(config, ORIGIN, "session")
+    client.objects.pop(remote_sessions._completion_key(base, 1, earlier_digest))
+
+    repository = GitSnapshotStore(source_root / "snapshots.git")
+    snapshot = source_root / "work"
+    snapshot.mkdir()
+    content = b"forked final state"
+    (snapshot / "file.bin").write_bytes(content)
+    final_commit = repository.commit(snapshot, None, "forked final step")
+    shutil.rmtree(snapshot)
+    entries: list[SnapshotEntry] = []
+    entries_digest = digest_entries(entries)
+    (source_root / "entries").mkdir(exist_ok=True)
+    (source_root / "entries" / f"{entries_digest}.json").write_bytes(encode_entries(entries))
+    manifest = StepManifest(
+        "session",
+        2,
+        "time-2",
+        "snapshots/2",
+        [],
+        schema_version=STEP_SCHEMA_VERSION,
+        snapshot_commit=final_commit,
+        entries_digest=entries_digest,
+    )
+    _json(source_root / "steps" / "2.json", manifest.to_stored_dict())
+    (source_root / "HEAD").write_text("2\n")
+    final_archive = _tar_zst(source_root)
+    _put_content_addressed(client, config, final_archive, step=2)
+    before = dict(client.objects)
+
+    summary = recompress_s3(config, client, dry_run=True)
+
+    assert not summary.failed, summary.failed
+    assert summary.migrated == ["session"]
+    assert client.objects == before
+    assert ("get", earlier_key) in client.operations
+
+
+def test_upgrade_recovers_disconnected_commit_retained_by_older_repository(
+    tmp_path: Path,
+) -> None:
+    config = S3Config("bucket", "prefix")
+    client = FakeS3()
+    source_root = tmp_path / "source" / "session"
+    _numeric_session(source_root, "session", [3])
+    repository = GitSnapshotStore(source_root / "snapshots.git")
+    published = json.loads((source_root / "steps" / "0.json").read_text())["snapshot_commit"]
+    snapshot = source_root / "work"
+    snapshot.mkdir()
+    (snapshot / "file.bin").write_bytes(b"disconnected but retained")
+    disconnected = repository.commit(snapshot, None, "disconnected state")
+    repository._run("--git-dir", str(repository.path), "update-ref", repository.REF, published)
+    shutil.rmtree(snapshot)
+
+    # This transitional archive has a valid repository but predates commit
+    # pointers in its manifests. The selected newer manifest is the authority
+    # for which exact disconnected object may be recovered from it.
+    step_path = source_root / "steps" / "0.json"
+    current_step = step_path.read_bytes()
+    legacy_step = json.loads(current_step)
+    legacy_step["schema_version"] = 1
+    legacy_step.pop("snapshot_commit")
+    legacy_step.pop("entries_digest")
+    _json(step_path, legacy_step)
+    earlier_archive = _unchecked_tar_zst(source_root)
+    step_path.write_bytes(current_step)
+    _put_content_addressed(client, config, earlier_archive, step=0)
+    earlier_digest = hashlib.sha256(earlier_archive).hexdigest()
+    base = remote_sessions._session_base(config, ORIGIN, "session")
+    client.objects.pop(remote_sessions._completion_key(base, 0, earlier_digest))
+
+    unusable_root = tmp_path / "unusable" / "session"
+    shutil.copytree(source_root, unusable_root)
+    shutil.rmtree(unusable_root / "snapshots.git")
+    (unusable_root / "snapshots.git").mkdir()
+    unusable_archive = _unchecked_tar_zst(unusable_root)
+    _put_content_addressed(client, config, unusable_archive, step=1)
+    unusable_digest = hashlib.sha256(unusable_archive).hexdigest()
+    client.objects.pop(remote_sessions._completion_key(base, 1, unusable_digest))
+
+    loose_commit = repository.path / "objects" / disconnected[:2] / disconnected[2:]
+    assert loose_commit.is_file()
+    loose_commit.unlink()
+    entries: list[SnapshotEntry] = []
+    entries_digest = digest_entries(entries)
+    (source_root / "entries" / f"{entries_digest}.json").write_bytes(encode_entries(entries))
+    for step in (1, 2):
+        manifest = StepManifest(
+            "session",
+            step,
+            f"time-{step}",
+            f"snapshots/{step}",
+            entries,
+            schema_version=STEP_SCHEMA_VERSION,
+            snapshot_commit=disconnected,
+            entries_digest=entries_digest,
+        )
+        _json(source_root / "steps" / f"{step}.json", manifest.to_stored_dict())
+    (source_root / "HEAD").write_text("2\n")
+    selected_archive = _unchecked_tar_zst(source_root)
+    _put_content_addressed(client, config, selected_archive, step=2)
+
+    summary = recompress_s3(config, client, dry_run=True)
+
+    assert not summary.failed, summary.failed
+    assert summary.migrated == ["session"]
+
+
+def test_requested_remote_session_must_exist() -> None:
+    with pytest.raises(ValueError, match="indexed S3 session not found: absent"):
+        recompress_s3(S3Config("bucket", "prefix"), FakeS3(), dry_run=True, session_ids=["absent"])
 
 
 def test_remote_step_must_match_downloaded_archive_head(tmp_path: Path) -> None:
