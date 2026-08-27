@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import threading
 import time
@@ -104,8 +105,38 @@ def test_zero_terminal_recording_keeps_publishing(tmp_path: Path) -> None:
         _stop(paths, thread)
 
 
+def test_watcher_exhaustion_falls_back_to_periodic_publishing(tmp_path: Path, monkeypatch) -> None:
+    from watchdog.observers import Observer
+
+    def exhausted(_self) -> None:
+        raise OSError(errno.ENOSPC, "inotify watch limit reached")
+
+    monkeypatch.setattr(Observer, "start", exhausted)
+    paths, root, daemon, thread = _running(tmp_path, interval=0.1)
+    try:
+        attached = request(str(paths.socket), "attach", {"path": str(root)})
+        session_id = str(attached["session_id"])
+        assert daemon.registry.lookup_session(session_id) is not None
+        assert session_id not in daemon._observers
+
+        (root / "file.txt").write_text("captured periodically")
+        store = SessionStore(paths)
+        deadline = time.monotonic() + 3
+        manifest = store.head(session_id)
+        while time.monotonic() < deadline and (manifest is None or manifest.step < 1):
+            time.sleep(0.05)
+            manifest = store.head(session_id)
+
+        assert manifest is not None and manifest.step >= 1
+        restored = tmp_path / "restored-without-watcher"
+        store.restore_manifest(session_id, manifest, restored)
+        assert (restored / "file.txt").read_text() == "captured periodically"
+    finally:
+        _stop(paths, thread)
+
+
 def test_snapshot_reads_do_not_trigger_more_steps(tmp_path: Path) -> None:
-    paths, root, _, thread = _running(tmp_path, interval=60)
+    paths, root, _, thread = _running(tmp_path, interval=0.1)
     try:
         (root / "untracked.txt").write_text("initial")
         attached = request(str(paths.socket), "attach", {"path": str(root)})
@@ -129,10 +160,12 @@ def test_snapshot_reads_do_not_trigger_more_steps(tmp_path: Path) -> None:
 
 
 def test_mutation_burst_is_coalesced_into_one_step(tmp_path: Path) -> None:
-    paths, root, _, thread = _running(tmp_path, interval=60)
+    paths, root, daemon, thread = _running(tmp_path, interval=60)
     try:
         attached = request(str(paths.socket), "attach", {"path": str(root)})
         session_id = str(attached["session_id"])
+        if session_id not in daemon._observers:
+            pytest.skip("native filesystem watcher is unavailable")
         for value in range(10):
             (root / "generated.txt").write_text(str(value))
             time.sleep(0.02)

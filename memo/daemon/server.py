@@ -169,7 +169,22 @@ class MemoDaemon:
 
         observer = Observer()
         observer.schedule(Handler(), str(active.root), recursive=True)
-        observer.start()
+        try:
+            observer.start()
+        except OSError as error:
+            observer.stop()
+            with suppress(RuntimeError):
+                observer.join(timeout=2)
+            self.log.warning(
+                "filesystem watcher unavailable for %s; using periodic snapshots: %s",
+                active.session_id,
+                error,
+            )
+            # Recursive inotify watches can exhaust the per-user watch limit on
+            # large trees.  The step worker still publishes on its interval, so
+            # a missing watcher should reduce responsiveness rather than strand
+            # a newly-created recording in the registry and make `memo` unusable.
+            return
         self._observers[active.session_id] = observer
 
     def _step_loop(self, active: ActiveSession) -> None:
